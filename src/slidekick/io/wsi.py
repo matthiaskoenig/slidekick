@@ -50,82 +50,22 @@ def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> dict[int, zarr
     return d
 
 
-# import cv2
-# from tifffile import TiffWriter
+if __name__ == "__main__":
+    # Example for reading files
+    from slidekick import DATA_PATH
+    image_paths: list[Path] = [f for f in DATA_PATH.glob("*.*")]
 
-# def get_new_xy(y, x, level) -> Tuple[int, int]:
-#     return round(y / 2 ** level), round(x / 2 ** level)
+    n_images = 0
+    for image_path in image_paths:
+        if image_path.suffix in {".ndpi", ".qptiff", ".tiff"}:
+            # if image_path.suffix in {".qptiff"}:
+            # if image_path.suffix in {".ndpi"}:
+            # if image_path.suffix in {".czi"}:
+            console.print(f"Importing image: '{image_path.name}'")
+            image_data: dict[int, zarr.Array] = read_wsi(image_path)
+            console.print(image_data)
+            image_array: np.ndarray = np.array(image_data)
 
+            n_images += 1
 
-# def get_shape_for_level(shape_zero: Tuple[int, ...], level: int) -> Tuple[int, ...]:
-#     if len(shape_zero) == 2:
-#         y, x = shape_zero
-#         new_y, new_x = get_new_xy(y, x, level)
-#         return new_y, new_x
-#
-#     else:
-#         y, x, c = shape_zero
-#         new_y, new_x = get_new_xy(y, x, level)
-#
-#         return new_y, new_x, c
-
-
-# def write_rois_to_ome_tiff(path: Path,
-#                            image_level: int,
-#                            image: np.ndarray,
-#                            sub_res: int,
-#                            tile_size: Tuple[int, int],
-#                            level_zero_pixel_size: float,
-#                            unit: str = "µm"
-#                            ):
-#     # remove zero level generator from dict
-#
-#     pixel_size = level_zero_pixel_size * 2 ** image_level
-#
-#     meta_data = {
-#         "PhysicalSizeX": pixel_size,
-#         "PhysicalSizeXUnit": unit,
-#         "PhysicalSizeY": pixel_size,
-#         "PhyiscalSizeYUnit": unit,
-#     }
-#
-#
-#     with TiffWriter(path, bigtiff=True) as tif:
-#         options = dict(
-#             photometric='rgb',
-#             compression='jpeg',
-#             resolutionunit='CENTIMETER',
-#             maxworkers=os.cpu_count())
-#
-#         # writes the highest resolution
-#         tif.write(
-#             data=image,
-#             tile=tile_size,
-#             subifds=sub_res,
-#             resolution=(1e4 / pixel_size, 1e4 / pixel_size),
-#
-#             # resolution=(1e4 / pixelsize, 1e4 / pixelsize),
-#             metadata=meta_data,
-#             **options
-#         )
-#
-#         # write pyramid levels to the two subifds
-#         # in production use resampling to generate sub-resolution images
-#
-#         for i in range(sub_res):
-#             image = cv2.pyrDown(image)
-#             mag = 2 ** (i + 1)
-#             tif.write(
-#                 data=image,
-#                 subfiletype=1,
-#                 resolution=(1e4 / pixel_size / mag, 1e4 / pixel_size / mag),
-#                 **options,
-#
-#             )
-#         # resolution=(1e4 / mag / pixelsize, 1e4 / mag / pixelsize), **options)
-#         # add a thumbnail image as a separate series
-#         # it is recognized by QuPath as an associated image
-#
-#         # thumbnail = (data[0, 0, ::8, ::8] >> 2).astype('uint8')
-#
-#         # tif.write(thumbnail, metadata={'Name': 'thumbnail'})
+    console.print(f"Images imported: {n_images}")

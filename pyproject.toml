@@ -16,4 +16,8 @@ dependencies = [
     "pylibCZIrw",
     "dask",
     "napari",
+    "napari-wsi",
+    "rasterio",
+    "wsidicom",
+    "PyQt5"
 ]
