@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any
+from typing import Tuple, Annotated
 
 import numpy as np
 import tifffile
@@ -8,9 +8,10 @@ import zarr
 
 from slidekick.console import console
 from slidekick.io.czi import czi2tiff
+from slidekick.metadata import Metadata
 
 
-def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> dict[int, zarr.Array]:
+def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> Tuple[dict[int, zarr.Array], Metadata]:
     """Read image with tifffile library.
 
     @:return dictionary containing the resolution level as key and the zarr array of the image as value.
@@ -47,7 +48,10 @@ def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> dict[int, zarr
     for level in range(n_arrays):
         d[level] = zarr_group.get(level)
 
-    return d
+    # create metadata
+    m = Metadata(image_path.parent, image_path.name, image_path.suffix)
+
+    return d, m
 
 
 if __name__ == "__main__":
@@ -62,8 +66,9 @@ if __name__ == "__main__":
             # if image_path.suffix in {".ndpi"}:
             # if image_path.suffix in {".czi"}:
             console.print(f"Importing image: '{image_path.name}'")
-            image_data: dict[int, zarr.Array] = read_wsi(image_path)
+            image_data, meta_data = read_wsi(image_path)
             console.print(image_data)
+            console.print(meta_data)
             image_array: np.ndarray = np.array(image_data)
 
             n_images += 1
