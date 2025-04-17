@@ -7,7 +7,7 @@ import logging
 
 from rich.logging import RichHandler
 
-from sidekick.console import console
+from slidekick.console import console
 
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:

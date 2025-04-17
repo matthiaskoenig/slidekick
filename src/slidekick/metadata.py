@@ -30,15 +30,15 @@ class Metadata:
     annotations: Dict = field(default_factory=dict)
 
     def __post_init__(self):
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d")
         short_id = uuid.uuid4().hex[:8]
-        self.uid = f"{timestamp}_{short_id}"
-
-    def set_stains(self, stains: Dict[int, str]) -> None:
-        self.stains = stains
+        self.uid = f"{timestamp}-{short_id}"
 
     def set_image_type(self, image_type: str) -> None:
         self.image_type = image_type
+
+    def set_stains(self, stains: Dict[int, str]) -> None:
+        self.stains = stains
 
     def set_annotations(self, annotations: Dict) -> None:
         self.annotations = annotations
