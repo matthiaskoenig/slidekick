@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Tuple, Annotated
+from typing import Tuple
 
 import numpy as np
 import tifffile
@@ -9,50 +9,51 @@ import zarr
 from slidekick.console import console
 from slidekick.io.czi import czi2tiff
 from slidekick.metadata import Metadata
+from slidekick.processing import add_metadata
 
 
-def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> Tuple[dict[int, zarr.Array], Metadata]:
-    """Read image with tifffile library.
-
-    @:return dictionary containing the resolution level as key and the zarr array of the image as value.
+def import_wsi(image_path: Path, annotate: bool = False) -> Tuple[dict[int, zarr.Array], Metadata]:
     """
-    if image_path.suffix == ".czi":
+    Import whole-slide image and return data and metadata.
 
-        # FIXME: this is hardcoded for the CZI example
-        czi_kwargs = dict(
-            tile_size=(2048, 2048),
-            subresolution_levels=[1, 2, 4],
-            res_unit="µm"
-        )
+    If annotate=True, interactively annotate metadata (image type and stains).
+    """
+    image_data, stored_path = read_wsi(image_path)
+
+    # Initialize metadata object first
+    metadata = Metadata(
+        path_original=image_path,
+        path_storage=stored_path,
+    )
+
+    if annotate:
+        add_metadata(image_data, metadata)
+
+    return image_data, metadata
+
+
+def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> Tuple[dict[int, zarr.Array], Path]:
+    if image_path.suffix == ".czi":
+        czi_kwargs = dict(tile_size=(2048, 2048), subresolution_levels=[1, 2, 4], res_unit="µm")
         czi_path = image_path
-        image_path = Path(image_path).with_suffix(".tiff")
+        image_path = image_path.with_suffix(".tiff")
 
         if not image_path.exists():
             czi2tiff(czi_path, image_path, **czi_kwargs)
         else:
             console.print("CZI already converted to TIFF", style="warning")
 
+    store = tifffile.imread(str(image_path), aszarr=True, maxworkers=max_workers)
+    zarr_group = zarr.open(store, mode="r")
 
-    # read in zarr store
-    store: tifffile.ZarrTiffStore = tifffile.imread(str(image_path), aszarr=True, maxworkers=max_workers)
-    zarr_group = zarr.open(store, mode="r")  # zarr.core.Group or Array
-
-    # find number of pyramidal levels
     for key, value in zarr_group.info.items:
         if key == "No. arrays":
             n_arrays = int(value)
             break
 
-    # dictionary of pyramidal levels
-    d: dict[int, zarr.Array] = {}
-    for level in range(n_arrays):
-        d[level] = zarr_group.get(level)
+    d: dict[int, zarr.Array] = {level: zarr_group.get(level) for level in range(n_arrays)}
 
-    # create metadata
-    m = Metadata(image_path.parent, image_path.name, image_path.suffix)
-
-    return d, m
-
+    return d, image_path
 
 if __name__ == "__main__":
     # Example for reading files

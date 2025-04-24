@@ -1,12 +1,3 @@
-import os
-from pathlib import Path
-from typing import Tuple, Annotated
-
-import numpy as np
-import tifffile
-import zarr
-
-from slidekick.console import console
 from slidekick.metadata import Metadata
 
 def add_metadata(image_data, metadata: Metadata) -> None:
@@ -52,7 +43,7 @@ def add_metadata(image_data, metadata: Metadata) -> None:
     mode = console.input("Enter choice [1-3]: ")
     stains = {}
     if mode == "1":
-        stain_name = console.input(f"Stain name: ")
+        stain_name = console.input("Stain name: ")
         stains[0] = stain_name
     elif mode == "2":
         count = console.input("Number of channels: ")
@@ -77,29 +68,66 @@ def add_metadata(image_data, metadata: Metadata) -> None:
 
 
 if __name__ == "__main__":
-    from slidekick import DATA_PATH
-    from slidekick.io import wsi
+    from slidekick import DATA_PATH, OUTPUT_PATH
+    from slidekick.io import import_wsi
+    from slidekick.metadata import FileList
+    from slidekick.console import console
+    from dataclasses import asdict
 
-    # Read whole-slide image
-    # image_path = DATA_PATH / "SIM-22-034_4plex.qptiff"
-    image_path = DATA_PATH / "NOR-021_CYP1A2.ndpi"
-    # image_path = DATA_PATH / "APAP_HE.czi"
+    """Full pipeline: create metadata for each file, save all, reload and verify."""
 
-    # Load image and auto-generated metadata
-    image_data, meta_data = wsi.read_wsi(image_path)
-    console.print("Loaded image data:", image_data)
-    console.print("Initial metadata:", meta_data)
+    file_list = FileList()
 
-    # Convert to numpy array if needed
-    image_array: np.ndarray = np.array(image_data)
+    supported_suffixes = {".ndpi", ".qptiff", ".tiff", ".czi"}
+    image_paths = [p for p in DATA_PATH.glob("*") if p.suffix in supported_suffixes]
 
-    # Run interactive metadata annotation
-    add_metadata(image_data, meta_data)
+    for image_path in image_paths:
+        try:
+            console.print(f"[bold green]Processing image:[/bold green] {image_path.name}")
 
-    # Display updated metadata
-    console.print("[success]Final metadata:[/]")
-    console.print(meta_data)
+            # Define the path where the converted/stored file would go (same name for simplicity)
+            stored_path = OUTPUT_PATH / image_path.name
 
+            image_data, metadata = import_wsi(image_path)
 
+            metadata.set_image_type("fluorescence")
+            metadata.set_stains({0: "DAPI", 1: "FITC"})
+            metadata.set_annotations({"note": f"Test annotation for {image_path.name}"})
 
+            # Add to file list
+            file_list.add_file(metadata)
 
+        except Exception as e:
+            console.print(f"[error]Failed to process {image_path.name}: {e}")
+            continue
+
+    # Save all metadata and file list
+    file_list.save_all(OUTPUT_PATH)
+
+    # Load file list back
+    file_list_json = OUTPUT_PATH / "file_list.json"
+    reloaded_file_list = FileList.from_json(file_list_json)
+
+    # Check integrity of the saved and reloaded metadata
+    for uid in file_list.files:
+        original = asdict(file_list.get_file(uid))
+        reloaded = asdict(reloaded_file_list.get_file(uid))
+
+        # Convert paths to strings for comparison
+        original["path_original"] = str(original["path_original"])
+        original["path_storage"] = str(original["path_storage"])
+        reloaded["path_original"] = str(reloaded["path_original"])
+        reloaded["path_storage"] = str(reloaded["path_storage"])
+
+        # Compare dictionaries and print the difference if they don't match
+        if original != reloaded:
+            print(f"[error] Metadata mismatch for UID {uid}")
+            for key in original.keys():
+                if original[key] != reloaded[key]:
+                    print(f"Difference in '{key}':")
+                    print(f"  Original: {original[key]}")
+                    print(f"  Reloaded: {reloaded[key]}")
+            # Optionally raise the error after printing the differences
+            raise AssertionError(f"Metadata mismatch for UID {uid}")
+
+    print(f"\n[✓] Metadata pipeline test passed for {len(file_list.files)} files.")
