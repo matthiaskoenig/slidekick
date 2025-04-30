@@ -4,6 +4,7 @@ from typing import Dict, Optional
 import uuid
 from datetime import datetime
 from pathlib import Path
+from slidekick.console import console
 
 
 @dataclass
@@ -65,7 +66,6 @@ class Metadata:
 
         return metadata
 
-
     def set_image_type(self, image_type: str) -> None:
         self.image_type = image_type
 
@@ -108,11 +108,11 @@ class FileList:
         file_list_file.parent.mkdir(parents=True, exist_ok=True)
         # Check if the file already exists
         if file_list_file.exists():
-            print(f"File list already exists at {file_list_file}. Overwriting.")
+            console.print(f"File list already exists at {file_list_file}. Overwriting.", style="warning")
 
         with open(file_list_file, "w") as f:
             f.write(self.to_json())
-        print(f"File list saved to {file_list_file}")
+        console.print(f"File list saved to {file_list_file}", style="info")
 
     def to_json(self) -> str:
         return json.dumps(
