@@ -19,5 +19,6 @@ dependencies = [
     "rasterio",
     "wsidicom",
     "PyQt5",
+    "opencv-python",
     "PyQt5-Qt5==5.15.2 ; sys_platform == 'win32'"
 ]

@@ -4,7 +4,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from image_utils.stain_separation_utils.stain_separation import (
+from slidekick.processing.stain_separation import (
     calculate_stain_matrix,
     deconvolve_image_and_normalize,
     create_single_channel_pixels,

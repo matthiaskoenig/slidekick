@@ -5,7 +5,6 @@ import numpy as np
 
 # copied from https://github.com/schaugf/HEnorm_python/blob/master/normalizeStaining.py
 
-
 def calculate_stain_matrix(pxi: np.ndarray, Io=240, alpha=1) -> np.ndarray:
     """
     calculates the stain base vectors
