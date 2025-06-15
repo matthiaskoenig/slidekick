@@ -8,7 +8,7 @@ import zarr
 
 from slidekick.console import console
 from slidekick.io.czi import czi2tiff
-from slidekick.metadata import Metadata
+from slidekick.processing.metadata import Metadata
 from slidekick.processing import add_metadata
 
 
