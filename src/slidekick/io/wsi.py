@@ -8,8 +8,8 @@ import zarr
 
 from slidekick.console import console
 from slidekick.io.czi import czi2tiff
-from slidekick.processing.metadata import Metadata
-from slidekick.processing import add_metadata
+from slidekick.metadata.metadata import Metadata
+from slidekick.metadata import add_metadata
 
 
 def import_wsi(image_path: Path, annotate: bool = False) -> Tuple[dict[int, zarr.Array], Metadata]:

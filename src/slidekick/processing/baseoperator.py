@@ -1,14 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Tuple, Union
-from slidekick.processing import Metadata
+from slidekick.metadata.metadata import Metadata
 from slidekick.console import console
 
-"""
-We have three base operations and thus classes:
-1) Append a channel to an image.
-2) Merge channels from one or more images into a new image.
-3) Modify one or more channels in an image.
-"""
 
 def ensure_list(x: Union[Any, List[Any]]) -> List[Any]:
     return x if isinstance(x, list) else [x]
@@ -38,17 +32,34 @@ def normalize_channel_selection(
 
 class BaseOperator(ABC):
     """
-    Abstract base class for all operators.
+    Abstract base class for all operators. We include three main types of operations:
+    1. Append a channel to an image.
+    2. Merge channels from one or more images into a new image.
+    3. Modify one or more channels in an image.
+
+    This class provides a common interface and utility methods for channel selection
+    and metadata handling.
+
+    Additional functions include the saving of the resulting image and metadata.
+
+    Subclasses must implement the `apply` method to define the specific operation.
     """
 
     def __init__(
         self,
         metadata: Union[Metadata, List[Metadata]],
-        channel_selection: Union[Tuple[int, int], List[Tuple[int, int]]]
+        channel_selection: Union[Tuple[int, int], List[Tuple[int, int]], List[int]]
     ) -> None:
         self.metadata = ensure_list(metadata)
 
         # Allow simpler input (e.g., channel index only) when there's just one metadata
+        if isinstance(self.metadata, list) and len(self.metadata) == 1:
+            self.metadata = self.metadata[0]
+            # If channel_selection is a List of ints
+            if isinstance(channel_selection, tuple) and len(channel_selection) == 1:
+
+
+
         if len(self.metadata) == 1 and not isinstance(channel_selection, list) and not isinstance(channel_selection, tuple):
             raise ValueError("Single channel index must be provided as a tuple (0, channel_index) or list of such tuples.")
 

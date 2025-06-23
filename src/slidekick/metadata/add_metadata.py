@@ -1,4 +1,4 @@
-from slidekick.processing.metadata import Metadata
+from slidekick.metadata.metadata import Metadata
 
 
 def add_metadata(image_data, metadata: Metadata) -> None:
@@ -72,7 +72,7 @@ def add_metadata(image_data, metadata: Metadata) -> None:
 if __name__ == "__main__":
     from slidekick import DATA_PATH, OUTPUT_PATH
     from slidekick.io import import_wsi
-    from slidekick.processing.metadata import FileList
+    from slidekick.metadata.metadata import FileList
     from slidekick.console import console
     from dataclasses import asdict
 

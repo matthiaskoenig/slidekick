@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from slidekick.console import console
+from slidekick.io import read_wsi
+import zarr
 
 
 @dataclass
@@ -60,7 +62,6 @@ class Metadata:
 
         if not metadata.path_storage.exists():
             print(f"[warning] Missing stored image at {metadata.path_storage}, re-reading...")
-            from slidekick.io import read_wsi  # local import to avoid circular imports
             _, new_path = read_wsi(metadata.path_original)
             metadata.path_storage = new_path
 
@@ -74,6 +75,16 @@ class Metadata:
 
     def set_annotations(self, annotations: Dict) -> None:
         self.annotations = annotations
+
+    def load_image(self) -> dict[int, zarr.Array]:
+        """Load the image data from the storage path."""
+        if not self.path_storage.exists():
+            raise FileNotFoundError(f"Stored image {self.path_storage} does not exist.")
+
+        # Load image using read_wsi
+        image_data, _ = read_wsi(self.path_storage)
+
+        return image_data
 
 
 @dataclass
