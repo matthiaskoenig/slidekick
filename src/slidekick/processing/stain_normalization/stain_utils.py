@@ -160,6 +160,7 @@ def reconstruct_pixels(concentrations: np.ndarray, refrence_matrix=None, Io=240)
     Inorm = Inorm.astype(np.uint8).T.reshape(-1, 3)
     return Inorm
 
+
 def separate_stains(image_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # create a grayscale representation to find interesting pixels with otsu
     gs = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)

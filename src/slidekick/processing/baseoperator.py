@@ -1,33 +1,10 @@
-from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Tuple, Union
-from slidekick.metadata.metadata import Metadata
+from abc import ABC
+from typing import List, Any, Tuple, Union, Optional
+from slidekick.io.metadata import Metadata
+from slidekick.io import read_wsi
 from slidekick.console import console
+import zarr
 
-
-def ensure_list(x: Union[Any, List[Any]]) -> List[Any]:
-    return x if isinstance(x, list) else [x]
-
-def normalize_channel_selection(
-    selection: Union[Tuple[int, int], List[Tuple[int, int]]],
-    metadata_list: List[Metadata]
-) -> List[Tuple[int, int, str]]:
-    """
-    Normalize a selection of (image_index, channel_index) pairs into a list of
-    (image_index, channel_index, channel_name), verifying against stains.
-    """
-    selection = ensure_list(selection)
-    normalized = []
-    for item in selection:
-        if not isinstance(item, tuple) or len(item) != 2:
-            raise ValueError(f"Each channel selection must be a tuple of (image_index, channel_index), got: {item}")
-        image_idx, channel_idx = item
-        if image_idx >= len(metadata_list):
-            raise ValueError(f"Image index {image_idx} out of range for metadata list of length {len(metadata_list)}")
-        metadata = metadata_list[image_idx]
-        if channel_idx not in metadata.stains:
-            raise ValueError(f"Channel index {channel_idx} not in stains for image {image_idx}")
-        normalized.append((image_idx, channel_idx, metadata.stains[channel_idx]))
-    return normalized
 
 
 class BaseOperator(ABC):
@@ -50,18 +27,51 @@ class BaseOperator(ABC):
         metadata: Union[Metadata, List[Metadata]],
         channel_selection: Union[Tuple[int, int], List[Tuple[int, int]], List[int]]
     ) -> None:
-        self.metadata = ensure_list(metadata)
+        self.metadata = metadata if isinstance(metadata, list) else [metadata]
 
-        # Allow simpler input (e.g., channel index only) when there's just one metadata
-        if isinstance(self.metadata, list) and len(self.metadata) == 1:
-            self.metadata = self.metadata[0]
-            # If channel_selection is a List of ints
-            if isinstance(channel_selection, tuple) and len(channel_selection) == 1:
+        # If channel_selection is a List of integers, convert it to a list of tuples with the first image index as 0
+        if isinstance(channel_selection, list) and all(isinstance(c, int) for c in channel_selection):
+            channel_selection = [(0, c) for c in channel_selection]
+        # If channel_selection is a single tuple, convert it to a list of one tuple
+        if isinstance(channel_selection, tuple) and len(channel_selection) == 2:
+            channel_selection = [channel_selection]
 
+        self.channels = channel_selection
 
-
-        if len(self.metadata) == 1 and not isinstance(channel_selection, list) and not isinstance(channel_selection, tuple):
-            raise ValueError("Single channel index must be provided as a tuple (0, channel_index) or list of such tuples.")
-
-        self.channels = normalize_channel_selection(channel_selection, self.metadata)
+        # TODO: Validate channel_selection to ensure it contains valid indices
         console.print(f"Initialized operator with channel references: {self.channels}", style="info")
+
+    def load_image(self, metadata_idx: int = 0) -> dict[int, zarr.Array]:
+        """
+        Load the image data for the specified index from the metadata.
+        """
+        if metadata_idx is None:
+            metadata_idx = 0
+
+        if metadata_idx >= len(self.metadata):
+            raise IndexError(f"Metadata index {metadata_idx} out of range for {len(self.metadata)} metadata objects.")
+        metadata = self.metadata[metadata_idx]
+        if not isinstance(metadata, Metadata):
+            raise TypeError("Metadata must be an instance of Metadata class.")
+
+        img, _ = read_wsi(metadata.path_storage)
+
+        return img
+
+
+    def extract_channels(self, image: dict[int, zarr.Array]) -> List[zarr.Array]:
+        """
+        Extract the channels from the image based on the selected channels.
+        Returns a list of zarr arrays for the selected channels.
+        """
+        extracted_channels = []
+        for img_idx, channel_idx in self.channels:
+            if img_idx < len(self.metadata):
+                metadata = self.metadata[img_idx]
+                if channel_idx < len(image):
+                    extracted_channels.append(image[channel_idx])
+                else:
+                    console.print(f"Channel index {channel_idx} out of range for image {img_idx}.", style="error")
+            else:
+                console.print(f"Image index {img_idx} out of range for metadata.", style="error")
+        return extracted_channels
