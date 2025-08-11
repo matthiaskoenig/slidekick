@@ -40,17 +40,22 @@ class StainNormalizer(BaseOperator):
         Note: This creates a new metadata object with the normalized image data based on the original metadata, but a
         new path for the normalized image, other description, and uid
         """
+        if isinstance(self.metadata, list):
+            s_metadata = self.metadata[0]
+        else:
+            s_metadata = self.metadata
+
         # Create a new metadata object for the normalized image
         normalized_metadata = Metadata(
-            path_original=self.metadata.path_original,
-            path_storage=self.metadata.path_storage.with_suffix(".normalized.tiff"),
-            image_type=self.metadata.image_type,
-            stains={idx: f"{name}_normalized" for idx, _, name in self.channels},  # Use the selected channels
-            uid=f"{self.metadata.uid}_normalized"
+            path_original=s_metadata.path_original,
+            path_storage=s_metadata.path_storage.with_suffix("_normalized.tiff"),
+            image_type=s_metadata.image_type,
+            #stains={idx: f"{name}_normalized" for idx, _, name in s_metadata.channels},
+            uid=f"{s_metadata.uid}_normalized"
         )
 
         # Save the normalized metadata
-        normalized_metadata.save()
+        normalized_metadata.save(output_path=normalized_metadata.path_storage)
         console.print(f"Normalized metadata saved to {normalized_metadata.path_storage}")
 
         # Save the new image data to the storage path

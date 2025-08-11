@@ -79,7 +79,7 @@ if __name__ == "__main__":
     file_list = FileList()
 
     supported_suffixes = {".ndpi", ".qptiff", ".tiff", ".czi"}
-    image_paths = [p for p in DATA_PATH.glob("*") if p.suffix in supported_suffixes]
+    image_paths = [p for p in DATA_PATH.rglob("*") if p.suffix in supported_suffixes]
 
     for image_path in image_paths:
         try:

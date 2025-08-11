@@ -1,8 +1,7 @@
 from pathlib import Path
 from typing import Optional, Dict
-from rich.progress import Progress
 from tifffile import TiffWriter
-import os
+import numpy as np
 
 def save_tif(image: Dict, path: Path, metadata: Optional[Dict]) -> None:
     """
@@ -16,6 +15,19 @@ def save_tif(image: Dict, path: Path, metadata: Optional[Dict]) -> None:
 
     # TODO: Needs proper metadata handling (see czi2tiff for example, unify this with that function)
 
+    # Sort keys to ensure deterministic page ordering (0,1,2,...)
+    levels = sorted(image.keys())
+
+    with TiffWriter(str(path), bigtiff=True) as tif:
+        for lvl in levels:
+            arr = image[lvl]
+            if arr is None:
+                raise ValueError(f"image[{lvl}] is None")
+            # ensure a contiguous array for faster I/O; preserve dtype
+            arr = np.ascontiguousarray(arr)
+            tif.write(arr)
+    """
+
     # Ensure the directory exists
     path.parent.mkdir(parents=True, exist_ok=True)
     # Check if the path has a .tiff suffix, if not, add it
@@ -23,10 +35,10 @@ def save_tif(image: Dict, path: Path, metadata: Optional[Dict]) -> None:
         path = path.with_suffix('.tiff')
 
     n_tiles = 1
-    subresolution_levels = 1 # Debug
+    subresolution_levels = len(image) - 1
 
     with Progress() as progress:
-        task = progress.add_task(description=f"[green]Saving image to {path.name}...", total=(len(subresolution_levels) + 1) * n_tiles)
+        task = progress.add_task(description=f"[green]Saving image to {path.name}...", total=(subresolution_levels + 1) * n_tiles)
 
         sub_task = progress.add_task(description="[cyan]Writing resolution level 0...", total=n_tiles)
 
@@ -52,3 +64,4 @@ def save_tif(image: Dict, path: Path, metadata: Optional[Dict]) -> None:
             progress.remove_task(sub_task)
 
     print(f"Image saved to {path}")
+    """

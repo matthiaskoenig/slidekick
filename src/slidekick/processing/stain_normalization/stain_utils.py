@@ -48,13 +48,78 @@ def find_max_c(pxi, stain_matrix: np.ndarray, Io=240) -> np.ndarray:
     # normalize stain concentrations
     return np.array([np.percentile(C[0, :], 99), np.percentile(C[1, :], 99)])
 
-
+"""
 def lsq(pxi: np.ndarray, stain_matrix: np.ndarray, Io=240) -> np.ndarray:
     y = -np.log((pxi.astype(float) + 1) / Io).T
 
     # determine concentrations of the individual stains
     return np.linalg.lstsq(stain_matrix, y, rcond=None)[0]
+"""
 
+# New func due to memory issues
+def lsq(pxi: np.ndarray, stain_matrix: np.ndarray, Io=240) -> np.ndarray:
+    """
+    Memory-efficient least-squares for stain deconvolution.
+
+    - Uses the pseudo-inverse of the small `stain_matrix` (computed once).
+    - Operates in float32.
+    - If `pxi` contains many pixels, it processes them in chunks to keep peak memory low.
+    - Returns concentrations with shape (n_stains, n_pixels) to match previous behavior.
+
+    Parameters
+    ----------
+    pxi : np.ndarray
+        Pixel array. Expected shapes:
+          - (n_pixels, 3)  -> common case (rows of RGB pixels)
+          - (3, n_pixels)  -> already transposed case (will be handled)
+    stain_matrix : np.ndarray
+        Matrix of stain vectors (shape should be (3, n_stains) typically).
+    Io : int or float
+        Illumination constant used in OD transform (default 240).
+    """
+    # ensure numpy arrays and reduce precision to float32 to save memory
+    A = np.asarray(stain_matrix, dtype=np.float32)
+    p = np.asarray(pxi, dtype=np.float32, order='C')
+
+    # compute pseudo-inverse of the small stain matrix (cheap)
+    pinvA = np.linalg.pinv(A).astype(np.float32)  # shape: (n_stains, 3)
+
+    # helper to compute concentrations for a 2D block of pixels with shape (m,3)
+    def _process_block(block: np.ndarray) -> np.ndarray:
+        # compute optical density: shape -> (3, m)
+        od = -np.log((block.astype(np.float32) + 1.0) / float(Io)).T
+        # concentrations: (n_stains, m)
+        return pinvA.dot(od)
+
+    # Case A: pxi is (n_pixels, 3)  -> typical
+    if p.ndim == 2 and p.shape[1] == 3:
+        n_pixels = p.shape[0]
+
+        # choose a safe chunk size in pixels (tunable). This keeps memory peaks small.
+        chunk_size = 200_000
+
+        if n_pixels <= chunk_size:
+            return _process_block(p)
+        else:
+            # new: preallocate and fill
+            n_stains = pinvA.shape[0]
+            out = np.empty((n_stains, n_pixels), dtype=np.float32)
+            for i in range(0, n_pixels, chunk_size):
+                blk = p[i:i + chunk_size]
+                out[:, i:i + blk.shape[0]] = _process_block(blk)
+            return out
+
+    # Case B: pxi is already (3, n_pixels)
+    if p.ndim == 2 and p.shape[0] == 3:
+        # compute od directly (shape (3, n_pixels))
+        od = -np.log((p.astype(np.float32) + 1.0) / float(Io))
+        return pinvA.dot(od)
+
+    # other shapes are unexpected -> provide helpful error
+    raise ValueError(
+        "lsq: unexpected pxi shape. Expected (n_pixels, 3) or (3, n_pixels). "
+        f"Got shape {p.shape}."
+    )
 
 def deconvolve_image(pxi: np.ndarray, stain_matrix: np.ndarray, maxC: np.ndarray, maxCRef=None, Io=240) -> np.ndarray:
     """
@@ -165,12 +230,11 @@ def separate_stains(image_array: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # create a grayscale representation to find interesting pixels with otsu
     gs = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
 
-    otsu_sample = gs.reshape(-1, 1)  # gs[mask[:]]
-
-    threshold, _ = cv2.threshold(otsu_sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    threshold, _ = cv2.threshold(gs, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     idx = gs < threshold
-    px_oi = image_array[idx]
+    ##px_oi = image_array[idx]
+    px_oi = image_array[idx][::10]  # subsampling for speed
 
     stain_matrix = calculate_stain_matrix(px_oi)
 
@@ -205,11 +269,12 @@ def normalize_stain(
     threshold, _ = cv2.threshold(otsu_sample, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     idx = gs < threshold
-    px_oi = image_array[idx]
+    ##px_oi = image_array[idx]
+    px_oi = image_array[idx][::10]  # subsampling for speed
 
     stain_matrix = calculate_stain_matrix(px_oi)
 
-    concentrations = deconvolve_image_and_normalize(image_array.reshape(-1, 3), stain_matrix, maxCRef)
+    concentrations = deconvolve_image_and_normalize(image_array.reshape(-1, 3).astype(np.float32, copy=False), stain_matrix, maxCRef)
 
     normalized = reconstruct_pixels(concentrations=concentrations, refrence_matrix=HERef)
 
