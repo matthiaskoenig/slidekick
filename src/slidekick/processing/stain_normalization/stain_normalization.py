@@ -5,6 +5,7 @@ from slidekick.console import console
 from slidekick.io.metadata import Metadata
 from typing import List
 from slidekick.io import save_tif
+from slidekick import OUTPUT_PATH
 
 class StainNormalizer(BaseOperator):
     """
@@ -48,14 +49,14 @@ class StainNormalizer(BaseOperator):
         # Create a new metadata object for the normalized image
         normalized_metadata = Metadata(
             path_original=s_metadata.path_original,
-            path_storage=s_metadata.path_storage.with_suffix("_normalized.tiff"),
+            path_storage=s_metadata.path_storage.with_name(s_metadata.path_storage.stem + "_normalized.tiff"),
             image_type=s_metadata.image_type,
             #stains={idx: f"{name}_normalized" for idx, _, name in s_metadata.channels},
             uid=f"{s_metadata.uid}_normalized"
         )
 
         # Save the normalized metadata
-        normalized_metadata.save(output_path=normalized_metadata.path_storage)
+        normalized_metadata.save(output_path=OUTPUT_PATH)  #
         console.print(f"Normalized metadata saved to {normalized_metadata.path_storage}")
 
         # Save the new image data to the storage path

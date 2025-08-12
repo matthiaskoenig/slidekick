@@ -6,7 +6,6 @@ from slidekick.console import console
 import zarr
 
 
-
 class BaseOperator(ABC):
     """
     Abstract base class for all operators. We include three main types of operations:
