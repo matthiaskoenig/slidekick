@@ -1,11 +1,14 @@
-from slidekick.processing.baseoperator import BaseOperator
 import numpy as np
+from typing import List
+
 from slidekick.processing.stain_normalization.stain_utils import normalize_stain
 from slidekick.console import console
 from slidekick.io.metadata import Metadata
-from typing import List
 from slidekick.io import save_tif
 from slidekick import OUTPUT_PATH
+
+from slidekick.processing.baseoperator import BaseOperator
+
 
 class StainNormalizer(BaseOperator):
     """
@@ -18,7 +21,8 @@ class StainNormalizer(BaseOperator):
             metadata: Metadata,
             channel_selection: List[int],
             HERef: np.ndarray = np.array([[0.65, 0.2159], [0.70, 0.8012], [0.29, 0.5581]]),
-            maxCRef: np.ndarray = np.array([1.9705, 1.0308])) -> None:
+            maxCRef: np.ndarray = np.array([1.9705, 1.0308]),
+            save_img: bool = True) -> None:
 
         # Ensure that 3 channels and 1 image, i.e., metadata object are selected before init call of the superclass
         if not isinstance(metadata, Metadata):
@@ -28,6 +32,7 @@ class StainNormalizer(BaseOperator):
 
         self.HERef = HERef
         self.maxCRef = maxCRef
+        self.save_img = save_img
 
         # Call the init method of the parent class to set up metadata and channel selection
         super().__init__(metadata, channel_selection)
@@ -46,10 +51,15 @@ class StainNormalizer(BaseOperator):
         else:
             s_metadata = self.metadata
 
+        if self.save_img:
+            storage_path = s_metadata.path_storage.with_name(s_metadata.path_storage.stem + "_normalized.tiff")
+        else:
+            storage_path = None
+
         # Create a new metadata object for the normalized image
         normalized_metadata = Metadata(
             path_original=s_metadata.path_original,
-            path_storage=s_metadata.path_storage.with_name(s_metadata.path_storage.stem + "_normalized.tiff"),
+            path_storage=storage_path,
             image_type=s_metadata.image_type,
             #stains={idx: f"{name}_normalized" for idx, _, name in s_metadata.channels},
             uid=f"{s_metadata.uid}_normalized"
@@ -60,7 +70,8 @@ class StainNormalizer(BaseOperator):
         console.print(f"Normalized metadata saved to {normalized_metadata.path_storage}")
 
         # Save the new image data to the storage path
-        save_tif(normalized_data, normalized_metadata.path_storage, metadata=normalized_metadata)
+        if self.save_img:
+            save_tif(normalized_data, normalized_metadata.path_storage, metadata=normalized_metadata)
 
         return normalized_metadata
 

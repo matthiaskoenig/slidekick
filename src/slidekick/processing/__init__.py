@@ -1,2 +1,1 @@
 from .baseoperator import BaseOperator
-from .stain_normalization.stain_normalization import StainNormalizer
