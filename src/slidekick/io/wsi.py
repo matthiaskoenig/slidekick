@@ -55,6 +55,7 @@ def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> Tuple[dict[int
 
     return d, image_path
 
+
 if __name__ == "__main__":
     # Example for reading files
     from slidekick import DATA_PATH

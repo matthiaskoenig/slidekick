@@ -24,7 +24,7 @@ class BaseOperator(ABC):
     def __init__(
         self,
         metadata: Union[Metadata, List[Metadata]],
-        channel_selection: Union[Tuple[int, int], List[Tuple[int, int]], List[int]]
+        channel_selection: Union[Tuple[int, int], List[Tuple[int, int]], List[int], None]
     ) -> None:
         self.metadata = metadata if isinstance(metadata, list) else [metadata]
 
@@ -34,6 +34,7 @@ class BaseOperator(ABC):
         # If channel_selection is a single tuple, convert it to a list of one tuple
         if isinstance(channel_selection, tuple) and len(channel_selection) == 2:
             channel_selection = [channel_selection]
+        # Some operators operate on all images provided and no channel_selection is necessary, e.g., valis registration
 
         self.channels = channel_selection
 
@@ -57,20 +58,3 @@ class BaseOperator(ABC):
 
         return img
 
-
-    def extract_channels(self, image: dict[int, zarr.Array]) -> List[zarr.Array]:
-        """
-        Extract the channels from the image based on the selected channels.
-        Returns a list of zarr arrays for the selected channels.
-        """
-        extracted_channels = []
-        for img_idx, channel_idx in self.channels:
-            if img_idx < len(self.metadata):
-                metadata = self.metadata[img_idx]
-                if channel_idx < len(image):
-                    extracted_channels.append(image[channel_idx])
-                else:
-                    console.print(f"Channel index {channel_idx} out of range for image {img_idx}.", style="error")
-            else:
-                console.print(f"Image index {img_idx} out of range for metadata.", style="error")
-        return extracted_channels
