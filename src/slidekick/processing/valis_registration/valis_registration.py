@@ -2,6 +2,7 @@ from typing import List
 import datetime
 import uuid
 from pathlib import Path
+import shutil
 
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
@@ -50,13 +51,6 @@ class ValisRegistrator(BaseOperator):
           downstream processing / saving / metadata-updating.
         """
 
-        # Build a list of input slide file paths from metadata.
-        # Prefer path_original if present, otherwise path_storage.
-        img_paths = []
-        for m in self.metadata:
-            # Metadata.path_storage are Path-like; cast to str for VALIS
-            img_paths.append(str(m.path_storage))
-
         # Create a results folder for this registration run (under OUTPUT_PATH).
         # Using a timestamp + short uuid to keep results separate if apply() called multiple times.
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -65,6 +59,13 @@ class ValisRegistrator(BaseOperator):
 
         results_dir = Path(OUTPUT_PATH) / f"valis_registration_{timestamp}_{short_id}"
         results_dir.mkdir(parents=True, exist_ok=True)
+
+        temp_img_dir = results_dir / "temp_imgs"
+        temp_img_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy every image metadata from path_storage to temp_img_dir
+        for m in self.metadata:
+            shutil.copy(m.path_storage, temp_img_dir)
 
         # registered slides destination folder
         registered_slide_dst_dir = results_dir / "registered_slides"
@@ -82,14 +83,13 @@ class ValisRegistrator(BaseOperator):
         # Initialize VALIS registrar with the list of slide image paths.
         # imgs_ordered=False lets VALIS reorder the images by similarity (unordered structure).
         # reference_img_f=None leaves selection of reference image to VALIS (it will pick center).
-        #TODO: Currently hardcoded path to folder, needs adaptive copying of files into temp folder with uid or smth
 
         from slidekick import DATA_PATH
 
         registrar = registration.Valis(
-            src_dir=str(DATA_PATH / "reg" / "debug"),
+            src_dir=str(temp_img_dir),
             dst_dir=str(results_dir),
-            img_list=img_paths,
+            #img_list=img_paths, Unused for now
             max_processed_image_dim_px=self.max_processed_image_dim_px,
             imgs_ordered=self.imgs_ordered,
             crop="reference"
@@ -112,6 +112,9 @@ class ValisRegistrator(BaseOperator):
         registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop="overlap")
 
         console.print(f"Full-resolution registered slides saved to: {registered_slide_dst_dir}")
+
+        # Delete temp dir
+        shutil.rmtree(temp_img_dir)
 
         # VALIS saved the transformed images to the new path as individual objects
 
@@ -173,14 +176,14 @@ if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
 
-    image_paths = [DATA_PATH / "reg" / "HE.tiff",
-                   DATA_PATH / "reg" / "Arginase1.tiff",
-                   DATA_PATH / "reg" / "KI67.tiff",
+    image_paths = [DATA_PATH / "reg" / "HE.ome.tif",
+                   DATA_PATH / "reg" / "Arginase1.ome.tif",
+                   DATA_PATH / "reg" / "KI67.ome.tif",
                    ]
 
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=850)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=5000)
 
     metadatas_registered = Registrator.apply()
 
