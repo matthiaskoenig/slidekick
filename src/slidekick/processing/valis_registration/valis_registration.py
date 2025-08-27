@@ -13,6 +13,8 @@ from slidekick.processing.baseoperator import BaseOperator
 # VALIS imports
 from valis import registration
 
+import matplotlib
+matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 from skimage.io import imread
@@ -28,6 +30,7 @@ class ValisRegistrator(BaseOperator):
                  save_img: bool = True,
                  imgs_ordered: bool = False,
                  max_processed_image_dim_px: int = 850,
+                 max_non_rigid_registration_dim_px: int = 850,
                  confirm: bool = True,
                  preview: bool = True):
         """
@@ -38,6 +41,7 @@ class ValisRegistrator(BaseOperator):
         channel_selection = None
         self.imgs_ordered = imgs_ordered
         self.max_processed_image_dim_px = max_processed_image_dim_px
+        self.max_non_rigid_registration_dim_px = max_non_rigid_registration_dim_px
         self.confirm = confirm  # Confirm if check is applied
         self.preview = preview  # Preview transformation
         super().__init__(metadata, channel_selection)
@@ -94,6 +98,7 @@ class ValisRegistrator(BaseOperator):
             dst_dir=str(results_dir),
             #img_list=img_paths, Unused for now
             max_processed_image_dim_px=self.max_processed_image_dim_px,
+            max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px,
             imgs_ordered=self.imgs_ordered,
             crop="reference"
         )
@@ -297,13 +302,14 @@ if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
 
-    image_paths = [DATA_PATH / "reg" / "HE.ome.tif",
-                   #DATA_PATH / "reg" / "Arginase1.ome.tif",
-                   DATA_PATH / "reg" / "KI67.ome.tif",
+    image_paths = [DATA_PATH / "reg" / "HE1.ome.tif",
+                   DATA_PATH / "reg" / "HE2.ome.tif",
+                   DATA_PATH / "reg" / "Arginase1.ome.tif",
+                   DATA_PATH / "reg" / "KI67.ome.tif"
                    ]
 
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=2048)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=850, max_non_rigid_registration_dim_px=850)
 
     metadatas_registered = Registrator.apply()
