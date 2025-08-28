@@ -3,11 +3,11 @@ import datetime
 import uuid
 from pathlib import Path
 import shutil
+from rich.prompt import Confirm
 
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
-from rich.prompt import Confirm
 from slidekick.processing.baseoperator import BaseOperator
 
 # VALIS imports

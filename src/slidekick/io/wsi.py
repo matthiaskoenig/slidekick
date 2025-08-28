@@ -43,17 +43,57 @@ def read_wsi(image_path: Path, max_workers=os.cpu_count() - 1) -> Tuple[dict[int
         else:
             console.print("CZI already converted to TIFF", style="warning")
 
+    # Keep your tifffile.imread(..., aszarr=True) flow, but stop using .info
     store = tifffile.imread(str(image_path), aszarr=True, maxworkers=max_workers)
-    zarr_group = zarr.open(store, mode="r")
+    root = zarr.open(store, mode="r")
 
-    for key, value in zarr_group.info.items:
-        if key == "No. arrays":
-            n_arrays = int(value)
-            break
+    # If root is a single array
+    if isinstance(root, zarr.Array):
+        return {0: root}, image_path
 
-    d: dict[int, zarr.Array] = {level: zarr_group.get(level) for level in range(n_arrays)}
+    # Else root is a group: collect arrays by numeric keys
+    arrays: dict[int, zarr.Array] = {}
 
-    return d, image_path
+    # Try array_keys() first (zarr v2)
+    keys = []
+    try:
+        keys = list(root.array_keys())
+    except Exception:
+        pass
+
+    # Fallback: generic keys() or probing "0","1",...
+    if not keys:
+        try:
+            keys = list(root.keys())
+        except Exception:
+            keys = []
+
+    if keys:
+        for k in sorted(keys, key=lambda x: int(x) if str(x).isdigit() else float("inf")):
+            arr = root.get(k)
+            if arr is not None:
+                idx = int(k) if str(k).isdigit() else len(arrays)
+                arrays[idx] = arr
+    else:
+        i = 0
+        while True:
+            arr = root.get(str(i))
+            if arr is None:
+                break
+            arrays[i] = arr
+            i += 1
+
+    # If still empty, fall back to TiffFile().series[0].aszarr()
+    if not arrays:
+        with tifffile.TiffFile(str(image_path)) as tf:
+            s = tf.series[0]
+            z = s.aszarr(maxworkers=max_workers)
+            if isinstance(z, list):
+                arrays = {i: z[i] for i in range(len(z))}
+            else:
+                arrays = {0: z}
+
+    return arrays, image_path
 
 
 if __name__ == "__main__":
