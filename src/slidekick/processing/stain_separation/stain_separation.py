@@ -1,4 +1,3 @@
-import uuid
 import numpy as np
 from pathlib import Path
 from rich.prompt import Confirm, Prompt
@@ -209,16 +208,15 @@ class StainSeparator(BaseOperator):
         # Save outputs and create metadata per stain
         output_metadata = []
         base_path = Path(self.metadata[0].path_storage)
-        base_stem = base_path.stem
+        base_stem = str(base_path.name).rstrip(''.join(base_path.suffixes))
         orig_meta = self.metadata[0]
+
+        dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
         for j, stain_name in enumerate(stain_names):
             if stain_name.lower() == "residual":
                 continue
-
-            new_uid = uuid.uuid4().hex
-            dest_dir = Path(OUTPUT_PATH) / new_uid
-            dest_dir.mkdir(parents=True, exist_ok=True)
 
             out_name = f"{base_stem}_{stain_name.replace(' ', '_')}.tiff"
             out_path = dest_dir / out_name
@@ -227,7 +225,7 @@ class StainSeparator(BaseOperator):
                 path_original=orig_meta.path_original,
                 path_storage=out_path,
                 image_type=orig_meta.image_type,
-                uid=new_uid
+                uid=f"{self.metadata[0].uid}-{stain_name.replace(' ', '_')}"
             )
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)  # save metadata into the same folder
@@ -363,25 +361,24 @@ class StainSeparator(BaseOperator):
                     colored.append(_colorize(Aprev[..., ch], rgb_vec))
 
                 # Layout: Original + colored channels
+                # Layout: Original + colored channels in one row
                 total = 1 + len(colored)
-                cols = min(total, 3)
-                rows = int(np.ceil(total / cols))
-                fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
-                axes = np.array(axes).reshape(-1)
+                fig, axes = plt.subplots(1, total, figsize=(3 * total, 3))
+                axes = np.atleast_1d(axes).ravel()
 
-                axes[0].imshow(original_panel);
-                axes[0].set_title("Original");
+                axes[0].imshow(original_panel)
+                axes[0].set_title("Original")
                 axes[0].axis("off")
+
                 for i, img_rgb in enumerate(colored, start=1):
                     axes[i].imshow(img_rgb)
                     ch_name = stain_dict.get(show_idx[i - 1], f"Channel{show_idx[i - 1]}")
-                    axes[i].set_title(ch_name);
+                    axes[i].set_title(ch_name)
                     axes[i].axis("off")
-                for ax in axes[1 + len(colored):]:
-                    ax.axis("off")
 
-                plt.tight_layout();
+                plt.tight_layout()
                 plt.show()
+
             except Exception as e:
                 console.print(f"Fluorescence preview failed: {e}", style="error")
 
@@ -405,13 +402,12 @@ class StainSeparator(BaseOperator):
         # save per channel (grayscale intensity)
         output_metadata = []
         base_path = Path(orig_meta.path_storage)
-        base_stem = base_path.stem
+        base_stem = str(base_path.name).rstrip(''.join(base_path.suffixes))
+        stain_name = stain_dict.get(ch, f"ch{ch}")
+        dest_dir = Path(OUTPUT_PATH) / orig_meta.uid
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
         for ch in range(n_ch):
-            stain_name = stain_dict.get(ch, f"ch{ch}")
-            new_uid = uuid.uuid4().hex
-            dest_dir = Path(OUTPUT_PATH) / new_uid
-            dest_dir.mkdir(parents=True, exist_ok=True)
 
             out_name = f"{base_stem}_{stain_name.replace(' ', '_')}.tiff"
             out_path = dest_dir / out_name
@@ -420,7 +416,7 @@ class StainSeparator(BaseOperator):
                 path_original=orig_meta.path_original,
                 path_storage=out_path,
                 image_type=orig_meta.image_type or "fluorescence",
-                uid=new_uid,
+                uid=f"{orig_meta.uid}-ch{ch}",
             )
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)
