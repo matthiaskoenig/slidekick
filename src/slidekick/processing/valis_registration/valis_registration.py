@@ -4,6 +4,8 @@ import uuid
 from pathlib import Path
 import shutil
 from rich.prompt import Confirm
+import warnings
+
 
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
@@ -106,123 +108,206 @@ class ValisRegistrator(BaseOperator):
         # Run registration: returns rigid and non-rigid registrar objects and an error dataframe
         rigid_registrar, non_rigid_registrar, error_df = registrar.register()
 
-        # Preview as a grid: rows = slides, cols = [original, rigid, non-rigid]
+        # Preview: rows = [original color, rigid(gray), non-rigid(gray)] x cols = slides
         if self.preview:
             try:
                 slides = list(registrar.slide_dict.values())
                 if not slides:
-                    console.print("No slides found for preview.", style="error")
+                    console.print("No slides for preview.", style="error")
                     return self.metadata
 
-                # name -> original path (invert VALIS' mapping)
+                MAX_SIDE = 2048
+                warnings.filterwarnings(
+                    "ignore",
+                    message="scaling transformation for image with different shape",
+                    category=UserWarning,
+                )
+
+                def _downsample_stride(img: np.ndarray, max_side: int = MAX_SIDE) -> np.ndarray:
+                    if img is None:
+                        return None
+                    a = np.asarray(img)
+                    H, W = a.shape[:2]
+                    if max(H, W) <= max_side:
+                        return a
+                    s = max(int(np.ceil(max(H, W) / float(max_side))), 1)
+                    return a[::s, ::s] if a.ndim == 2 else a[::s, ::s, :]
+
+                def _stretch99(x: np.ndarray) -> np.ndarray:
+                    x = x.astype(np.float32, copy=False)
+                    lo, hi = np.percentile(x, (1, 99))
+                    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                        lo = np.nanmin(x) if np.isfinite(np.nanmin(x)) else 0.0
+                        hi = np.nanmax(x) if np.isfinite(np.nanmax(x)) else 1.0
+                        if hi <= lo:
+                            hi = lo + 1.0
+                    y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+                    return (y * 255.0).astype(np.uint8)
+
+                def _guess_brightfield(arr: np.ndarray) -> bool:
+                    a = np.asarray(arr)
+                    return a.ndim == 3 and a.shape[2] >= 3 and a.dtype == np.uint8
+
+                def _rgb_native(a: np.ndarray) -> np.ndarray:
+                    """Preserve brightfield colors. Take first 3 channels. No per-channel stretch."""
+                    x = np.asarray(a)
+                    if x.ndim == 2:  # rare for BF; make neutral RGB
+                        x = np.repeat(x[:, :, None], 3, axis=2)
+                    else:
+                        x = x[..., :3]
+                    if x.dtype == np.uint8:
+                        return x
+                    if x.dtype == np.uint16:
+                        return (x / 257.0).clip(0, 255).astype(np.uint8)
+                    # float or other: uniform scale by global max (keeps color balance)
+                    x = x.astype(np.float32, copy=False)
+                    m = np.nanmax(x)
+                    m = 1.0 if (not np.isfinite(m) or m <= 0) else m
+                    return np.clip(x / m * 255.0, 0, 255).astype(np.uint8)
+
+                def _pick_rgb3(src: np.ndarray) -> list[np.ndarray]:
+                    """Choose 3 channels for fluorescence. Handles 2D, 3D, ND."""
+                    x = np.asarray(src)
+                    if x.ndim == 2:
+                        return [x, x, x]
+                    if x.ndim == 3:
+                        C = x.shape[2]
+                        if C >= 3:
+                            return [x[..., 0], x[..., 1], x[..., 2]]
+                        if C == 2:
+                            c0, c1 = x[..., 0], x[..., 1]
+                            return [c0, c1, np.maximum(c0, c1)]
+                        g = x[..., 0]
+                        return [g, g, g]
+                    # ND fallback: flatten non-spatial dims to channels, take first three
+                    order = np.argsort(x.shape)[::-1]
+                    y_dim, x_dim = order[:2]
+                    y = np.transpose(x, (y_dim, x_dim, *[d for d in range(x.ndim) if d not in (y_dim, x_dim)]))
+                    H, W = y.shape[:2]
+                    C = int(np.prod(y.shape[2:])) if y.ndim > 2 else 1
+                    y = y.reshape(H, W, C)
+                    if C >= 3:
+                        return [y[..., 0], y[..., 1], y[..., 2]]
+                    if C == 2:
+                        c0, c1 = y[..., 0], y[..., 1]
+                        return [c0, c1, np.maximum(c0, c1)]
+                    g = y[..., 0]
+                    return [g, g, g]
+
+                def _rgb_from_channels_stretched(chs: list[np.ndarray]) -> np.ndarray:
+                    """Fluorescence: per-channel percentile stretch to avoid black tiles."""
+                    return np.stack([_stretch99(np.asarray(chs[0])),
+                                     _stretch99(np.asarray(chs[1])),
+                                     _stretch99(np.asarray(chs[2]))], axis=-1)
+
+                # Map VALIS short name -> original file path (for thumbnail fallback)
                 name_to_src = {v: k for k, v in registrar.name_dict.items()}
 
-                def to_rgb(arr: np.ndarray) -> np.ndarray:
-                    if arr is None:
-                        return None
-                    if arr.ndim == 2:
-                        arr = np.repeat(arr[..., None], 3, axis=2)
-                    if arr.shape[-1] > 3:
-                        arr = arr[..., :3]
-                    return arr
-
-                def load_orig_downsample(src_fp: str, target_hw: tuple[int, int]) -> np.ndarray | None:
-                    if not src_fp or not Path(src_fp).exists():
-                        return None
-                    Ht, Wt = target_hw
-                    try:
-                        im = pyvips.Image.thumbnail(src_fp, Wt)
-                        if im.bands == 1:
-                            im = im.bandjoin([im, im, im])
-                        arr = np.frombuffer(im.write_to_memory(), dtype=np.uint8).reshape(im.height, im.width, im.bands)
-                    except Exception:
+                def _read_original_color(slide) -> np.ndarray:
+                    # Prefer VALIS-provided slide.image
+                    src = getattr(slide, "image", None)
+                    if src is not None:
+                        if _guess_brightfield(src):
+                            return _downsample_stride(_rgb_native(src))
+                        # fluorescence or non-uint8 3-channel -> stretch per channel
+                        return _downsample_stride(_rgb_from_channels_stretched(_pick_rgb3(src)))
+                    # Fallback: thumbnail from original file via pyvips
+                    src_fp = name_to_src.get(slide.name, None)
+                    if src_fp and Path(src_fp).exists():
                         try:
-                            arr = imread(src_fp)
+                            v = pyvips.Image.thumbnail(str(src_fp), MAX_SIDE)
+                            arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(v.height, v.width, v.bands)
+                            if arr.shape[2] == 1:
+                                arr = np.repeat(arr, 3, axis=2)
+                            if arr.shape[2] > 3:
+                                arr = arr[..., :3]
+                            return arr
                         except Exception:
-                            return None
-                    if (arr.shape[0], arr.shape[1]) != (Ht, Wt):
-                        arr = resize(arr, (Ht, Wt), order=1, anti_aliasing=True, preserve_range=True).astype(np.uint8)
-                    if arr.ndim == 3 and arr.shape[-1] == 4:
-                        arr = arr[..., :3]
-                    return arr
+                            pass
+                    # Last resort: processed gray replicated
+                    g = _stretch99(slide.processed_img)
+                    return np.stack([g, g, g], axis=-1)
 
-                # Collect per-slide images
                 per_slide = []
                 for slide in slides:
                     name = slide.name
+                    proc = slide.processed_img  # registration resolution (2D)
 
-                    rigid_fp = getattr(slide, "rigid_reg_img_f", None)
-                    nr_fp = getattr(slide, "non_rigid_reg_img_f", None)
+                    # Row 1: original color (BF native, FL stretch), ≤2048
+                    orig_rgb = _read_original_color(slide)
 
-                    rigid = imread(rigid_fp) if rigid_fp and Path(rigid_fp).exists() else None
-                    nonrigid = imread(nr_fp) if nr_fp and Path(nr_fp).exists() else None
-
-                    # choose canvas for original downsample
-                    tgt = nonrigid if nonrigid is not None else rigid
-                    if tgt is None:
-                        # last resort: try to synthesize rigid from processed
+                    # Rows 2–3: warp processed image to grayscale previews (shape-matched)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", category=UserWarning)
                         try:
-                            rigid = slide.warp_img(img=slide.processed_img, non_rigid=False, crop=True)
-                            tgt = rigid
+                            rigid_gray = slide.warp_img(img=proc, non_rigid=False, crop=True)
                         except Exception:
-                            console.print(f"No registered image for '{name}'. Skipping column.", style="warning")
-                            continue
-
-                    # synthesize non-rigid if missing and dxdy exists
-                    if nonrigid is None:
+                            rigid_gray = None
                         try:
-                            nonrigid = slide.warp_img(img=slide.processed_img, non_rigid=True, crop=True)
+                            nonrigid_gray = slide.warp_img(img=proc, non_rigid=True, crop=True)
                         except Exception:
-                            nonrigid = None  # non-rigid likely disabled or failed
+                            nonrigid_gray = None
 
-                    src_fp = name_to_src.get(name)
-                    orig = load_orig_downsample(src_fp, (tgt.shape[0], tgt.shape[1]))
+                    rigid_gray = _downsample_stride(_stretch99(rigid_gray)) if rigid_gray is not None else None
+                    nonrigid_gray = _downsample_stride(_stretch99(nonrigid_gray)) if nonrigid_gray is not None else None
 
-                    per_slide.append((name, to_rgb(orig), to_rgb(rigid), to_rgb(nonrigid)))
+                    per_slide.append((name, orig_rgb, rigid_gray, nonrigid_gray))
 
                 if not per_slide:
-                    console.print("Nothing to show.")
+                    console.print("Nothing to preview.", style="warning")
                     return self.metadata
 
-                # Plot: 3 rows (orig, rigid, non-rigid) x N columns (slides)
+                # Plot 3 rows x N columns
                 n = len(per_slide)
                 fig_w = max(3.0 * n, 6.0)
-                fig_h = 3.0 * 3
+                fig_h = 9.0
                 fig, axes = plt.subplots(3, n, figsize=(fig_w, fig_h), constrained_layout=True)
                 if n == 1:
                     axes = np.expand_dims(axes, 1)
 
-                row_titles = ["original", "rigid", "non-rigid"]
-                for j, (name, orig, rigid, nonrigid) in enumerate(per_slide):
+                row_titles = ["original color", "rigid", "non-rigid"]
+                for j, (name, orig_p, rigid_p, nonrigid_p) in enumerate(per_slide):
                     axes[0, j].set_title(name, fontsize=10)
-                    imgs = [orig, rigid, nonrigid]
-                    for i in range(3):
-                        ax = axes[i, j]
-                        img = imgs[i]
-                        if img is None:
-                            ax.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
-                        else:
-                            ax.imshow(img)
-                        if j == 0:
-                            ax.set_ylabel(row_titles[i], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
-                            ax.set_xticks([]);
-                            ax.set_yticks([])
-                            for s in ax.spines.values():
-                                s.set_visible(False)
-                        else:
-                            ax.axis("off")  # safe for non-label columns
+
+                    # row 1: color
+                    ax0 = axes[0, j]
+                    ax0.imshow(orig_p) if orig_p is not None else ax0.text(0.5, 0.5, "N/A", ha="center", va="center",
+                                                                           fontsize=9)
+                    ax0.set_ylabel(row_titles[0], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
+                    ax0.set_xticks([]);
+                    ax0.set_yticks([]);
+                    [s.set_visible(False) for s in ax0.spines.values()]
+
+                    # row 2: rigid grayscale
+                    ax1 = axes[1, j]
+                    ax1.imshow(rigid_p, cmap="gray") if rigid_p is not None else ax1.text(0.5, 0.5, "N/A", ha="center",
+                                                                                          va="center", fontsize=9)
+                    ax1.set_ylabel(row_titles[1], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
+                    ax1.set_xticks([]);
+                    ax1.set_yticks([]);
+                    [s.set_visible(False) for s in ax1.spines.values()]
+
+                    # row 3: non-rigid grayscale
+                    ax2 = axes[2, j]
+                    ax2.imshow(nonrigid_p, cmap="gray") if nonrigid_p is not None else ax2.text(0.5, 0.5, "N/A",
+                                                                                                ha="center",
+                                                                                                va="center", fontsize=9)
+                    ax2.set_ylabel(row_titles[2], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
+                    ax2.set_xticks([]);
+                    ax2.set_yticks([]);
+                    [s.set_visible(False) for s in ax2.spines.values()]
 
                 plt.show()
 
-                if self.confirm:
-                    apply = Confirm.ask("Apply full-resolution transformation and save outputs?", default=False,
-                                        console=console)
-                    if not apply:
-                        console.print("Aborted by user. No warping performed.")
-                        return self.metadata
-
             except Exception as e:
-                console.print(f"Matplotlib preview failed ({e}). Continuing without preview.", style="error")
+                console.print(f"Preview failed ({e}). Continuing without preview.", style="error")
+
+        if self.confirm:
+            apply = Confirm.ask("Apply full-resolution transformation and save outputs?", default=False,
+                                console=console)
+            if not apply:
+                console.print("Aborted by user. No warping performed.")
+                return self.metadata
 
         console.print(f"VALIS registration completed. Results directory: {results_dir}", style="info")
 
@@ -305,11 +390,13 @@ if __name__ == "__main__":
     image_paths = [DATA_PATH / "reg" / "HE1.ome.tif",
                    DATA_PATH / "reg" / "HE2.ome.tif",
                    DATA_PATH / "reg" / "Arginase1.ome.tif",
-                   DATA_PATH / "reg" / "KI67.ome.tif"
+                   DATA_PATH / "reg" / "KI67.ome.tif",
+                   DATA_PATH / "reg" / "GS_CYP1A2.czi",
+                   DATA_PATH / "reg" / "Ecad_CYP2E1.czi",
                    ]
 
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=850, max_non_rigid_registration_dim_px=850)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600)
 
     metadatas_registered = Registrator.apply()
