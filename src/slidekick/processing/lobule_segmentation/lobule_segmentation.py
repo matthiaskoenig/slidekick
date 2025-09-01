@@ -40,6 +40,7 @@ class LobuleSegmentor(BaseOperator):
             channel_selection = [channel_selection]
         super().__init__(metadata, channel_selection)
 
+    @staticmethod
     def _downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
         """
         Downsample image so max(height, width) == max_side, preserving aspect ratio.
@@ -75,7 +76,6 @@ class LobuleSegmentor(BaseOperator):
 
         return out
 
-    # === add this method ===
     def _preview_images(self, images: List[np.ndarray], titles: Optional[List[str]] = None) -> None:
         """
         Downsample and render a grid preview. Max 2048 px on the longest side per image.
@@ -148,7 +148,7 @@ class LobuleSegmentor(BaseOperator):
                 return a[...]
             return None
 
-        arrays, shapes = [], []
+        arrays = []
 
         for i, md in enumerate(self.metadata):
             # resolve path
@@ -188,18 +188,18 @@ class LobuleSegmentor(BaseOperator):
                     img = 1.0 - img
 
             arrays.append(img)
-            shapes.append(img.shape[:2])
 
         if not arrays:
             raise RuntimeError("No images loaded after filtering.")
 
-        # crop all to smallest H×W so stacking is defined
-        h_min = min(s[0] for s in shapes)
-        w_min = min(s[1] for s in shapes)
+        # stack along the third dimension
+        # harmonize shapes before stacking
+        h_min = min(a.shape[0] for a in arrays)
+        w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
 
-        # stack along the third dimension
-        stack = np.dstack(arrays)  # (H, W, N)
+        stack = np.dstack(arrays)
+
         return stack
 
 
@@ -209,22 +209,22 @@ class LobuleSegmentor(BaseOperator):
         img_stack = self._load_and_invert_images_from_metadatas()
 
         # Apply filters
-
+        # TODO: Next
 
         # Show Preview after loading and filtering
         if self.preview:
             # Ensure we have a list of arrays to preview
-            # zarr.Array or numpy array -> split into list; list stays as-is
+            # numpy array -> split into list
             if isinstance(img_stack, list):
                 imgs = img_stack
             elif hasattr(img_stack, "shape"):
-                # Accept shapes like (N,H,W[,C]) and slice into a list
-                if img_stack.ndim < 3:
+                if img_stack.ndim == 2:
                     imgs = [np.asarray(img_stack)]
+                elif img_stack.ndim == 3:
+                    # assume H, W, N and split channels
+                    imgs = [np.asarray(img_stack[..., i]) for i in range(img_stack.shape[2])]
                 else:
-                    imgs = [np.asarray(img_stack[i]) for i in range(img_stack.shape[0])]
-            else:
-                raise ValueError("Unsupported img_stack type for preview.")
+                    raise ValueError("Unsupported img_stack shape for preview.")
 
             # Optional titles from metadata if available
             titles = []
