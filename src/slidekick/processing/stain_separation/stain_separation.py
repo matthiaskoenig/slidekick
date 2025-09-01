@@ -5,7 +5,7 @@ import zarr
 
 from slidekick.processing.baseoperator import BaseOperator
 from slidekick.io.metadata import Metadata
-from slidekick.io import save_tif, read_wsi
+from slidekick.io import save_tif
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
 
@@ -42,7 +42,7 @@ DEFAULT_STAIN_NAMES = {
 def _to_numpy(arr):
     """Coerce zarr NumPy-like arrays to NumPy ndarray."""
     if isinstance(arr, zarr.Array):
-       return arr[...]
+        return arr[...]
     else:
         return np.asarray(arr)
 
@@ -98,7 +98,7 @@ class StainSeparator(BaseOperator):
         mode = self.mode
         if mode is None:
             try:
-                img_example, _ = read_wsi(self.metadata[0].path_storage)
+                img_example = self.load_image()
                 sample_level = next(iter(img_example.keys()))
                 arr = _to_numpy(img_example[sample_level])
                 if arr.ndim == 3 and arr.shape[2] == 3 and \
@@ -133,7 +133,8 @@ class StainSeparator(BaseOperator):
             M = np.column_stack([M, v3])
             stain_names = stain_names + ["Residual"]
 
-        image = self.load_image()  # dict[level] -> array
+        # READ ALL PYRAMID LEVELS
+        image = self.load_image()   # dict[level] -> array
         separated_levels = [dict() for _ in range(M.shape[1])]
 
         # also keep a colored preview per stain at preview level
@@ -208,8 +209,8 @@ class StainSeparator(BaseOperator):
         # Save outputs and create metadata per stain
         output_metadata = []
         base_path = Path(self.metadata[0].path_storage)
-        base_stem = str(base_path.name).rstrip(''.join(base_path.suffixes))
-        orig_meta = self.metadata[0]
+        # safe multi-suffix trimming (e.g., .ome.tif)
+        base_stem = base_path.name[:-len(''.join(base_path.suffixes))] if base_path.suffixes else base_path.stem
 
         dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -222,13 +223,14 @@ class StainSeparator(BaseOperator):
             out_path = dest_dir / out_name
 
             new_meta = Metadata(
-                path_original=orig_meta.path_original,
+                path_original=self.metadata[0].path_original,
                 path_storage=out_path,
-                image_type=orig_meta.image_type,
+                image_type=self.metadata[0].image_type,
                 uid=f"{self.metadata[0].uid}-{stain_name.replace(' ', '_')}"
             )
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)  # save metadata into the same folder
+            # Passing a level→array dict => save_tif writes tiled, pyramidal TIFF
             save_tif(separated_levels[j], out_path, metadata=new_meta)
 
             console.print(f"Saved [{stain_name}] to {out_path}", style="success")
@@ -311,8 +313,9 @@ class StainSeparator(BaseOperator):
             y = _stretch99(ch2d)[..., None] * rgb[None, None, :]
             return (np.clip(y, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-        # load and inspect
-        image = self.load_image()
+        # READ ALL PYRAMID LEVELS
+        image = self.load_image()  # dict[level] -> array
+
         sample_level = min(image.keys())
         A0 = _to_numpy(image[sample_level])
         if A0.ndim < 3 or A0.shape[2] < 1:
@@ -320,8 +323,7 @@ class StainSeparator(BaseOperator):
             return self.metadata
         n_ch = int(A0.shape[2])
 
-        orig_meta = self.metadata[0]
-        stain_dict = getattr(orig_meta, "stains", {}) or {}
+        stain_dict = getattr(self.metadata[0], "stains", {}) or {}
 
         # preview (downsampled only)
         if self.preview:
@@ -334,8 +336,6 @@ class StainSeparator(BaseOperator):
                 stride = max(int(np.ceil(max(Aprev.shape[0], Aprev.shape[1]) / MAX_PREVIEW_SIDE)), 1)
                 if stride > 1:
                     Aprev = Aprev[::stride, ::stride, :]
-
-                H, W, _ = Aprev.shape
 
                 # Original panel
                 if n_ch == 3:
@@ -360,7 +360,6 @@ class StainSeparator(BaseOperator):
                         rgb_vec = PALETTE[ch % len(PALETTE)]
                     colored.append(_colorize(Aprev[..., ch], rgb_vec))
 
-                # Layout: Original + colored channels
                 # Layout: Original + colored channels in one row
                 total = 1 + len(colored)
                 fig, axes = plt.subplots(1, total, figsize=(3 * total, 3))
@@ -392,6 +391,7 @@ class StainSeparator(BaseOperator):
         # build full-resolution separated levels (no downsampling)
         separated_levels = {ch: {} for ch in range(n_ch)}
         for level, arr in image.items():
+            # keep ALL pyramid levels; each ch gets a level→2D array map
             A = _to_numpy(arr)  # Y×X×C
             if A.ndim != 3 or A.shape[2] != n_ch:
                 console.print(f"Unexpected image format at level {level}, skipping.", style="warning")
@@ -401,25 +401,27 @@ class StainSeparator(BaseOperator):
 
         # save per channel (grayscale intensity)
         output_metadata = []
-        base_path = Path(orig_meta.path_storage)
-        base_stem = str(base_path.name).rstrip(''.join(base_path.suffixes))
-        stain_name = stain_dict.get(ch, f"ch{ch}")
-        dest_dir = Path(OUTPUT_PATH) / orig_meta.uid
+        base_path = Path(self.metadata[0].path_storage)
+        # safe multi-suffix trimming (e.g., .ome.tif)
+        base_stem = base_path.name[:-len(''.join(base_path.suffixes))] if base_path.suffixes else base_path.stem
+        dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         for ch in range(n_ch):
-
+            # per-channel naming + metadata
+            stain_name = stain_dict.get(ch, f"ch{ch}")
             out_name = f"{base_stem}_{stain_name.replace(' ', '_')}.tiff"
             out_path = dest_dir / out_name
 
             new_meta = Metadata(
-                path_original=orig_meta.path_original,
+                path_original=self.metadata[0].path_original,
                 path_storage=out_path,
-                image_type=orig_meta.image_type or "fluorescence",
-                uid=f"{orig_meta.uid}-ch{ch}",
+                image_type=self.metadata[0].image_type or "fluorescence",
+                uid=f"{self.metadata[0].uid}-ch{ch}",
             )
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)
+            # Pass the full level→array dict so save_tif writes a tiled, pyramidal TIFF
             save_tif(separated_levels[ch], out_path, metadata=new_meta)
 
             console.print(f"Saved channel {ch} -> {out_path}", style="success")
@@ -430,15 +432,34 @@ class StainSeparator(BaseOperator):
 
 if __name__ == "__main__":
     from slidekick import DATA_PATH
+    from slidekick.io import read_wsi
 
     # Brightfield example
     image_path_brightfield = DATA_PATH / "reg" / "HE1.ome.tif"
     metadata_brightfield = Metadata(path_original=image_path_brightfield, path_storage=image_path_brightfield)
+
+    # Check loaded img
+    img, _ = read_wsi(metadata_brightfield.path_storage)
+    print(img)
+
     bright = StainSeparator(metadata=metadata_brightfield, mode="brightfield", confirm=True, preview=True)
     metadatas_brightfield = bright.apply()
+
+    # Check saved img
+    img, _ = read_wsi(metadatas_brightfield[0].path_storage)
+    print(img)
 
     # Fluorescence example
     image_path_fluorescence = DATA_PATH / "reg" / "GS_CYP1A2.czi"
     metadata_fluorescence = Metadata(path_original=image_path_fluorescence, path_storage=image_path_fluorescence)
+
+    # Check loaded img
+    img, _ = read_wsi(metadata_fluorescence.path_storage)
+    print(img)
+
     fluor = StainSeparator(metadata=metadata_fluorescence, mode="fluorescence", confirm=True, preview=True)
     metadatas_fluorescence = fluor.apply()
+
+    # Check saved img
+    img, _ = read_wsi(metadatas_fluorescence[0].path_storage)
+    print(img)
