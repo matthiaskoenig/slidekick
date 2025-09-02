@@ -4,13 +4,21 @@ from pathlib import Path
 from rich.prompt import Confirm, Prompt
 import zarr
 from typing import List, Union, Optional
-import matplotlib.pyplot as plt
 from PIL import Image
+import cv2
+import datetime
+import uuid
+
+import matplotlib
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
 
 from slidekick.processing.baseoperator import BaseOperator
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
+
+from slidekick.processing.lobule_segmentation.run_skeletize_image import run_skeletize_image
 
 class LobuleSegmentor(BaseOperator):
     """
@@ -22,7 +30,8 @@ class LobuleSegmentor(BaseOperator):
                  channel_selection: Union[int, List[int]] = None,
                  throw_out_ratio: float = None,
                  preview: bool = True,
-                 confirm: bool = True):
+                 confirm: bool = True,
+                 base_level: int = 0):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation
         @param channel_selection: Number of Metadata objects that should be inverted. If None, invert none.
@@ -31,14 +40,20 @@ class LobuleSegmentor(BaseOperator):
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
+        @param base_level: Pyramid level to load
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
+        self.base_level = base_level
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
             channel_selection = [channel_selection]
-        super().__init__(metadata, channel_selection)
+        elif channel_selection is None:
+            channel_selection = []
+        super().__init__(metadata, channel_selection=None)
+        # Override init back to have direct info on channels to invert
+        self.channels = channel_selection
 
     @staticmethod
     def _downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
@@ -47,8 +62,6 @@ class LobuleSegmentor(BaseOperator):
         Uses Pillow LANCZOS for high-quality downscale.
         No-op if the image is already smaller than max_side.
         """
-        if img is None:
-            return img
 
         # Ensure we operate on HxW or HxWxC ndarray
         if not isinstance(img, np.ndarray) or img.ndim not in (2, 3):
@@ -113,55 +126,17 @@ class LobuleSegmentor(BaseOperator):
 
     def _load_and_invert_images_from_metadatas(self) -> np.ndarray:
         """
-        Load each image at the coarsest pyramid level available, invert selected channels,
+        Load each image at the pyramid level defined, invert selected channels,
         harmonize shapes, and stack along the last axis -> (H, W, N).
         """
-
-        def _read_highest_level_from_store(p: Path):
-            # Try Zarr/OME-NGFF multiscales first
-            try:
-                root = zarr.open(str(p), mode="r")
-            except Exception:
-                return None
-
-            # If it's a single array, just read it
-            if isinstance(root, zarr.core.Array):
-                return root[...]
-
-            # Otherwise walk groups and collect arrays; pick the smallest area (highest level index)
-            candidates = []
-
-            def _collect(g):
-                for _, a in g.arrays():
-                    if a.ndim >= 2:
-                        candidates.append(a)
-                for _, sg in g.groups():
-                    _collect(sg)
-
-            try:
-                _collect(root)
-            except Exception:
-                candidates = []
-
-            if candidates:
-                a = min(candidates, key=lambda arr: int(arr.shape[0]) * int(arr.shape[1]))
-                return a[...]
-            return None
 
         arrays = []
 
         for i, md in enumerate(self.metadata):
-            # resolve path
-            p = getattr(md, "path_storage", None) or getattr(md, "path_original", None)
-            p = Path(p) if p is not None else None
-
-            img = None
-            if p is not None and p.exists():
-                img = _read_highest_level_from_store(p)
-
-            # fallback to existing loader if Zarr path not present or failed
-            if img is None:
-                img = self.load_image(i)
+            try:
+                img = self.load_image(i)[self.base_level]  # Load resolution
+            except:
+                raise Exception(f"Level {self.base_level} failed for image {i} in stack")
 
             # ensure 2D
             img = np.asarray(img)
@@ -198,18 +173,76 @@ class LobuleSegmentor(BaseOperator):
         w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
 
-        stack = np.dstack(arrays)
+        stack = np.dstack(arrays).astype(np.uint8)
 
         return stack
 
+    def _filter(self, image_stack: np.ndarray) -> np.ndarray:
+        """
+        Channel-wise version of zia's filtering. Works for N >= 1 channels.
+        Keeps dtype uint8, returns (H, W, N).
+        """
+
+        if image_stack.ndim != 3:
+            raise ValueError(f"Expected (H, W, N) stack, got {image_stack.shape}")
+
+        H, W, N = image_stack.shape
+
+        # 1) set missing to 0 (any zero across channels -> zero all channels)
+        missing_mask = np.any(image_stack == 0, axis=-1)
+
+        out = np.empty((H, W, N), dtype=np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+
+        for c in range(N):
+            ch = image_stack[..., c]
+
+            # ensure uint8 for OpenCV ops
+            if ch.dtype != np.uint8:
+                ch = np.clip(ch, 0, 255).astype(np.uint8)
+
+            # apply missing mask on this channel
+            ch[missing_mask] = 0
+
+            # 2) convolution
+            ch = cv2.medianBlur(ch, ksize=7)
+
+            # 3) adaptive histogram norm (2D only)
+            ch = clahe.apply(ch)
+            ch[ch < 10] = 0  # suppress background altered by CLAHE
+
+            # 4) convolution
+            ch = cv2.medianBlur(ch, ksize=3)
+
+            # 5) channel normalization to 99th percentile
+            # use >0 to avoid zero-inflation from background
+            nz = ch[ch > 0]
+            p99 = float(np.percentile(nz, 99)) if nz.size else 255.0
+            if p99 <= 0:
+                p99 = 1.0
+            ch = (ch.astype(np.float32) / p99 * 255.0).clip(0, 255).astype(np.uint8)
+
+            out[..., c] = ch
+
+        return out
+
+    def _overlay_skeleton(self, image_stack: np.ndarray, skeleton: np.ndarray) -> np.ndarray:
+        """Red overlay of skeleton on mean of channels."""
+        base = image_stack.mean(axis=2).astype(np.uint8)
+        rgb = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        rgb[skeleton > 0] = (255, 0, 0)
+        return rgb
 
     def apply(self) -> Metadata:
 
+        console.print("Loading images...", style="info")
         # Load images and invert based on metadata
         img_stack = self._load_and_invert_images_from_metadatas()
 
+        console.print("Complete. Now applying filters...", style="info")
+
         # Apply filters
-        # TODO: Next
+        img_stack = self._filter(img_stack)
 
         # Show Preview after loading and filtering
         if self.preview:
@@ -240,40 +273,44 @@ class LobuleSegmentor(BaseOperator):
             self._preview_images(imgs, titles)
 
         if self.confirm:
-            apply = Confirm.ask("Continue with lobule segmentation?", default=False, console=console)
+            apply = Confirm.ask("Continue with lobule segmentation?", default=True, console=console)
             if not apply:
                 console.print("Aborted by user. No segmentation performed.", style="error")
                 return self.metadata
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        short_id = uuid.uuid4().hex[:8]
+        new_uid = f"{timestamp}-{short_id}"
+
+        report_path = OUTPUT_PATH / f"segmentation-{new_uid}"
+        report_path.mkdir(parents=True, exist_ok=True)
+
+        # Superpixel algorithm (steps 3–7)
+        pad = 0  # adjust if you want a safety border
+        thinned, (vessel_classes, vessel_contours) = run_skeletize_image(
+            img_stack,
+            n_clusters=3,
+            pad=pad,
+            report_path=report_path,  # or a folder path if you want PNGs saved
+        )
+
+
 
 
 if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
-    from slidekick.processing.valis_registration.valis_registration import ValisRegistrator
-    from slidekick.processing.stain_separation.stain_separation import StainSeparator
 
-    image_paths = [DATA_PATH / "reg" / "HE1.ome.tif",
-                   DATA_PATH / "reg" / "HE2.ome.tif",
-                   DATA_PATH / "reg" / "Arginase1.ome.tif",
-                   DATA_PATH / "reg" / "KI67.ome.tif",
-                   DATA_PATH / "reg" / "GS_CYP1A2.czi",
-                   DATA_PATH / "reg" / "Ecad_CYP2E1.czi",
+    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",
+                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
+                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff",
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff",
                    ]
 
-    metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
+    metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600, confirm=False, preview=False)
-
-    metadatas_registered = Registrator.apply()
-
-    Separator_1 = StainSeparator(metadatas_registered[4], mode="fluorescence", confirm=False, preview=False)
-    Separator_2 = StainSeparator(metadatas_registered[5], mode="fluorescence", confirm=False, preview=False)
-
-    metadatas_sep_1 = Separator_1.apply()
-    metadatas_sep_2 = Separator_2.apply()
-
-    metadata_for_segmentation = metadatas_registered[2:4] + metadatas_sep_1 + metadatas_sep_2
-
-    Segmentor = LobuleSegmentor(metadata_for_segmentation, 1)
+    Segmentor = LobuleSegmentor(metadata_for_segmentation, base_level=2)
 
     metadata_segmentation = Segmentor.apply()

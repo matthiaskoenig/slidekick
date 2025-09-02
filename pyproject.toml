@@ -149,7 +149,7 @@ dependencies = [
     "rpds-py==0.27.1",
     "scikit-image==0.25.2",
     "scikit-learn==1.7.1",
-    "scipy==1.16.1",
+    "scipy>=1.6.3,<1.15",
     "scyjava==1.12.1",
     "setuptools==80.9.0",
     "shapely==2.1.1",

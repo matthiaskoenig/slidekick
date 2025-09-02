@@ -19,8 +19,6 @@ import matplotlib
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 import numpy as np
-from skimage.io import imread
-from skimage.transform import resize
 import pyvips
 
 class ValisRegistrator(BaseOperator):
