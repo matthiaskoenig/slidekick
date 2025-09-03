@@ -190,4 +190,5 @@ dependencies = [
     "wrapt==1.17.3",
     "xmltodict==0.14.2",
     "xsdata==24.3.1",
+    "geojson>=3.2.0",
 ]

@@ -1,13 +1,13 @@
 import numpy as np
-import os
 from pathlib import Path
-from rich.prompt import Confirm, Prompt
-import zarr
+from rich.prompt import Confirm
 from typing import List, Union, Optional
 from PIL import Image
 import cv2
 import datetime
 import uuid
+from skimage.filters import threshold_multiotsu
+from skimage.morphology import closing, disk, remove_small_holes, remove_small_objects
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -18,7 +18,106 @@ from slidekick.io.metadata import Metadata
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
 
+from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
+
 from slidekick.processing.lobule_segmentation.run_skeletize_image import run_skeletize_image
+from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
+from slidekick.processing.lobule_segmentation.process_segments import process_line_segments
+
+def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5):
+    """
+    3-class Otsu on a blurred grayscale -> labels in {0,1,2}.
+    Heuristic: lowest mean = true background, middle = microscope bg, highest = tissue.
+    """
+    g = gray.astype(np.uint8)
+    if blur_sigma and blur_sigma > 0:
+        g = cv2.GaussianBlur(g, (0, 0), blur_sigma)
+    # thresholds length = classes-1 -> two thresholds for 3 classes
+    thr = threshold_multiotsu(g, classes=classes)
+    lbl = np.digitize(gray, bins=thr)  # uses original gray for sharper boundaries
+    # order by class mean
+    means = [gray[lbl == i].mean() if np.any(lbl == i) else -1 for i in range(classes)]
+    order = np.argsort(means)  # low -> high
+    idx_true_bg, idx_mic_bg, idx_tissue = order[0], order[1], order[-1]
+    return lbl.astype(np.int32), (idx_true_bg, idx_mic_bg, idx_tissue)
+
+
+def detect_tissue_mask_multiotsu(gray: np.ndarray,
+                                 morphological_radius: int = 5,
+                                 min_size: int = 10_000,
+                                 hole_size: int = 10_000):
+    """
+    Build boolean masks: tissue, microscope background, true background.
+    Cleans with closing + small object/hole removal.
+    """
+    lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=1.5)
+    m_tis  = (lbl == i2)
+
+    # morph clean tissue
+    m_tis = closing(m_tis, disk(int(morphological_radius)))
+    m_tis = remove_small_objects(m_tis, min_size=min_size)
+    m_tis = remove_small_holes(m_tis, area_threshold=hole_size)
+
+    return m_tis.astype(bool)
+
+
+def _overlay_skeleton(image_stack: np.ndarray, skeleton: np.ndarray) -> np.ndarray:
+    """Red overlay of skeleton on mean of channels."""
+    base = image_stack.mean(axis=2).astype(np.uint8)
+    rgb = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    rgb[skeleton > 0] = (255, 0, 0)
+    return rgb
+
+
+def _filter(image_stack: np.ndarray) -> np.ndarray:
+    """
+    Channel-wise version of zia's filtering. Works for N >= 1 channels.
+    Keeps dtype uint8, returns (H, W, N).
+    """
+
+    if image_stack.ndim != 3:
+        raise ValueError(f"Expected (H, W, N) stack, got {image_stack.shape}")
+
+    H, W, N = image_stack.shape
+
+    # 1) set missing to 0 (any zero across channels -> zero all channels)
+    missing_mask = np.any(image_stack == 0, axis=-1)
+
+    out = np.empty((H, W, N), dtype=np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+
+    for c in range(N):
+        ch = image_stack[..., c]
+
+        # ensure uint8 for OpenCV ops
+        if ch.dtype != np.uint8:
+            ch = np.clip(ch, 0, 255).astype(np.uint8)
+
+        # apply missing mask on this channel
+        ch[missing_mask] = 0
+
+        # 2) convolution
+        ch = cv2.medianBlur(ch, ksize=7)
+
+        # 3) adaptive histogram norm (2D only)
+        ch = clahe.apply(ch)
+        ch[ch < 10] = 0  # suppress background altered by CLAHE
+
+        # 4) convolution
+        ch = cv2.medianBlur(ch, ksize=3)
+
+        # 5) channel normalization to 99th percentile
+        # use >0 to avoid zero-inflation from background
+        nz = ch[ch > 0]
+        p99 = float(np.percentile(nz, 99)) if nz.size else 255.0
+        if p99 <= 0:
+            p99 = 1.0
+        ch = (ch.astype(np.float32) / p99 * 255.0).clip(0, 255).astype(np.uint8)
+
+        out[..., c] = ch
+
+    return out
+
 
 class LobuleSegmentor(BaseOperator):
     """
@@ -31,7 +130,9 @@ class LobuleSegmentor(BaseOperator):
                  throw_out_ratio: float = None,
                  preview: bool = True,
                  confirm: bool = True,
-                 base_level: int = 0):
+                 base_level: int = 0,
+                 region_size: int = 20,
+                 target_superpixels: int = None):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation
         @param channel_selection: Number of Metadata objects that should be inverted. If None, invert none.
@@ -40,12 +141,16 @@ class LobuleSegmentor(BaseOperator):
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
-        @param base_level: Pyramid level to load
+        @param base_level: Pyramid level to load, use -1 to get coarsest level available
+        @param region_size: average size of superpixels for SLIC in pixels
+        @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
         self.base_level = base_level
+        self.region_size = region_size
+        self.target_superpixels = target_superpixels
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
             channel_selection = [channel_selection]
@@ -134,10 +239,14 @@ class LobuleSegmentor(BaseOperator):
 
         for i, md in enumerate(self.metadata):
             try:
-                img = self.load_image(i)[self.base_level]  # Load resolution
+                if self.base_level == -1:
+                    img = self.load_image(i)  # Get the highest level
+                    key = max(img)  # Get the highest number, i.e., coarsest level
+                    img = img[key]
+                else:
+                    img = self.load_image(i)[self.base_level]  # Load resolution
             except:
                 raise Exception(f"Level {self.base_level} failed for image {i} in stack")
-
             # ensure 2D
             img = np.asarray(img)
             if img.ndim == 3 and img.shape[-1] in (3, 4):
@@ -174,64 +283,23 @@ class LobuleSegmentor(BaseOperator):
         arrays = [a[:h_min, :w_min] for a in arrays]
 
         stack = np.dstack(arrays).astype(np.uint8)
+        # ROI detection block
+        console.print("Complete. Detecting ROI...", style="info")
+        stack_grayscale = ensure_grayscale_uint8(stack)
+        # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
+        # returns (tissue_mask, microscope_bg_mask, true_bg_mask)
+        tissue_mask = detect_tissue_mask_multiotsu(
+            stack_grayscale, morphological_radius=5, min_size=10_000, hole_size=10_000
+        )
+
+        # hard clamp everything outside tissue to black
+        stack[~tissue_mask] = 0
+
+        # crop to tissue bbox
+        bbox = largest_bbox(tissue_mask.astype(np.uint8))
+        stack = crop_image(stack, bbox)
 
         return stack
-
-    def _filter(self, image_stack: np.ndarray) -> np.ndarray:
-        """
-        Channel-wise version of zia's filtering. Works for N >= 1 channels.
-        Keeps dtype uint8, returns (H, W, N).
-        """
-
-        if image_stack.ndim != 3:
-            raise ValueError(f"Expected (H, W, N) stack, got {image_stack.shape}")
-
-        H, W, N = image_stack.shape
-
-        # 1) set missing to 0 (any zero across channels -> zero all channels)
-        missing_mask = np.any(image_stack == 0, axis=-1)
-
-        out = np.empty((H, W, N), dtype=np.uint8)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
-
-        for c in range(N):
-            ch = image_stack[..., c]
-
-            # ensure uint8 for OpenCV ops
-            if ch.dtype != np.uint8:
-                ch = np.clip(ch, 0, 255).astype(np.uint8)
-
-            # apply missing mask on this channel
-            ch[missing_mask] = 0
-
-            # 2) convolution
-            ch = cv2.medianBlur(ch, ksize=7)
-
-            # 3) adaptive histogram norm (2D only)
-            ch = clahe.apply(ch)
-            ch[ch < 10] = 0  # suppress background altered by CLAHE
-
-            # 4) convolution
-            ch = cv2.medianBlur(ch, ksize=3)
-
-            # 5) channel normalization to 99th percentile
-            # use >0 to avoid zero-inflation from background
-            nz = ch[ch > 0]
-            p99 = float(np.percentile(nz, 99)) if nz.size else 255.0
-            if p99 <= 0:
-                p99 = 1.0
-            ch = (ch.astype(np.float32) / p99 * 255.0).clip(0, 255).astype(np.uint8)
-
-            out[..., c] = ch
-
-        return out
-
-    def _overlay_skeleton(self, image_stack: np.ndarray, skeleton: np.ndarray) -> np.ndarray:
-        """Red overlay of skeleton on mean of channels."""
-        base = image_stack.mean(axis=2).astype(np.uint8)
-        rgb = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-        rgb[skeleton > 0] = (255, 0, 0)
-        return rgb
 
     def apply(self) -> Metadata:
 
@@ -242,7 +310,7 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Now applying filters...", style="info")
 
         # Apply filters
-        img_stack = self._filter(img_stack)
+        img_stack = _filter(img_stack)
 
         # Show Preview after loading and filtering
         if self.preview:
@@ -287,14 +355,41 @@ class LobuleSegmentor(BaseOperator):
 
         # Superpixel algorithm (steps 3–7)
         pad = 0  # adjust if you want a safety border
+
+        # Adjust region size from number of superpixels if specified
+        if self.target_superpixels is not None:
+            H, W, _ = img_stack.shape
+            region_size = int(np.sqrt((H * W) / self.target_superpixels))
+            console.print(f"Region size for SLIC was computed as {region_size}", style="info")
+            if region_size < self.region_size:
+                console.print(f"Computed region size {region_size} is smaller than specified region size {self.region_size}", style="warning")
+            self.region_size = region_size
+
         thinned, (vessel_classes, vessel_contours) = run_skeletize_image(
             img_stack,
             n_clusters=3,
             pad=pad,
+            region_size = self.region_size,
             report_path=report_path,  # or a folder path if you want PNGs saved
         )
 
+        console.print("Complete. Creating lines segments from skeleton...", style="info")
 
+        # Steps 8: segments
+        line_segments = segment_thinned_image(thinned)
+
+        console.print("Complete. Creating polygons...", style="info")
+
+        # Step 9: Creating lobule and vessel polygons from line segments and vessel contours
+        slide_stats = process_line_segments(line_segments,
+                                            vessel_classes,
+                                            vessel_contours,
+                                            pad)
+
+        console.print("Complete.", style="info")
+
+
+        # TODO: package `final_mask` as a new Metadata later
 
 
 if __name__ == "__main__":
@@ -311,6 +406,8 @@ if __name__ == "__main__":
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Segmentor = LobuleSegmentor(metadata_for_segmentation, base_level=2)
+    Segmentor = LobuleSegmentor(metadata_for_segmentation,
+                                base_level = 3,
+                                target_superpixels = 50000)
 
     metadata_segmentation = Segmentor.apply()
