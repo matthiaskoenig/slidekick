@@ -7,6 +7,7 @@ from slidekick.console import console
 from time import time
 
 # The functions are all based on code from zia/pipeline/pipeline_components/algorithm/segementation/clustering.py
+# Some adaptions are made to better classifysmall vessels
 
 def _superpixel_stats(labels: np.ndarray, image: np.ndarray, num_labels: int):
     """
@@ -118,9 +119,11 @@ def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, so
 
     return classes, classified_contours, tissue_boundary
 
+
 def pad_image(image_stack: np.ndarray, pad: int) -> np.ndarray:
     pad_width = ((pad, pad), (pad, pad), (0, 0))
     return np.pad(image_stack, pad_width, mode="constant", constant_values=0)
+
 
 def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_size = 6, report_path: Path = None) -> Tuple[
     np.ndarray, Tuple[List[int], list]]:
@@ -138,59 +141,6 @@ def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_si
 
     if report_path is not None:
         cv2.imwrite(str(report_path / "superpixels.png"), superpixel_mask)
-    """
-    merged = image_stack.astype(np.uint8)  # keep uint8 for later writes; stats use float32 internally
-
-    # fast per-superpixel stats
-    total, zero_frac, means = _superpixel_stats(labels, image_stack, num_labels)
-    is_bg_sp = zero_frac > 0.10
-    is_fg_sp = ~is_bg_sp
-    fg_ids = np.nonzero(is_fg_sp)[0]
-
-    # optional debug: BG/FG preview (vectorized)
-    if report_path is not None:
-        is_bg_px = is_bg_sp[labels]
-        out = np.zeros((image_stack.shape[0], image_stack.shape[1], 3), dtype=np.uint8)
-        out[~is_bg_px] = (255, 255, 255)
-        cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out)
-
-        # channel mean previews
-        spmask = (~is_bg_sp).astype(np.uint8)  # only FG get means drawn
-        for k in range(image_stack.shape[2]):
-            vals = means[:, k].copy()
-            vals[is_bg_sp] = 0.0
-            imgk = vals[labels]
-            vmax = float(imgk.max())
-            if vmax > 0:
-                imgk = (imgk / vmax * 255.0).astype(np.uint8)
-            else:
-                imgk = imgk.astype(np.uint8)
-            rgb = cv2.cvtColor(imgk, cv2.COLOR_GRAY2RGB)
-            # highlight superpixel boundaries
-            rgb[(rgb != 0).any(axis=2) & (superpixel_mask == 255)] = [255, 255, 0]
-            cv2.imwrite(str(report_path / f"superpixel_means_{k}.png"), rgb)
-
-    # cluster FG superpixels on their mean vectors
-    from sklearn.cluster import MiniBatchKMeans
-    X = means[fg_ids].astype(np.float32, copy=False)
-    if X.shape[0] < 3:
-        # degenerate case: keep original mapping minimal
-        km_labels = np.zeros(X.shape[0], dtype=np.int32)
-        centers = np.zeros((1, X.shape[1]), dtype=np.float32)
-    else:
-        km = MiniBatchKMeans(n_clusters=n_clusters, batch_size=4096, max_iter=100, n_init=1, random_state=0)
-        km_labels = km.fit_predict(X)
-        centers = km.cluster_centers_
-
-    # order clusters by center norm (ascending)
-    d = np.linalg.norm(centers, axis=1) if centers.size else np.array([0.0])
-    sorted_label_idx = np.argsort(d)
-
-    # build per-superpixel cluster id array and per-pixel cluster map
-    sp_to_cluster = np.full(num_labels, -1, dtype=np.int32)
-    sp_to_cluster[fg_ids] = km_labels
-    foreground_clustered = sp_to_cluster[labels]
-    """
 
     merged = image_stack.astype(float)
 

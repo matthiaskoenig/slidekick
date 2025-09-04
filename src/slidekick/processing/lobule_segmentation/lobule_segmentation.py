@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 from rich.prompt import Confirm
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Tuple, Iterable, Dict
 from PIL import Image
 import cv2
 import datetime
@@ -22,7 +22,7 @@ from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_ui
 
 from slidekick.processing.lobule_segmentation.run_skeletize_image import run_skeletize_image
 from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
-from slidekick.processing.lobule_segmentation.process_segments import process_line_segments
+from process_segments import process_segments_to_mask
 
 def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5):
     """
@@ -119,6 +119,56 @@ def _filter(image_stack: np.ndarray) -> np.ndarray:
     return out
 
 
+def build_mask_pyramid_from_processed(
+    mask_cropped: np.ndarray,
+    img_size_base: Tuple[int, int],            # (Hb, Wb) cropped ROI at base_level (AFTER bbox crop, BEFORE padding)
+    bbox_base: Tuple[int, int, int, int],      # (min_r, min_c, max_r, max_c) in base_level coords
+    orig_shapes: Dict[int, Tuple[int, int]],   # {level: (H,W)} full-frame shapes at each level
+    base_level: int,                           # the level used to load/crop
+) -> Dict[int, np.ndarray]:
+    """
+    0) mask_cropped: mask with padding already stripped (so shape == processed ROI size without pad)
+    1) Resize mask_cropped from processed-ROI size -> base-level ROI size (img_size_base)
+    2) Paste into a full-size base_level canvas at bbox_base
+    3) Resample that base canvas to every level in orig_shapes (NEAREST to preserve labels)
+    Returns {level: full_mask_at_level}
+    """
+    # Step 1: processed ROI -> base-level ROI
+    Hb, Wb = int(img_size_base[0]), int(img_size_base[1])      # target ROI size at base_level
+    if Hb <= 0 or Wb <= 0 or mask_cropped.size == 0:
+        return {lvl: np.zeros(orig_shapes[lvl], dtype=np.int32) for lvl in orig_shapes}
+
+    roi_base = cv2.resize(
+        mask_cropped.astype(np.int32),
+        (Wb, Hb),  # (width, height)
+        interpolation=cv2.INTER_NEAREST
+    ).astype(np.int32)
+
+    # Step 2: paste into full-size base canvas at bbox
+    Hfull_base, Wfull_base = orig_shapes[base_level]
+    min_r, min_c, max_r, max_c = bbox_base
+    canvas_base = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
+    # Safety clamp (in case of off-by-one)
+    min_r = max(0, min_r); min_c = max(0, min_c)
+    max_r = min(Hfull_base, max_r); max_c = min(Wfull_base, max_c)
+    if (max_r - min_r) != Hb or (max_c - min_c) != Wb:
+        # If bbox dims and img_size_base mismatch by 1 px, reconcile by resize
+        Hb2, Wb2 = (max_r - min_r), (max_c - min_c)
+        roi_base = cv2.resize(roi_base, (Wb2, Hb2), interpolation=cv2.INTER_NEAREST).astype(np.int32)
+    canvas_base[min_r:max_r, min_c:max_c] = roi_base
+
+    # -- Step 3: build pyramid by resizing base canvas to each level
+    out = {}
+    for lvl, (Hdst, Wdst) in orig_shapes.items():
+        if lvl == base_level:
+            out[lvl] = canvas_base.copy()
+        else:
+            out[lvl] = cv2.resize(
+                canvas_base, (Wdst, Hdst), interpolation=cv2.INTER_NEAREST
+            ).astype(np.int32)
+    return out
+
+
 class LobuleSegmentor(BaseOperator):
     """
     Based on https://github.com/matthiaskoenig/zonation-image-analysis/blob/develop/src/zia/pipeline/pipeline_components/segementation_component.py
@@ -141,7 +191,7 @@ class LobuleSegmentor(BaseOperator):
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
-        @param base_level: Pyramid level to load, use -1 to get coarsest level available
+        @param base_level: Pyramid level to load
         @param region_size: average size of superpixels for SLIC in pixels
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         """
@@ -239,37 +289,13 @@ class LobuleSegmentor(BaseOperator):
 
         for i, md in enumerate(self.metadata):
             try:
-                if self.base_level == -1:
-                    img = self.load_image(i)  # Get the highest level
-                    key = max(img)  # Get the highest number, i.e., coarsest level
-                    img = img[key]
-                else:
-                    img = self.load_image(i)[self.base_level]  # Load resolution
+                img = self.load_image(i)[self.base_level]  # Load resolution
             except:
                 raise Exception(f"Level {self.base_level} failed for image {i} in stack")
             # ensure 2D
             img = np.asarray(img)
             if img.ndim == 3 and img.shape[-1] in (3, 4):
                 img = np.mean(img[..., :3], axis=-1).astype(img.dtype)
-
-            # optional discard by foreground coverage
-            if self.throw_out_ratio is not None:
-                non_bg = np.count_nonzero(img != 255)
-                ratio = non_bg / img.size
-                if ratio < self.throw_out_ratio:
-                    console.print(
-                        f"Discarded {i} with non-background pixel ratio: {ratio:.3f}",
-                        style="warning",
-                    )
-                    continue
-
-            # optional inversion
-            if self.channels is not None and i in self.channels:
-                if np.issubdtype(img.dtype, np.integer):
-                    info = np.iinfo(img.dtype)
-                    img = info.max - img
-                else:  # float images assumed in [0,1]
-                    img = 1.0 - img
 
             arrays.append(img)
 
@@ -283,6 +309,10 @@ class LobuleSegmentor(BaseOperator):
         arrays = [a[:h_min, :w_min] for a in arrays]
 
         stack = np.dstack(arrays).astype(np.uint8)
+
+        # Get resolutions / image sizes as dict for later back mapping based on metadata object 0
+        orig_shapes = {k: v.shape[:2] for k, v in self.load_image(0).items()}
+
         # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
         stack_grayscale = ensure_grayscale_uint8(stack)
@@ -299,13 +329,37 @@ class LobuleSegmentor(BaseOperator):
         bbox = largest_bbox(tissue_mask.astype(np.uint8))
         stack = crop_image(stack, bbox)
 
-        return stack
+        # Inversion and discard only AFTER cropping:
+        for i in range(stack.shape[-1]):
+
+            # optional discard by foreground coverage
+            if self.throw_out_ratio is not None:
+                non_bg = np.count_nonzero(img != 255)
+                ratio = non_bg / stack[:, :, i].size
+                if ratio < self.throw_out_ratio:
+                    console.print(
+                        f"Discarded {i} with non-background pixel ratio: {ratio:.3f}",
+                        style="warning",
+                    )
+                    stack = np.delete(stack, i, axis=-1)
+
+            # optional inversion
+            if self.channels is not None and i in self.channels:
+                if np.issubdtype(stack[:, :, i].dtype, np.integer):
+                    info = np.iinfo(stack[:, :, i].dtype)
+                    stack[:, :, i] = info.max - stack[:, :, i]
+                else:  # float images assumed in [0,1]
+                    stack[:, :, i] = 1.0 - stack[:, :, i]
+
+        return stack, bbox, orig_shapes
 
     def apply(self) -> Metadata:
 
         console.print("Loading images...", style="info")
         # Load images and invert based on metadata
-        img_stack = self._load_and_invert_images_from_metadatas()
+        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas()
+
+        img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
         console.print("Complete. Now applying filters...", style="info")
 
@@ -354,7 +408,7 @@ class LobuleSegmentor(BaseOperator):
         report_path.mkdir(parents=True, exist_ok=True)
 
         # Superpixel algorithm (steps 3–7)
-        pad = 0  # adjust if you want a safety border
+        pad = 10  # adjust if you want a different safety border
 
         # Adjust region size from number of superpixels if specified
         if self.target_superpixels is not None:
@@ -378,18 +432,29 @@ class LobuleSegmentor(BaseOperator):
         # Steps 8: segments
         line_segments = segment_thinned_image(thinned)
 
-        console.print("Complete. Creating polygons...", style="info")
+        console.print("Complete. Creating segmentation mask...", style="info")
 
         # Step 9: Creating lobule and vessel polygons from line segments and vessel contours
-        slide_stats = process_line_segments(line_segments,
-                                            vessel_classes,
-                                            vessel_contours,
-                                            pad)
+        mask = process_segments_to_mask(line_segments, thinned.shape, report_path=report_path)
+
+        # Crop mask by padding
+        mask_cropped = mask[pad:-pad, pad:-pad]
+
+        console.print("Complete. Back-mapping mask to all pyramid levels...", style="info")
+
+        # Build masks for every level (steps 1–3)
+        mask_pyramid = build_mask_pyramid_from_processed(
+            mask_cropped=mask_cropped,
+            img_size_base=img_size_base,  # ROI size at base_level (after bbox crop)
+            bbox_base=bbox,  # bbox in base_level coords used for the crop
+            orig_shapes=orig_shapes,  # {level: (H,W)} from self.load_image(0)
+            base_level=self.base_level,
+        )
 
         console.print("Complete.", style="info")
 
+        # TODO: package `full_mask` as a new Metadata and save
 
-        # TODO: package `final_mask` as a new Metadata later
 
 
 if __name__ == "__main__":
@@ -398,16 +463,15 @@ if __name__ == "__main__":
 
     image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",
                    DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
-                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff",
                    DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",
                    DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff",
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                base_level = 3,
-                                target_superpixels = 50000)
+                                #1,
+                                base_level = 4,
+                                region_size = 6)
 
     metadata_segmentation = Segmentor.apply()
