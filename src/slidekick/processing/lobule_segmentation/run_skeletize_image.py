@@ -183,7 +183,7 @@ def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_si
 
     # cluster the superpixels based on the mean channel values within the superpixel
     console.print(f"Cluster (n={n_clusters}) the foreground superpixels based on superpixel mean values", style="info")
-    kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=20)
     kmeans.fit(list(foreground_pixels_means.values()))
 
     # calculate the cluster distance from origin to have a measure for sorting the labels.

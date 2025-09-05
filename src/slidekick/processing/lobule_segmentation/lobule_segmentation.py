@@ -138,10 +138,8 @@ class LobuleSegmentor(BaseOperator):
                  ksize: int = 3,
                  target_superpixels: int = None):
         """
-        @param metadata: List or single metadata object to load and use for lobule segmentation
-        @param channel_selection: Number of Metadata objects that should be inverted. If None, invert none.
-        Images should be inverted so that high absorbance, i.e., bright values are pericentral zones.
-        Different to zia where simply high absorbance = bright
+        @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
+        @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
@@ -257,6 +255,7 @@ class LobuleSegmentor(BaseOperator):
         """
         Downsample and render a grid preview. Max 2048 px on the longest side per image.
         """
+        # TODO. Switch to napari with layered view
         if not images:
             console.print("No images to preview.", style="warning")
             return
@@ -343,6 +342,16 @@ class LobuleSegmentor(BaseOperator):
         # Inversion and discard only AFTER cropping:
         for i in range(stack.shape[-1]):
 
+            # optional inversion
+            if self.channels is not None and i in self.channels:
+                if np.issubdtype(stack[:, :, i].dtype, np.integer):
+                    info = np.iinfo(stack[:, :, i].dtype)
+                    stack[:, :, i] = info.max - stack[:, :, i]
+                else:  # float images assumed in [0,1]
+                    stack[:, :, i] = 1.0 - stack[:, :, i]
+
+                    # TODO: Check that inversion returns still black in background vessels by setting them black if one is black, might need higher offset based on otsu threshold mask from microscope?
+
             # optional discard by foreground coverage
             if self.throw_out_ratio is not None:
                 non_bg = np.count_nonzero(img != 255)
@@ -353,14 +362,6 @@ class LobuleSegmentor(BaseOperator):
                         style="warning",
                     )
                     stack = np.delete(stack, i, axis=-1)
-
-            # optional inversion
-            if self.channels is not None and i in self.channels:
-                if np.issubdtype(stack[:, :, i].dtype, np.integer):
-                    info = np.iinfo(stack[:, :, i].dtype)
-                    stack[:, :, i] = info.max - stack[:, :, i]
-                else:  # float images assumed in [0,1]
-                    stack[:, :, i] = 1.0 - stack[:, :, i]
 
         return stack, bbox, orig_shapes
 
@@ -485,8 +486,8 @@ class LobuleSegmentor(BaseOperator):
         )
 
         new_meta.save(report_path)
-        # Pass the full level→array dict so save_tif writes a tiled, pyramidal TIFF
-        save_tif(mask_pyramid, report_path, metadata=new_meta)
+        # Pass the full level -> array dict so save_tif writes a tiled, pyramidal TIFF
+        save_tif(mask_pyramid, report_path / f"{new_uid}_seg.tiff", metadata=new_meta)
 
         return new_meta
 
@@ -496,16 +497,18 @@ if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
 
-    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",
-                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
+    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pp
+                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
+                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff",
                    DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
+                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff",
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                #1,
+                                [1, 4],
                                 base_level = 4,
                                 region_size = 6)
 
