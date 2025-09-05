@@ -1,13 +1,14 @@
 import numpy as np
 from pathlib import Path
 from rich.prompt import Confirm
-from typing import List, Union, Optional, Tuple, Iterable, Dict
+from typing import List, Union, Optional, Tuple, Dict, Any
 from PIL import Image
 import cv2
 import datetime
 import uuid
 from skimage.filters import threshold_multiotsu
-from skimage.morphology import closing, disk, remove_small_holes, remove_small_objects
+from skimage.morphology import closing, disk
+from skimage.color import label2rgb
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -17,6 +18,7 @@ from slidekick.processing.baseoperator import BaseOperator
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
+from slidekick.io import save_tif
 
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
 
@@ -43,9 +45,7 @@ def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5)
 
 
 def detect_tissue_mask_multiotsu(gray: np.ndarray,
-                                 morphological_radius: int = 5,
-                                 min_size: int = 10_000,
-                                 hole_size: int = 10_000):
+                                 morphological_radius: int = 5):
     """
     Build boolean masks: tissue, microscope background, true background.
     Cleans with closing + small object/hole removal.
@@ -53,70 +53,22 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
     lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=1.5)
     m_tis  = (lbl == i2)
 
-    # morph clean tissue
     m_tis = closing(m_tis, disk(int(morphological_radius)))
-    m_tis = remove_small_objects(m_tis, min_size=min_size)
-    m_tis = remove_small_holes(m_tis, area_threshold=hole_size)
 
     return m_tis.astype(bool)
 
 
-def _overlay_skeleton(image_stack: np.ndarray, skeleton: np.ndarray) -> np.ndarray:
-    """Red overlay of skeleton on mean of channels."""
-    base = image_stack.mean(axis=2).astype(np.uint8)
-    rgb = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
-    rgb[skeleton > 0] = (255, 0, 0)
-    return rgb
-
-
-def _filter(image_stack: np.ndarray) -> np.ndarray:
-    """
-    Channel-wise version of zia's filtering. Works for N >= 1 channels.
-    Keeps dtype uint8, returns (H, W, N).
+def _overlay_mask(image_stack: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """Overlay segmentation labels using skimage.color.label2rgb.
+    - Treats label 0 as background.
+    - Supports multi-class masks.
     """
 
-    if image_stack.ndim != 3:
-        raise ValueError(f"Expected (H, W, N) stack, got {image_stack.shape}")
+    base = image_stack.mean(axis=2).astype(np.float32) / 255.0
+    lbl = mask.astype(np.int32)
 
-    H, W, N = image_stack.shape
-
-    # 1) set missing to 0 (any zero across channels -> zero all channels)
-    missing_mask = np.any(image_stack == 0, axis=-1)
-
-    out = np.empty((H, W, N), dtype=np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
-
-    for c in range(N):
-        ch = image_stack[..., c]
-
-        # ensure uint8 for OpenCV ops
-        if ch.dtype != np.uint8:
-            ch = np.clip(ch, 0, 255).astype(np.uint8)
-
-        # apply missing mask on this channel
-        ch[missing_mask] = 0
-
-        # 2) convolution
-        ch = cv2.medianBlur(ch, ksize=7)
-
-        # 3) adaptive histogram norm (2D only)
-        ch = clahe.apply(ch)
-        ch[ch < 10] = 0  # suppress background altered by CLAHE
-
-        # 4) convolution
-        ch = cv2.medianBlur(ch, ksize=3)
-
-        # 5) channel normalization to 99th percentile
-        # use >0 to avoid zero-inflation from background
-        nz = ch[ch > 0]
-        p99 = float(np.percentile(nz, 99)) if nz.size else 255.0
-        if p99 <= 0:
-            p99 = 1.0
-        ch = (ch.astype(np.float32) / p99 * 255.0).clip(0, 255).astype(np.uint8)
-
-        out[..., c] = ch
-
-    return out
+    over = label2rgb(lbl, image=base, bg_label=0, alpha=alpha, image_alpha=1.0)
+    return (over * 255).astype(np.uint8)
 
 
 def build_mask_pyramid_from_processed(
@@ -182,6 +134,8 @@ class LobuleSegmentor(BaseOperator):
                  confirm: bool = True,
                  base_level: int = 0,
                  region_size: int = 20,
+                 multi_otsu: bool = True,
+                 ksize: int = 3,
                  target_superpixels: int = None):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation
@@ -192,14 +146,18 @@ class LobuleSegmentor(BaseOperator):
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
         @param base_level: Pyramid level to load
+        @param multi_otsu: whether to use multi-otsu to filter out microscopy background, otherwise classic otsu
         @param region_size: average size of superpixels for SLIC in pixels
+        @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
         self.base_level = base_level
+        self.multi_otsu = multi_otsu
         self.region_size = region_size
+        self.ksize = ksize
         self.target_superpixels = target_superpixels
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -244,6 +202,57 @@ class LobuleSegmentor(BaseOperator):
 
         return out
 
+    def _filter(self, image_stack: np.ndarray) -> np.ndarray:
+        """
+        Channel-wise version of zia's filtering. Works for N >= 1 channels.
+        Keeps dtype uint8, returns (H, W, N).
+        """
+
+        if image_stack.ndim != 3:
+            raise ValueError(f"Expected (H, W, N) stack, got {image_stack.shape}")
+
+        H, W, N = image_stack.shape
+
+        # set missing to 0 (any zero across channels -> zero all channels)
+        missing_mask = np.any(image_stack == 0, axis=-1)
+
+        out = np.empty((H, W, N), dtype=np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
+
+        for c in range(N):
+            ch = image_stack[..., c]
+
+            # ensure uint8 for OpenCV ops
+            if ch.dtype != np.uint8:
+                ch = np.clip(ch, 0, 255).astype(np.uint8)
+
+            # apply missing mask on this channel
+            ch[missing_mask] = 0
+
+            # convolution, changed to ksize=3 form 7 from zia
+            # keep more local info
+            ch = cv2.medianBlur(ch, ksize=self.ksize)
+
+            # adaptive histogram norm (2D only)
+            ch = clahe.apply(ch)
+            ch[ch < 10] = 0  # suppress background altered by CLAHE
+
+            # convolution - currently unused from zia
+            # blurred small vessel too much
+            # ch = cv2.medianBlur(ch, ksize=3)
+
+            # channel normalization to 99th percentile
+            # use >0 to avoid zero-inflation from background
+            nz = ch[ch > 0]
+            p99 = float(np.percentile(nz, 99)) if nz.size else 255.0
+            if p99 <= 0:
+                p99 = 1.0
+            ch = (ch.astype(np.float32) / p99 * 255.0).clip(0, 255).astype(np.uint8)
+
+            out[..., c] = ch
+
+        return out
+
     def _preview_images(self, images: List[np.ndarray], titles: Optional[List[str]] = None) -> None:
         """
         Downsample and render a grid preview. Max 2048 px on the longest side per image.
@@ -279,7 +288,7 @@ class LobuleSegmentor(BaseOperator):
 
         plt.show()
 
-    def _load_and_invert_images_from_metadatas(self) -> np.ndarray:
+    def _load_and_invert_images_from_metadatas(self) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
         Load each image at the pyramid level defined, invert selected channels,
         harmonize shapes, and stack along the last axis -> (H, W, N).
@@ -316,11 +325,13 @@ class LobuleSegmentor(BaseOperator):
         # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
         stack_grayscale = ensure_grayscale_uint8(stack)
-        # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
-        # returns (tissue_mask, microscope_bg_mask, true_bg_mask)
-        tissue_mask = detect_tissue_mask_multiotsu(
-            stack_grayscale, morphological_radius=5, min_size=10_000, hole_size=10_000
-        )
+        if self.multi_otsu:
+            # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
+            # returns tissue_mask
+            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=5)
+        else:
+            # just tissue detection
+            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
 
         # hard clamp everything outside tissue to black
         stack[~tissue_mask] = 0
@@ -364,7 +375,7 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Now applying filters...", style="info")
 
         # Apply filters
-        img_stack = _filter(img_stack)
+        img_stack = self._filter(img_stack)
 
         # Show Preview after loading and filtering
         if self.preview:
@@ -440,6 +451,17 @@ class LobuleSegmentor(BaseOperator):
         # Crop mask by padding
         mask_cropped = mask[pad:-pad, pad:-pad]
 
+        # Preview
+        # Left: Orig, Middle: Overlay, Right: Mask only
+        if self.preview:
+            # Original as mean projection
+            orig_vis = img_stack.mean(axis=2).astype(np.uint8)
+            # Skeleton cropped to match mask/img_stack
+            overlay_vis = _overlay_mask(img_stack, mask_cropped, alpha=0.5)
+            # Mask visualization as binary 0/255 for clarity
+            mask_vis = (mask_cropped > 0).astype(np.uint8) * 255
+            self._preview_images([orig_vis, overlay_vis, mask_vis], titles=["Original", "Segmentation Overlay", "Mask"])
+
         console.print("Complete. Back-mapping mask to all pyramid levels...", style="info")
 
         # Build masks for every level (steps 1–3)
@@ -454,6 +476,19 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete.", style="info")
 
         # TODO: package `full_mask` as a new Metadata and save
+
+        new_meta = Metadata(
+            path_original=report_path,
+            path_storage=report_path,
+            image_type="mask",
+            uid=new_uid,
+        )
+
+        new_meta.save(report_path)
+        # Pass the full level→array dict so save_tif writes a tiled, pyramidal TIFF
+        save_tif(mask_pyramid, report_path, metadata=new_meta)
+
+        return new_meta
 
 
 

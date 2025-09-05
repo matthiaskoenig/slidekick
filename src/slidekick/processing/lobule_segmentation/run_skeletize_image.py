@@ -4,10 +4,9 @@ from sklearn.cluster import KMeans
 from pathlib import Path
 from typing import Tuple, List
 from slidekick.console import console
-from time import time
 
 # The functions are all based on code from zia/pipeline/pipeline_components/algorithm/segementation/clustering.py
-# Some adaptions are made to better classifysmall vessels
+# Some adaptions are made to better classify small vessels
 
 def _superpixel_stats(labels: np.ndarray, image: np.ndarray, num_labels: int):
     """
@@ -68,8 +67,6 @@ def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, so
     kernel = np.ones((3, 3), np.uint8)
 
     for cont in filtered_contours:
-        # min_h, min_w = np.min(cont, axis=0).flatten()
-        # max_h, max_w = np.max(cont, axis=0).flatten()
 
         # create mask from contour
         ct_template = np.zeros_like(binary, dtype=np.uint8)
