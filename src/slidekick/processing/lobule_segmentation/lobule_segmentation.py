@@ -502,8 +502,8 @@ if __name__ == "__main__":
     image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pv
                    #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff", # -> DAPI
-                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pv
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",  # pp
+                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff", # -> DAPI
                    ]
 
