@@ -36,7 +36,7 @@ def _superpixel_stats(labels: np.ndarray, image: np.ndarray, num_labels: int):
     return total, zero_frac, means
 
 
-def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, sorted_label_idx: np.ndarray, n_clusters: int):
+def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, sorted_label_idx: np.ndarray, n_clusters: int, dilation : int = 5):
     contours, hierarchy = cv2.findContours(binary.reshape(binary.shape[0], binary.shape[1], 1).astype(np.uint8), cv2.RETR_TREE,
                                            cv2.CHAIN_APPROX_SIMPLE)
 
@@ -64,7 +64,7 @@ def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, so
     count_vectors = []
     classified_contours = []
 
-    kernel = np.ones((3, 3), np.uint8)
+    kernel = np.ones((dilation, dilation), np.uint8)
 
     for cont in filtered_contours:
 
@@ -122,7 +122,7 @@ def pad_image(image_stack: np.ndarray, pad: int) -> np.ndarray:
     return np.pad(image_stack, pad_width, mode="constant", constant_values=0)
 
 
-def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_size = 6, report_path: Path = None) -> Tuple[
+def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_size = 6, report_path: Path = None, dilation: int = 5) -> Tuple[
     np.ndarray, Tuple[List[int], list]]:
     image_stack = pad_image(image_stack, pad)
 
@@ -215,7 +215,8 @@ def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_si
     classes, filtered_contours, tissue_boundary = get_and_classify_background_polys(background_template,
                                                                                     foreground_clustered,
                                                                                     sorted_label_idx,
-                                                                                    n_clusters)
+                                                                                    n_clusters,
+                                                                                    dilation)
 
     # shades of gray, n clusters + 2 for background
     template = np.zeros_like(merged[:, :, 0]).astype(np.uint8)

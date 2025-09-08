@@ -109,7 +109,7 @@ def build_mask_pyramid_from_processed(
         roi_base = cv2.resize(roi_base, (Wb2, Hb2), interpolation=cv2.INTER_NEAREST).astype(np.int32)
     canvas_base[min_r:max_r, min_c:max_c] = roi_base
 
-    # -- Step 3: build pyramid by resizing base canvas to each level
+    # Step 3: build pyramid by resizing base canvas to each level
     out = {}
     for lvl, (Hdst, Wdst) in orig_shapes.items():
         if lvl == base_level:
@@ -332,7 +332,7 @@ class LobuleSegmentor(BaseOperator):
             # just tissue detection
             tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
 
-        # hard clamp everything outside tissue to black
+        # stack: (H,W,C); tissue_mask: (H,W) True=tissue
         stack[~tissue_mask] = 0
 
         # crop to tissue bbox
@@ -350,7 +350,7 @@ class LobuleSegmentor(BaseOperator):
                 else:  # float images assumed in [0,1]
                     stack[:, :, i] = 1.0 - stack[:, :, i]
 
-                    # TODO: Check that inversion returns still black in background vessels by setting them black if one is black, might need higher offset based on otsu threshold mask from microscope?
+            # TODO: Check that inversion returns still black in background vessels by setting them black if one is black, might need higher offset based on otsu threshold mask from microscope?
 
             # optional discard by foreground coverage
             if self.throw_out_ratio is not None:
@@ -421,6 +421,7 @@ class LobuleSegmentor(BaseOperator):
 
         # Superpixel algorithm (steps 3–7)
         pad = 10  # adjust if you want a different safety border
+        dilation = 5  # Adjust to keep larger/smaller region around vessel
 
         # Adjust region size from number of superpixels if specified
         if self.target_superpixels is not None:
@@ -437,6 +438,7 @@ class LobuleSegmentor(BaseOperator):
             pad=pad,
             region_size = self.region_size,
             report_path=report_path,  # or a folder path if you want PNGs saved
+            dilation=dilation
         )
 
         console.print("Complete. Creating lines segments from skeleton...", style="info")
@@ -497,19 +499,19 @@ if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
 
-    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pp
+    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pv
                    #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
-                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff",
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",
-                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff",
+                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff", # -> DAPI
+                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",  # pp
+                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff", # -> DAPI
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                [1, 4],
+                                [0],
                                 base_level = 4,
-                                region_size = 6)
+                                region_size = 50)
 
     metadata_segmentation = Segmentor.apply()
