@@ -6,9 +6,7 @@ from PIL import Image
 import cv2
 import datetime
 import uuid
-from skimage.filters import threshold_multiotsu
-from skimage.morphology import closing, disk
-from skimage.color import label2rgb
+from sklearn.cluster import KMeans
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -21,104 +19,9 @@ from slidekick import OUTPUT_PATH
 from slidekick.io import save_tif
 
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
-
-from slidekick.processing.lobule_segmentation.run_skeletize_image import run_skeletize_image
 from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
-from process_segments import process_segments_to_mask
-
-def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5):
-    """
-    3-class Otsu on a blurred grayscale -> labels in {0,1,2}.
-    Heuristic: lowest mean = true background, middle = microscope bg, highest = tissue.
-    """
-    g = gray.astype(np.uint8)
-    if blur_sigma and blur_sigma > 0:
-        g = cv2.GaussianBlur(g, (0, 0), blur_sigma)
-    # thresholds length = classes-1 -> two thresholds for 3 classes
-    thr = threshold_multiotsu(g, classes=classes)
-    lbl = np.digitize(gray, bins=thr)  # uses original gray for sharper boundaries
-    # order by class mean
-    means = [gray[lbl == i].mean() if np.any(lbl == i) else -1 for i in range(classes)]
-    order = np.argsort(means)  # low -> high
-    idx_true_bg, idx_mic_bg, idx_tissue = order[0], order[1], order[-1]
-    return lbl.astype(np.int32), (idx_true_bg, idx_mic_bg, idx_tissue)
-
-
-def detect_tissue_mask_multiotsu(gray: np.ndarray,
-                                 morphological_radius: int = 5):
-    """
-    Build boolean masks: tissue, microscope background, true background.
-    Cleans with closing + small object/hole removal.
-    """
-    lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=1.5)
-    m_tis  = (lbl == i2)
-
-    m_tis = closing(m_tis, disk(int(morphological_radius)))
-
-    return m_tis.astype(bool)
-
-
-def _overlay_mask(image_stack: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    """Overlay segmentation labels using skimage.color.label2rgb.
-    - Treats label 0 as background.
-    - Supports multi-class masks.
-    """
-
-    base = image_stack.mean(axis=2).astype(np.float32) / 255.0
-    lbl = mask.astype(np.int32)
-
-    over = label2rgb(lbl, image=base, bg_label=0, alpha=alpha, image_alpha=1.0)
-    return (over * 255).astype(np.uint8)
-
-
-def build_mask_pyramid_from_processed(
-    mask_cropped: np.ndarray,
-    img_size_base: Tuple[int, int],            # (Hb, Wb) cropped ROI at base_level (AFTER bbox crop, BEFORE padding)
-    bbox_base: Tuple[int, int, int, int],      # (min_r, min_c, max_r, max_c) in base_level coords
-    orig_shapes: Dict[int, Tuple[int, int]],   # {level: (H,W)} full-frame shapes at each level
-    base_level: int,                           # the level used to load/crop
-) -> Dict[int, np.ndarray]:
-    """
-    0) mask_cropped: mask with padding already stripped (so shape == processed ROI size without pad)
-    1) Resize mask_cropped from processed-ROI size -> base-level ROI size (img_size_base)
-    2) Paste into a full-size base_level canvas at bbox_base
-    3) Resample that base canvas to every level in orig_shapes (NEAREST to preserve labels)
-    Returns {level: full_mask_at_level}
-    """
-    # Step 1: processed ROI -> base-level ROI
-    Hb, Wb = int(img_size_base[0]), int(img_size_base[1])      # target ROI size at base_level
-    if Hb <= 0 or Wb <= 0 or mask_cropped.size == 0:
-        return {lvl: np.zeros(orig_shapes[lvl], dtype=np.int32) for lvl in orig_shapes}
-
-    roi_base = cv2.resize(
-        mask_cropped.astype(np.int32),
-        (Wb, Hb),  # (width, height)
-        interpolation=cv2.INTER_NEAREST
-    ).astype(np.int32)
-
-    # Step 2: paste into full-size base canvas at bbox
-    Hfull_base, Wfull_base = orig_shapes[base_level]
-    min_r, min_c, max_r, max_c = bbox_base
-    canvas_base = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
-    # Safety clamp (in case of off-by-one)
-    min_r = max(0, min_r); min_c = max(0, min_c)
-    max_r = min(Hfull_base, max_r); max_c = min(Wfull_base, max_c)
-    if (max_r - min_r) != Hb or (max_c - min_c) != Wb:
-        # If bbox dims and img_size_base mismatch by 1 px, reconcile by resize
-        Hb2, Wb2 = (max_r - min_r), (max_c - min_c)
-        roi_base = cv2.resize(roi_base, (Wb2, Hb2), interpolation=cv2.INTER_NEAREST).astype(np.int32)
-    canvas_base[min_r:max_r, min_c:max_c] = roi_base
-
-    # Step 3: build pyramid by resizing base canvas to each level
-    out = {}
-    for lvl, (Hdst, Wdst) in orig_shapes.items():
-        if lvl == base_level:
-            out[lvl] = canvas_base.copy()
-        else:
-            out[lvl] = cv2.resize(
-                canvas_base, (Wdst, Hdst), interpolation=cv2.INTER_NEAREST
-            ).astype(np.int32)
-    return out
+from slidekick.processing.lobule_segmentation.process_segments import process_segments_to_mask
+from slidekick.processing.lobule_segmentation.lob_utils import detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed
 
 
 class LobuleSegmentor(BaseOperator):
@@ -129,6 +32,8 @@ class LobuleSegmentor(BaseOperator):
     def __init__(self,
                  metadata: Union[Metadata, List[Metadata]],
                  channel_selection: Union[int, List[int]] = None,
+                 channels_pp: Union[int, List[int]] = None,
+                 channels_pv: Union[int, List[int]] = None,
                  throw_out_ratio: float = None,
                  preview: bool = True,
                  confirm: bool = True,
@@ -140,6 +45,8 @@ class LobuleSegmentor(BaseOperator):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
+        @param channels_pp: Channel[s] that are brighter in periportal regions (potentially after inversion). At least one channel has to be set for channel_pp or channel_pv. If only one is provided, the other will be calculated as the furthest distance on the same channel(s).
+        @param channels_pv: Channel[s] that are brighter in periveneous regions (potentially after inversion). At least one channel has to be set for channel_pp or channel_pv. If only one is provided, the other will be calculated as the furthest distance on the same channel(s).
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
@@ -149,6 +56,23 @@ class LobuleSegmentor(BaseOperator):
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         """
+        # Make lists
+        if isinstance(channels_pp, int):
+            channels_pp = [channels_pp]
+        if isinstance(channels_pv, int):
+            channels_pv = [channels_pv]
+        # Check that at least one of the lists is not None:
+        if channels_pp is None and channels_pv is None:
+            console.print(f"No values for channel_pp or channel_pv provided.", style="error")
+            raise ValueError(f"At least one channel hast to be set in either channel_pp or channel_pv.")
+        else:
+            # Check that channels_pp and channels_pv are different
+            overlap = set(channels_pp) & set(channels_pv)
+            if overlap:
+                console.print(f"The following IDs are used both for periportal and perivenous detection: {overlap}. This is not possible.", style="error")
+                raise ValueError(f"Identical elements for channels_pp and channels_pv: {overlap}")
+        self.channels_pp = channels_pp
+        self.channels_pv = channels_pv
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
@@ -287,7 +211,7 @@ class LobuleSegmentor(BaseOperator):
 
         plt.show()
 
-    def _load_and_invert_images_from_metadatas(self) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
+    def _load_and_invert_images_from_metadatas(self, report_path: Path = None) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
         Load each image at the pyramid level defined, invert selected channels,
         harmonize shapes, and stack along the last axis -> (H, W, N).
@@ -327,10 +251,10 @@ class LobuleSegmentor(BaseOperator):
         if self.multi_otsu:
             # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
             # returns tissue_mask
-            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=5)
+            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=6, report_path=report_path)
         else:
             # just tissue detection
-            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
+            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=6)
 
         # stack: (H,W,C); tissue_mask: (H,W) True=tissue
         stack[~tissue_mask] = 0
@@ -350,8 +274,6 @@ class LobuleSegmentor(BaseOperator):
                 else:  # float images assumed in [0,1]
                     stack[:, :, i] = 1.0 - stack[:, :, i]
 
-            # TODO: Check that inversion returns still black in background vessels by setting them black if one is black, might need higher offset based on otsu threshold mask from microscope?
-
             # optional discard by foreground coverage
             if self.throw_out_ratio is not None:
                 non_bg = np.count_nonzero(img != 255)
@@ -362,14 +284,197 @@ class LobuleSegmentor(BaseOperator):
                         style="warning",
                     )
                     stack = np.delete(stack, i, axis=-1)
+                    if i in self.channels_pp or i in self.channels_pv:
+                        console.print(
+                            f"Channel used for periportal or perivenous detection removed.",
+                            style="warning",
+                        )
+                        if i in self.channels_pp:
+                            self.channels_pp.remove(i)
+                        else:
+                            self.channels_pv.remove(i)
+
+                        # Check if channels_pp and channels_pv are not empty lists now
+                        if not self.channels_pp and not self.channels_pv:
+                            console.print("No remaining channels for perivenous or periportal detection available.", style="error")
+                            raise Exception(f"No remaining channels for segmentation available.")
+
+                    # IDs in channels_pp and channels_pv have to be adapted if channel is removed
+                    self.channels_pp = [j-1 for j in self.channels_pp if j >= i]
+                    self.channels_pv = [j-1 for j in self.channels_pv if j >= i]
 
         return stack, bbox, orig_shapes
 
+    def skeletize_image(self, image_stack: np.ndarray,
+                        pad=10,
+                        region_size=6,
+                        report_path: Path = None) -> Tuple[np.ndarray, Tuple[List[int], list]]:
+        """
+        This function is adopting most of the code from zia/pipeline/pipeline_components/algorithm/segementation/clustering.py
+        However, this code does not rely on "empty" holes to find vessels, but uses intensities of pre-defined stain-channels
+        For this, we use the same superpixel approach, but instead of looking for holes, we cluster the superpixels into each, and then use the pre-defined channels as key indicator which center is which.
+        We check for holes after finding high intensity regions for each and then define this as vessel, otherwise the middle of each intensity peak until sharp increase starts
+        """
+
+        # 1) Superpixel generation
+        image_stack = pad_image(image_stack, pad)
+
+        console.print("Generating superpixels...", style="info")
+        superpixelslic = cv2.ximgproc.createSuperpixelSLIC(image_stack, algorithm=cv2.ximgproc.MSLIC,
+                                                           region_size=region_size)
+        superpixelslic.iterate(num_iterations=20)
+
+        superpixel_mask = superpixelslic.getLabelContourMask(thick_line=False)
+        # Get the labels and number of superpixels
+        labels = superpixelslic.getLabels()
+
+        num_labels = superpixelslic.getNumberOfSuperpixels()
+
+        if report_path is not None:
+            cv2.imwrite(str(report_path / "superpixels.png"), superpixel_mask)
+
+        merged = image_stack.astype(float)
+
+        super_pixels = {label: merged[labels == label] for label in range(num_labels)}
+
+        # 2) Find foreground / background, background is more than 50% smaller than values of 20
+        background_pixels = {}
+        foreground_pixels = {}
+
+        console.print("Cluster superpixels into foreground and background pixels", style="info")
+        for label, pixels in super_pixels.items():
+            # TODO: potentially needs another approach to filter out bg outside not inside.
+            # pixels shape (N, C)
+            channel_dark_fraction = (pixels <= 5).sum(axis=0) / pixels.shape[0]
+            if (channel_dark_fraction > 0.5).any():  # any channel passes
+                background_pixels[label] = pixels
+            else:
+                foreground_pixels[label] = pixels
+
+        # calculate the top and bottom quantile over each channel within the foreground_pixels superpixel
+        # note that zia uses just mean
+        q_low, q_high = 0.20, 0.80
+        fg_keys = list(foreground_pixels.keys())
+        # Per-superpixel quantiles over pixels (axis=0 => per channel)
+        Qlo = {lab: np.quantile(arr, q_low, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()}
+        Qhi = {lab: np.quantile(arr, q_high, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()}
+
+
+
+        if report_path is not None:
+            out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1], 3)).astype(np.uint8)
+            for i in range(num_labels):
+                if i in background_pixels.keys():
+                    out_template[labels == i] = np.array([0, 0, 0])
+                else:
+                    out_template[labels == i] = np.array([255, 255, 255])
+            cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out_template)
+
+            for k in range(merged.shape[2]):
+                out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
+                for i, mean in Qlo.items():
+                    out_template[labels == i] = mean[k]
+                out_template = out_template / np.max(out_template) * 255
+                out_template = out_template.astype(np.uint8)
+                out_template = cv2.cvtColor(out_template, cv2.COLOR_GRAY2RGB)
+                out_template[np.all(out_template != [0, 0, 0], axis=2) & (superpixel_mask == 255)] = [255, 255, 0]
+                cv2.imwrite(str(report_path / f"superpixel_qlo_{k}.png"), out_template)
+
+                out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
+                for i, mean in Qhi.items():
+                    out_template[labels == i] = mean[k]
+                out_template = out_template / np.max(out_template) * 255
+                out_template = out_template.astype(np.uint8)
+                out_template = cv2.cvtColor(out_template, cv2.COLOR_GRAY2RGB)
+                out_template[np.all(out_template != [0, 0, 0], axis=2) & (superpixel_mask == 255)] = [255, 255, 0]
+                cv2.imwrite(str(report_path / f"superpixel_qhi_{k}.png"), out_template)
+
+            # TODO: Plot histograms
+
+        # cluster the superpixels based on the mean channel values within the superpixel
+        n_clusters = 3
+        console.print(f"Cluster (n={n_clusters}) the foreground superpixels based on superpixel mean values",
+                      style="info")
+
+        # Build [q_low | q_high] features -> shape [M, 2C]
+        X = np.stack([np.concatenate([Qlo[k], Qhi[k]], axis=0) for k in fg_keys], axis=0)
+        C = X.shape[1] // 2
+
+        alpha_hi = 2.0  # boost top-quantile on PP/PV channels
+        alpha_lo = 1.5  # also weight bottom-quantile for robustness
+        w_feat = np.ones(2 * C, dtype=np.float32)
+
+        if self.channels_pp is not None:
+            w_feat[self.channels_pp] *= alpha_lo  # bottom-quantile of PP channels
+            w_feat[C + np.array(self.channels_pp)] *= alpha_hi  # top-quantile of PP channels
+        if self.channels_pv is not None:
+            w_feat[self.channels_pv] *= alpha_lo
+            w_feat[C + np.array(self.channels_pv)] *= alpha_hi
+
+        scale = np.sqrt(w_feat)  # √-scaling implements feature weights
+        Xw = X * scale
+
+        # ---- KMeans on weighted quantile features ----
+        kmeans = KMeans(n_clusters=n_clusters, n_init=20, random_state=0)
+        kmeans.fit(Xw)
+
+        centers = kmeans.cluster_centers_ / scale  # back to original feature scale
+        labels_k = kmeans.labels_
+
+        # centers columns: [0:C)=q_low, [C:2C)=q_high
+        channels_pp = self.channels_pp
+        channels_pv = self.channels_pv
+
+        if (channels_pp is not None) and (channels_pv is not None):
+            pp_scores = centers[:, C + np.array(channels_pp)].mean(axis=1)  # high-quantile bright
+            pv_scores = centers[:, C + np.array(channels_pv)].mean(axis=1)
+            idx_pp = int(np.argmax(pp_scores))
+            order_pv = np.argsort(-pv_scores)
+            idx_pv = int(order_pv[0] if order_pv[0] != idx_pp else order_pv[1])
+        elif channels_pp is not None:
+            s_hi = centers[:, C + np.array(channels_pp)].mean(axis=1)  # PP bright
+            s_lo = centers[:, np.array(channels_pp)].mean(axis=1)  # PV = dark on PP
+            idx_pp = int(np.argmax(s_hi))
+            idx_pv = int(np.argmin(s_lo))
+        else:
+            s_hi = centers[:, C + np.array(channels_pv)].mean(axis=1)  # PV bright
+            s_lo = centers[:, np.array(channels_pv)].mean(axis=1)  # PP = dark on PV
+            idx_pv = int(np.argmax(s_hi))
+            idx_pp = int(np.argmin(s_lo))
+
+        idx_mid = next(i for i in range(n_clusters) if i not in (idx_pp, idx_pv))
+        sorted_label_idx = np.array([idx_pp, idx_mid, idx_pv], dtype=int)
+
+        superpixel_kmeans_map = {sp: km for sp, km in zip(foreground_pixels.keys(), labels_k)}
+        lookup = np.vectorize(superpixel_kmeans_map.get)
+        foreground_clustered = lookup(labels)
+
+        # create template for the background / vessels for classification
+        console.print("Complete. Create hierarchical grayscale image of clusters...", style="info")
+        background_template = np.ones_like(merged[:, :, 0]) * 255
+        for i in range(n_clusters):
+            background_template[foreground_clustered == sorted_label_idx[i]] = 0
+
+        if report_path is not None:
+            out_template = np.ones(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
+            for i in range(n_clusters):
+                out_template[foreground_clustered == sorted_label_idx[i]] = round((i + 1) * 255 / n_clusters)
+
+            cv2.imwrite(str(report_path / "foreground_clustered.png"), out_template)
+
+
     def apply(self) -> Metadata:
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        short_id = uuid.uuid4().hex[:8]
+        new_uid = f"{timestamp}-{short_id}"
+
+        report_path = OUTPUT_PATH / f"segmentation-{new_uid}"
+        report_path.mkdir(parents=True, exist_ok=True)
 
         console.print("Loading images...", style="info")
         # Load images and invert based on metadata
-        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas()
+        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
 
         img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
@@ -412,16 +517,8 @@ class LobuleSegmentor(BaseOperator):
                 console.print("Aborted by user. No segmentation performed.", style="error")
                 return self.metadata
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        short_id = uuid.uuid4().hex[:8]
-        new_uid = f"{timestamp}-{short_id}"
-
-        report_path = OUTPUT_PATH / f"segmentation-{new_uid}"
-        report_path.mkdir(parents=True, exist_ok=True)
-
         # Superpixel algorithm (steps 3–7)
         pad = 10  # adjust if you want a different safety border
-        dilation = 5  # Adjust to keep larger/smaller region around vessel
 
         # Adjust region size from number of superpixels if specified
         if self.target_superpixels is not None:
@@ -432,13 +529,11 @@ class LobuleSegmentor(BaseOperator):
                 console.print(f"Computed region size {region_size} is smaller than specified region size {self.region_size}", style="warning")
             self.region_size = region_size
 
-        thinned, (vessel_classes, vessel_contours) = run_skeletize_image(
+        thinned, (vessel_classes, vessel_contours) = self.skeletize_image(
             img_stack,
-            n_clusters=3,
             pad=pad,
-            region_size = self.region_size,
+            region_size=self.region_size,
             report_path=report_path,  # or a folder path if you want PNGs saved
-            dilation=dilation
         )
 
         console.print("Complete. Creating lines segments from skeleton...", style="info")
@@ -460,7 +555,7 @@ class LobuleSegmentor(BaseOperator):
             # Original as mean projection
             orig_vis = img_stack.mean(axis=2).astype(np.uint8)
             # Skeleton cropped to match mask/img_stack
-            overlay_vis = _overlay_mask(img_stack, mask_cropped, alpha=0.5)
+            overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
             # Mask visualization as binary 0/255 for clarity
             mask_vis = (mask_cropped > 0).astype(np.uint8) * 255
             self._preview_images([orig_vis, overlay_vis, mask_vis], titles=["Original", "Segmentation Overlay", "Mask"])
@@ -500,9 +595,9 @@ if __name__ == "__main__":
     from slidekick import DATA_PATH
 
     image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pv
-                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
+                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff", # -> DAPI
-                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
+                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
                    DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff", # -> DAPI
                    ]
@@ -510,8 +605,9 @@ if __name__ == "__main__":
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                [0],
-                                base_level = 4,
-                                region_size = 20)
+                                channels_pp=2,
+                                channels_pv=0,
+                                base_level=4,
+                                region_size=20)
 
     metadata_segmentation = Segmentor.apply()

@@ -117,9 +117,7 @@ def get_and_classify_background_polys(binary: np.ndarray, labels: np.ndarray, so
     return classes, classified_contours, tissue_boundary
 
 
-def pad_image(image_stack: np.ndarray, pad: int) -> np.ndarray:
-    pad_width = ((pad, pad), (pad, pad), (0, 0))
-    return np.pad(image_stack, pad_width, mode="constant", constant_values=0)
+
 
 
 def run_skeletize_image(image_stack: np.ndarray, n_clusters=5, pad=10, region_size = 6, report_path: Path = None, dilation: int = 5) -> Tuple[
