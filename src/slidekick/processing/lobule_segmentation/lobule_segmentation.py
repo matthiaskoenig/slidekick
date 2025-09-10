@@ -40,7 +40,10 @@ class LobuleSegmentor(BaseOperator):
                  base_level: int = 0,
                  region_size: int = 20,
                  multi_otsu: bool = True,
-                 ksize: int = 3,
+                 ksize: int = 7,
+                 n_clusters: int = 3,
+                 alpha_pv: float = 2.0,
+                 alpha_pp: float = 2.0,
                  target_superpixels: int = None):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
@@ -54,25 +57,12 @@ class LobuleSegmentor(BaseOperator):
         @param multi_otsu: whether to use multi-otsu to filter out microscopy background, otherwise classic otsu
         @param region_size: average size of superpixels for SLIC in pixels
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
+        @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
+        @param alpha_pv: weighting factors for superpixel clustering for pv channels
+        @param alpha_pp: weighting factors for superpixel clustering for pp channels
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         """
-        # Make lists
-        if isinstance(channels_pp, int):
-            channels_pp = [channels_pp]
-        if isinstance(channels_pv, int):
-            channels_pv = [channels_pv]
-        # Check that at least one of the lists is not None:
-        if channels_pp is None and channels_pv is None:
-            console.print(f"No values for channel_pp or channel_pv provided.", style="error")
-            raise ValueError(f"At least one channel hast to be set in either channel_pp or channel_pv.")
-        else:
-            # Check that channels_pp and channels_pv are different
-            overlap = set(channels_pp) & set(channels_pv)
-            if overlap:
-                console.print(f"The following IDs are used both for periportal and perivenous detection: {overlap}. This is not possible.", style="error")
-                raise ValueError(f"Identical elements for channels_pp and channels_pv: {overlap}")
-        self.channels_pp = channels_pp
-        self.channels_pv = channels_pv
+
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
@@ -80,6 +70,9 @@ class LobuleSegmentor(BaseOperator):
         self.multi_otsu = multi_otsu
         self.region_size = region_size
         self.ksize = ksize
+        self.n_clusters = n_clusters
+        self.alpha_pv = alpha_pv
+        self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -89,6 +82,37 @@ class LobuleSegmentor(BaseOperator):
         super().__init__(metadata, channel_selection=None)
         # Override init back to have direct info on channels to invert
         self.channels = channel_selection
+        # Make lists
+        if isinstance(channels_pp, int):
+            channels_pp = [channels_pp]
+        if isinstance(channels_pv, int):
+            channels_pv = [channels_pv]
+        # check that the defined channels exist in the metadata objects
+        if (
+                (channels_pp is not None and any(i > len(metadata) - 1 for i in channels_pp)) or
+                (channels_pv is not None and any(i > len(metadata) - 1 for i in channels_pv))
+        ):
+            console.print(
+                "At least one channel for pp or pv is greater than number of metadata objects.",
+                style="error"
+            )
+            raise ValueError(
+                "At least one channel for pp or pv is greater than number of metadata objects."
+            )
+        # Check that at least one of the lists is not None:
+        if channels_pp is None and channels_pv is None:
+            console.print(f"No values for channel_pp or channel_pv provided.", style="error")
+            raise ValueError(f"At least one channel hast to be set in either channel_pp or channel_pv.")
+        elif channels_pp is not None and channels_pv is not None:
+            # Check that channels_pp and channels_pv are different
+            overlap = set(channels_pp) & set(channels_pv)
+            if overlap:
+                console.print(
+                    f"The following IDs are used both for periportal and perivenous detection: {overlap}. This is not possible.",
+                    style="error")
+                raise ValueError(f"Identical elements for channels_pp and channels_pv: {overlap}")
+        self.channels_pp = channels_pp
+        self.channels_pv = channels_pv
 
     @staticmethod
     def _downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
@@ -151,17 +175,15 @@ class LobuleSegmentor(BaseOperator):
             # apply missing mask on this channel
             ch[missing_mask] = 0
 
-            # convolution, changed to ksize=3 form 7 from zia
-            # keep more local info
+            # blur, ksize from zia=7
             ch = cv2.medianBlur(ch, ksize=self.ksize)
 
             # adaptive histogram norm (2D only)
             ch = clahe.apply(ch)
             ch[ch < 10] = 0  # suppress background altered by CLAHE
 
-            # convolution - currently unused from zia
-            # blurred small vessel too much
-            # ch = cv2.medianBlur(ch, ksize=3)
+            # blur
+            ch = cv2.medianBlur(ch, ksize=3)
 
             # channel normalization to 99th percentile
             # use >0 to avoid zero-inflation from background
@@ -177,39 +199,37 @@ class LobuleSegmentor(BaseOperator):
 
     def _preview_images(self, images: List[np.ndarray], titles: Optional[List[str]] = None) -> None:
         """
-        Downsample and render a grid preview. Max 2048 px on the longest side per image.
+        Display the provided images in a Napari viewer as separate layers.
+        Each image will be added as a grayscale or RGBA layer (with appropriate naming).
+        Napari is launched only if preview is True.
         """
-        # TODO. Switch to napari with layered view
         if not images:
             console.print("No images to preview.", style="warning")
             return
 
+        # Downsample each image for preview to a reasonable size (max 2048 px on longest side)
         thumbs = [self._downsample_to_max_side(im, 2048) for im in images]
 
-        # Basic layout: up to 3 columns. Compute rows to fit all images.
-        n = len(thumbs)
-        cols = min(3, n)
-        rows = int(np.ceil(n / cols))
+        # Import Napari and create a viewer for layered display
+        import napari
+        viewer = napari.Viewer()
 
-        # Reasonable figure size based on columns/rows
-        fig_w = 5 * cols
-        fig_h = 5 * rows
-        fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False, constrained_layout=True)
-
-        for idx, ax in enumerate(axes.flat):
-            ax.axis("off")
-            if idx >= n:
-                continue
-            im = thumbs[idx]
-            # grayscale vs RGB handling
+        # Add each image as a separate layer in the viewer
+        for idx, im in enumerate(thumbs):
+            # Determine a layer name using provided titles or default naming
+            layer_name = titles[idx] if titles and idx < len(titles) else f"Layer_{idx}"
+            # Add as grayscale or color layer depending on image shape
             if im.ndim == 2:
-                ax.imshow(im, cmap="gray")
+                viewer.add_image(im, name=str(layer_name), colormap='gray')
+            elif im.ndim == 3 and im.shape[-1] in (3, 4):
+                # If image has 3 or 4 channels, treat it as an RGB(A) image
+                viewer.add_image(im, name=str(layer_name), rgb=True)
             else:
-                ax.imshow(im)
-            if titles and idx < len(titles):
-                ax.set_title(titles[idx], fontsize=9)
+                # Fallback: add image with default settings
+                viewer.add_image(im, name=str(layer_name))
 
-        plt.show()
+        # Start the Napari event loop (blocks until all viewer windows are closed)
+        napari.run()
 
     def _load_and_invert_images_from_metadatas(self, report_path: Path = None) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
@@ -343,124 +363,148 @@ class LobuleSegmentor(BaseOperator):
 
         console.print("Cluster superpixels into foreground and background pixels", style="info")
         for label, pixels in super_pixels.items():
-            # TODO: potentially needs another approach to filter out bg outside not inside.
             # pixels shape (N, C)
-            channel_dark_fraction = (pixels <= 5).sum(axis=0) / pixels.shape[0]
+            channel_dark_fraction = (pixels <= 0).sum(axis=0) / pixels.shape[0]
             if (channel_dark_fraction > 0.5).any():  # any channel passes
                 background_pixels[label] = pixels
             else:
                 foreground_pixels[label] = pixels
 
-        # calculate the top and bottom quantile over each channel within the foreground_pixels superpixel
-        # note that zia uses just mean
-        q_low, q_high = 0.20, 0.80
+        # calculate the mean over each channel within each foreground superpixel
         fg_keys = list(foreground_pixels.keys())
-        # Per-superpixel quantiles over pixels (axis=0 => per channel)
-        Qlo = {lab: np.quantile(arr, q_low, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()}
-        Qhi = {lab: np.quantile(arr, q_high, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()}
-
-
+        foreground_pixels_means = {
+            lab: np.mean(arr, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()
+        }
 
         if report_path is not None:
-            out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1], 3)).astype(np.uint8)
+            # export a foreground/background visualization over superpixels
+            out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1], 3), dtype=np.uint8)
             for i in range(num_labels):
                 if i in background_pixels.keys():
-                    out_template[labels == i] = np.array([0, 0, 0])
+                    out_template[labels == i] = np.array([0, 0, 0], dtype=np.uint8)
                 else:
-                    out_template[labels == i] = np.array([255, 255, 255])
+                    out_template[labels == i] = np.array([255, 255, 255], dtype=np.uint8)
             cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out_template)
 
+            # export per-channel superpixel means as images
             for k in range(merged.shape[2]):
-                out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
-                for i, mean in Qlo.items():
-                    out_template[labels == i] = mean[k]
-                out_template = out_template / np.max(out_template) * 255
-                out_template = out_template.astype(np.uint8)
-                out_template = cv2.cvtColor(out_template, cv2.COLOR_GRAY2RGB)
-                out_template[np.all(out_template != [0, 0, 0], axis=2) & (superpixel_mask == 255)] = [255, 255, 0]
-                cv2.imwrite(str(report_path / f"superpixel_qlo_{k}.png"), out_template)
+                out_gray = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1]), dtype=np.float32)
+                for i, mean_vec in foreground_pixels_means.items():
+                    out_gray[labels == i] = mean_vec[k]
+                m = float(out_gray.max())
+                if m > 0:
+                    out_gray = (out_gray / m) * 255.0
+                out_u8 = out_gray.astype(np.uint8)
+                out_rgb = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2RGB)
+                mask_on = (np.all(out_rgb != [0, 0, 0], axis=2)) & (superpixel_mask == 255)
+                out_rgb[mask_on] = [255, 255, 0]
+                cv2.imwrite(str(report_path / f"superpixel_mean_{k}.png"), out_rgb)
 
-                out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
-                for i, mean in Qhi.items():
-                    out_template[labels == i] = mean[k]
-                out_template = out_template / np.max(out_template) * 255
-                out_template = out_template.astype(np.uint8)
-                out_template = cv2.cvtColor(out_template, cv2.COLOR_GRAY2RGB)
-                out_template[np.all(out_template != [0, 0, 0], axis=2) & (superpixel_mask == 255)] = [255, 255, 0]
-                cv2.imwrite(str(report_path / f"superpixel_qhi_{k}.png"), out_template)
+            # histograms of superpixel mean intensity per channel
+            X_means = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)  # [M, C]
+            C = X_means.shape[1]
+            fig, axes = plt.subplots(
+                1, C,
+                figsize=(2.8 * C, 3.0),
+                squeeze=False,
+                constrained_layout=True,
+            )
+            for c in range(C):
+                axes[0, c].hist(X_means[:, c], bins=50)
+                axes[0, c].set_title(f"Ch {c} · mean")
+                axes[0, c].set_xlabel("value")
+                axes[0, c].set_ylabel("count")
+            fig.suptitle("Superpixel mean intensity histograms", fontsize=11)
+            fig.savefig(str(report_path / "hist_superpixel_means.png"), dpi=150)
+            plt.close(fig)
 
-            # TODO: Plot histograms
-
-        # cluster the superpixels based on the mean channel values within the superpixel
-        n_clusters = 3
-        console.print(f"Cluster (n={n_clusters}) the foreground superpixels based on superpixel mean values",
+        # 3) cluster the superpixels based on the mean channel values within the superpixel using weighted K-Means
+        console.print(f"Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values",
                       style="info")
 
-        # Build [q_low | q_high] features -> shape [M, 2C]
-        X = np.stack([np.concatenate([Qlo[k], Qhi[k]], axis=0) for k in fg_keys], axis=0)
-        C = X.shape[1] // 2
+        # feature matrix [M, C] from superpixel means
+        X = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
+        C = X.shape[1]
 
-        alpha_hi = 2.0  # boost top-quantile on PP/PV channels
-        alpha_lo = 1.5  # also weight bottom-quantile for robustness
-        w_feat = np.ones(2 * C, dtype=np.float32)
-
+        # per-channel importance: boost PP/PV channels
+        w_feat = np.ones(C, dtype=np.float32)
         if self.channels_pp is not None:
-            w_feat[self.channels_pp] *= alpha_lo  # bottom-quantile of PP channels
-            w_feat[C + np.array(self.channels_pp)] *= alpha_hi  # top-quantile of PP channels
+            w_feat[self.channels_pp] *= self.alpha_pp
         if self.channels_pv is not None:
-            w_feat[self.channels_pv] *= alpha_lo
-            w_feat[C + np.array(self.channels_pv)] *= alpha_hi
+            w_feat[self.channels_pv] *= self.alpha_pv
 
-        scale = np.sqrt(w_feat)  # √-scaling implements feature weights
-        Xw = X * scale
+        # scaling implements feature weights
+        Xw = X * w_feat
 
-        # ---- KMeans on weighted quantile features ----
-        kmeans = KMeans(n_clusters=n_clusters, n_init=20, random_state=0)
+        # KMeans on weighted mean features
+        kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
         kmeans.fit(Xw)
 
-        centers = kmeans.cluster_centers_ / scale  # back to original feature scale
+        centers = kmeans.cluster_centers_ / w_feat  # back to original scale
         labels_k = kmeans.labels_
 
-        # centers columns: [0:C)=q_low, [C:2C)=q_high
+        # assign centers: indices for PP, MID, PV using mean over provided channels
         channels_pp = self.channels_pp
         channels_pv = self.channels_pv
-
         if (channels_pp is not None) and (channels_pv is not None):
-            pp_scores = centers[:, C + np.array(channels_pp)].mean(axis=1)  # high-quantile bright
-            pv_scores = centers[:, C + np.array(channels_pv)].mean(axis=1)
+            pp_scores = centers[:, channels_pp].mean(axis=1)
+            pv_scores = centers[:, channels_pv].mean(axis=1)
             idx_pp = int(np.argmax(pp_scores))
-            order_pv = np.argsort(-pv_scores)
-            idx_pv = int(order_pv[0] if order_pv[0] != idx_pp else order_pv[1])
+            pv_order = np.argsort(-pv_scores)
+            idx_pv = int(pv_order[0] if pv_order[0] != idx_pp else pv_order[1])
         elif channels_pp is not None:
-            s_hi = centers[:, C + np.array(channels_pp)].mean(axis=1)  # PP bright
-            s_lo = centers[:, np.array(channels_pp)].mean(axis=1)  # PV = dark on PP
-            idx_pp = int(np.argmax(s_hi))
-            idx_pv = int(np.argmin(s_lo))
+            s = centers[:, channels_pp].mean(axis=1)
+            idx_pp = int(np.argmax(s))
+            idx_pv = int(np.argmin(s))  # inverse pole on same channels
         else:
-            s_hi = centers[:, C + np.array(channels_pv)].mean(axis=1)  # PV bright
-            s_lo = centers[:, np.array(channels_pv)].mean(axis=1)  # PP = dark on PV
-            idx_pv = int(np.argmax(s_hi))
-            idx_pp = int(np.argmin(s_lo))
+            s = centers[:, channels_pv].mean(axis=1)
+            idx_pv = int(np.argmax(s))
+            idx_pp = int(np.argmin(s))  # inverse pole on same channels
 
-        idx_mid = next(i for i in range(n_clusters) if i not in (idx_pp, idx_pv))
-        sorted_label_idx = np.array([idx_pp, idx_mid, idx_pv], dtype=int)
-
+        idx_mid = [i for i in range(self.n_clusters) if i not in [idx_pp, idx_pv]]
+        sorted_label_idx = np.array([idx_pp, *idx_mid, idx_pv], dtype=int)
+        
         superpixel_kmeans_map = {sp: km for sp, km in zip(foreground_pixels.keys(), labels_k)}
         lookup = np.vectorize(superpixel_kmeans_map.get)
         foreground_clustered = lookup(labels)
 
+        # TODO: Vessel classfication through superpixels over superpixel
+
         # create template for the background / vessels for classification
         console.print("Complete. Create hierarchical grayscale image of clusters...", style="info")
         background_template = np.ones_like(merged[:, :, 0]) * 255
-        for i in range(n_clusters):
+        for i in range(self.n_clusters):
             background_template[foreground_clustered == sorted_label_idx[i]] = 0
 
-        if report_path is not None:
-            out_template = np.ones(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
-            for i in range(n_clusters):
-                out_template[foreground_clustered == sorted_label_idx[i]] = round((i + 1) * 255 / n_clusters)
+        template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
+        for i in range(self.n_clusters):
+            if i == 0:
+                n = 1
+            elif i == self.n_clusters - 1:
+                n = 3
+            else:
+                n = 2
+            template[foreground_clustered == sorted_label_idx[i]] = round(n * 255 / 3)
 
-            cv2.imwrite(str(report_path / "foreground_clustered.png"), out_template)
+        if report_path is not None:
+            cv2.imwrite(str(report_path / "foreground_clustered.png"), template)
+
+        console.print("Complete. Run thinning algorithm...", style="info")
+
+        # TODO: Draw final map + vessels
+
+        template = cv2.medianBlur(255 - template, 5)
+
+        console.print("Complete. Run thinning algorithm...", style="info")
+
+        thinned = cv2.ximgproc.thinning(template.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
+
+        # TODO: Double thinning + vessels
+
+        if report_path is not None:
+            cv2.imwrite(str(report_path / "thinned.png"), thinned)
+
+        return thinned, (None, None)  #thinned, (classes, filtered_contours)
 
 
     def apply(self) -> Metadata:
@@ -595,19 +639,19 @@ if __name__ == "__main__":
     from slidekick import DATA_PATH
 
     image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pv
-                   DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
+                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff", # -> DAPI
                    DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
+                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
                    #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff", # -> DAPI
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                channels_pp=2,
+                                #channels_pp=1,
                                 channels_pv=0,
                                 base_level=4,
-                                region_size=20)
+                                region_size=25)
 
     metadata_segmentation = Segmentor.apply()
