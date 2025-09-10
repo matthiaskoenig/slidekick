@@ -52,7 +52,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
     Build boolean masks: tissue, microscope background, true background.
     Cleans with closing + small object/hole removal.
     """
-    lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=1.5, report_path=report_path)
+    lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=15, report_path=report_path)
     m_tis  = (lbl == i2)
 
     m_tis = closing(m_tis, disk(int(morphological_radius)))

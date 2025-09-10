@@ -325,7 +325,7 @@ class LobuleSegmentor(BaseOperator):
 
         return stack, bbox, orig_shapes
 
-    def skeletize_image(self, image_stack: np.ndarray,
+    def skeletize_kmeans(self, image_stack: np.ndarray,
                         pad=10,
                         region_size=6,
                         report_path: Path = None) -> Tuple[np.ndarray, Tuple[List[int], list]]:
@@ -573,11 +573,11 @@ class LobuleSegmentor(BaseOperator):
                 console.print(f"Computed region size {region_size} is smaller than specified region size {self.region_size}", style="warning")
             self.region_size = region_size
 
-        thinned, (vessel_classes, vessel_contours) = self.skeletize_image(
+        thinned, (vessel_classes, vessel_contours) = self.skeletize_kmeans(
             img_stack,
             pad=pad,
             region_size=self.region_size,
-            report_path=report_path,  # or a folder path if you want PNGs saved
+            report_path=report_path,
         )
 
         console.print("Complete. Creating lines segments from skeleton...", style="info")
@@ -638,20 +638,17 @@ if __name__ == "__main__":
     # Example usage
     from slidekick import DATA_PATH
 
-    image_paths = [DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch0.tiff",  # pv
-                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch1.tiff",
-                   #DATA_PATH / "reg_n_sep" / "GS_CYP1A2_ch2.tiff", # -> DAPI
-                   DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch0.tiff",  # pp
-                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch1.tiff",
-                   #DATA_PATH / "reg_n_sep" / "Ecad_CYP2E1_ch2.tiff", # -> DAPI
+    image_paths = [DATA_PATH / "reg_n_sep" / "noise.tiff",
+                   DATA_PATH / "reg_n_sep" / "periportal.tiff",
+                   DATA_PATH / "reg_n_sep" / "perivenous.tiff",
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                #channels_pp=1,
-                                channels_pv=0,
-                                base_level=4,
+                                channels_pp=1,
+                                channels_pv=2,
+                                base_level=1,
                                 region_size=25)
 
     metadata_segmentation = Segmentor.apply()

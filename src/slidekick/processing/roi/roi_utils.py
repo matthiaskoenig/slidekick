@@ -28,15 +28,8 @@ def ensure_grayscale_uint8(image: np.ndarray) -> np.ndarray:
         elif arr.dtype != np.uint8:
             arr = np.clip(arr, 0, 255).astype(np.uint8)
 
-        # If at least three channels exist use RGB->grayscale luminance, else average
-        if arr.shape[2] >= 3:
-            r = arr[..., 0].astype(np.float32)
-            g = arr[..., 1].astype(np.float32)
-            b = arr[..., 2].astype(np.float32)
-            gray = (0.2126 * r + 0.7152 * g + 0.0722 * b)
-            gray = np.clip(gray, 0, 255).astype(np.uint8)
-        else:
-            gray = np.mean(arr, axis=2).astype(np.uint8)
+        # average
+        gray = np.mean(arr, axis=2).astype(np.uint8)
     else:
         # Single-channel input handling
         if np.issubdtype(image.dtype, np.floating):
