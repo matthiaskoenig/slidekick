@@ -43,8 +43,17 @@ class LobuleSegmentor(BaseOperator):
                  ksize: int = 7,
                  n_clusters: int = 3,
                  alpha_pv: float = 2.0,
-                 alpha_pp: float = 2.0,
-                 target_superpixels: int = None):
+                 alpha_pp: float = 3.0,
+                 target_superpixels: int = None,
+                 min_vessel_area_pp: int = 1500,
+                 min_vessel_area_pv: int = 1000,
+                 vessel_annulus_px: int = 3,
+                 vessel_zone_ratio_thr_pp: float = 0.75,
+                 vessel_zone_ratio_thr_pv: float = 0.60,
+                 vessel_circularity_min: float = 0.15,
+                 vessel_contrast_min_pp: float = 10.0,
+                 vessel_contrast_min_pv: float = 6.0,
+                 vessel_bg_fraction_min: float = 0.20):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -61,8 +70,16 @@ class LobuleSegmentor(BaseOperator):
         @param alpha_pv: weighting factors for superpixel clustering for pv channels
         @param alpha_pp: weighting factors for superpixel clustering for pp channels
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
+        @param min_vessel_area_pp: min area (px) for PP-enclosed vessel candidates
+        @param min_vessel_area_pv: min area (px) for PV-enclosed vessel candidates
+        @param vessel_annulus_px: thickness (px) of ring-consistency check
+        @param vessel_zone_ratio_thr_pp: fraction of ring that must be PP
+        @param vessel_zone_ratio_thr_pv: fraction of ring that must be PV
+        @param vessel_circularity_min: 4πA/P^2 gate; low keeps elongated vessels
+        @param vessel_contrast_min_pp: PP ring − lumen contrast (uint8) in PP channels
+        @param vessel_contrast_min_pv: PV ring − lumen contrast (uint8) in PV channels
+        @param vessel_bg_fraction_min: share of inside SPs that were background before reassignment
         """
-
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
@@ -74,6 +91,15 @@ class LobuleSegmentor(BaseOperator):
         self.alpha_pv = alpha_pv
         self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
+        self.min_vessel_area_pp = min_vessel_area_pp
+        self.min_vessel_area_pv = min_vessel_area_pv
+        self.vessel_annulus_px = vessel_annulus_px
+        self.vessel_zone_ratio_thr_pp = vessel_zone_ratio_thr_pp
+        self.vessel_zone_ratio_thr_pv = vessel_zone_ratio_thr_pv
+        self.vessel_circularity_min = vessel_circularity_min
+        self.vessel_contrast_min_pp = vessel_contrast_min_pp
+        self.vessel_contrast_min_pv = vessel_contrast_min_pv
+        self.vessel_bg_fraction_min = vessel_bg_fraction_min
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
             channel_selection = [channel_selection]
@@ -113,6 +139,7 @@ class LobuleSegmentor(BaseOperator):
                 raise ValueError(f"Identical elements for channels_pp and channels_pv: {overlap}")
         self.channels_pp = channels_pp
         self.channels_pv = channels_pv
+
 
     @staticmethod
     def _downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
@@ -325,68 +352,62 @@ class LobuleSegmentor(BaseOperator):
 
         return stack, bbox, orig_shapes
 
-    def skeletize_kmeans(self, image_stack: np.ndarray,
-                        pad=10,
-                        region_size=6,
-                        report_path: Path = None) -> Tuple[np.ndarray, Tuple[List[int], list]]:
-        """
-        This function is adopting most of the code from zia/pipeline/pipeline_components/algorithm/segementation/clustering.py
-        However, this code does not rely on "empty" holes to find vessels, but uses intensities of pre-defined stain-channels
-        For this, we use the same superpixel approach, but instead of looking for holes, we cluster the superpixels into each, and then use the pre-defined channels as key indicator which center is which.
-        We check for holes after finding high intensity regions for each and then define this as vessel, otherwise the middle of each intensity peak until sharp increase starts
-        """
 
+    def skeletize_kmeans(self, image_stack: np.ndarray,
+                         pad=10,
+                         region_size=6,
+                         report_path: Path = None) -> Tuple[np.ndarray, Tuple[List[int], list]]:
+        """
+        Adopts most code from zia.../clustering.py. Uses intensities of pre-defined stain-channels.
+        We cluster superpixels, label centers (PP/MID/PV), then search for ring-like PP/PV regions
+        and reassign enclosed superpixels as vessels to the surrounding class. Saves zonation overlay
+        with vessel outlines (central=cyan, portal=magenta), then thinning.
+        """
         # 1) Superpixel generation
         image_stack = pad_image(image_stack, pad)
 
         console.print("Generating superpixels...", style="info")
-        superpixelslic = cv2.ximgproc.createSuperpixelSLIC(image_stack, algorithm=cv2.ximgproc.MSLIC,
-                                                           region_size=region_size)
+        superpixelslic = cv2.ximgproc.createSuperpixelSLIC(
+            image_stack, algorithm=cv2.ximgproc.MSLIC, region_size=region_size
+        )
         superpixelslic.iterate(num_iterations=20)
 
         superpixel_mask = superpixelslic.getLabelContourMask(thick_line=False)
-        # Get the labels and number of superpixels
         labels = superpixelslic.getLabels()
-
         num_labels = superpixelslic.getNumberOfSuperpixels()
 
         if report_path is not None:
             cv2.imwrite(str(report_path / "superpixels.png"), superpixel_mask)
 
         merged = image_stack.astype(float)
-
         super_pixels = {label: merged[labels == label] for label in range(num_labels)}
 
-        # 2) Find foreground / background, background is more than 50% smaller than values of 20
-        background_pixels = {}
-        foreground_pixels = {}
+        # 2) Foreground/background split based on dark fraction across channels
+        background_pixels: Dict[int, np.ndarray] = {}
+        foreground_pixels: Dict[int, np.ndarray] = {}
 
         console.print("Cluster superpixels into foreground and background pixels", style="info")
         for label, pixels in super_pixels.items():
-            # pixels shape (N, C)
             channel_dark_fraction = (pixels <= 0).sum(axis=0) / pixels.shape[0]
-            if (channel_dark_fraction > 0.5).any():  # any channel passes
+            if (channel_dark_fraction > 0.5).any():
                 background_pixels[label] = pixels
             else:
                 foreground_pixels[label] = pixels
 
-        # calculate the mean over each channel within each foreground superpixel
         fg_keys = list(foreground_pixels.keys())
         foreground_pixels_means = {
             lab: np.mean(arr, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()
         }
 
         if report_path is not None:
-            # export a foreground/background visualization over superpixels
             out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1], 3), dtype=np.uint8)
             for i in range(num_labels):
-                if i in background_pixels.keys():
+                if i in background_pixels:
                     out_template[labels == i] = np.array([0, 0, 0], dtype=np.uint8)
                 else:
                     out_template[labels == i] = np.array([255, 255, 255], dtype=np.uint8)
             cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out_template)
 
-            # export per-channel superpixel means as images
             for k in range(merged.shape[2]):
                 out_gray = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1]), dtype=np.float32)
                 for i, mean_vec in foreground_pixels_means.items():
@@ -400,15 +421,9 @@ class LobuleSegmentor(BaseOperator):
                 out_rgb[mask_on] = [255, 255, 0]
                 cv2.imwrite(str(report_path / f"superpixel_mean_{k}.png"), out_rgb)
 
-            # histograms of superpixel mean intensity per channel
-            X_means = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)  # [M, C]
+            X_means = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
             C = X_means.shape[1]
-            fig, axes = plt.subplots(
-                1, C,
-                figsize=(2.8 * C, 3.0),
-                squeeze=False,
-                constrained_layout=True,
-            )
+            fig, axes = plt.subplots(1, C, figsize=(2.8 * C, 3.0), squeeze=False, constrained_layout=True)
             for c in range(C):
                 axes[0, c].hist(X_means[:, c], bins=50)
                 axes[0, c].set_title(f"Ch {c} · mean")
@@ -418,32 +433,29 @@ class LobuleSegmentor(BaseOperator):
             fig.savefig(str(report_path / "hist_superpixel_means.png"), dpi=150)
             plt.close(fig)
 
-        # 3) cluster the superpixels based on the mean channel values within the superpixel using weighted K-Means
+        # 3) Weighted KMeans over superpixel mean features
         console.print(f"Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values",
                       style="info")
 
-        # feature matrix [M, C] from superpixel means
         X = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
         C = X.shape[1]
 
-        # per-channel importance: boost PP/PV channels
+        # TODO: Evaluate non-linear weighting
+
         w_feat = np.ones(C, dtype=np.float32)
         if self.channels_pp is not None:
             w_feat[self.channels_pp] *= self.alpha_pp
         if self.channels_pv is not None:
             w_feat[self.channels_pv] *= self.alpha_pv
-
-        # scaling implements feature weights
         Xw = X * w_feat
 
-        # KMeans on weighted mean features
         kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
         kmeans.fit(Xw)
 
-        centers = kmeans.cluster_centers_ / w_feat  # back to original scale
+        centers = kmeans.cluster_centers_ / w_feat
         labels_k = kmeans.labels_
 
-        # assign centers: indices for PP, MID, PV using mean over provided channels
+        # Assign semantic roles PP/MID/PV
         channels_pp = self.channels_pp
         channels_pv = self.channels_pv
         if (channels_pp is not None) and (channels_pv is not None):
@@ -455,39 +467,171 @@ class LobuleSegmentor(BaseOperator):
         elif channels_pp is not None:
             s = centers[:, channels_pp].mean(axis=1)
             idx_pp = int(np.argmax(s))
-            idx_pv = int(np.argmin(s))  # inverse pole on same channels
+            idx_pv = int(np.argmin(s))
         else:
             s = centers[:, channels_pv].mean(axis=1)
             idx_pv = int(np.argmax(s))
-            idx_pp = int(np.argmin(s))  # inverse pole on same channels
+            idx_pp = int(np.argmin(s))
 
         idx_mid = [i for i in range(self.n_clusters) if i not in [idx_pp, idx_pv]]
         sorted_label_idx = np.array([idx_pp, *idx_mid, idx_pv], dtype=int)
-        
-        superpixel_kmeans_map = {sp: km for sp, km in zip(foreground_pixels.keys(), labels_k)}
-        lookup = np.vectorize(superpixel_kmeans_map.get)
-        foreground_clustered = lookup(labels)
 
-        # TODO: Vessel classfication through superpixels over superpixel
+        # Map each foreground superpixel id -> cluster id
+        superpixel_kmeans_map = {sp: km for sp, km in zip(fg_keys, labels_k)}
 
-        # create template for the background / vessels for classification
-        console.print("Complete. Create hierarchical grayscale image of clusters...", style="info")
-        background_template = np.ones_like(merged[:, :, 0]) * 255
-        for i in range(self.n_clusters):
-            background_template[foreground_clustered == sorted_label_idx[i]] = 0
+        # Build initial assignment dict for all superpixels (background: -1)
+        assigned_by_sp: Dict[int, int] = {sp: -1 for sp in range(num_labels)}
+        for sp, km in superpixel_kmeans_map.items():
+            assigned_by_sp[sp] = km
 
-        template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1])).astype(np.uint8)
-        for i in range(self.n_clusters):
-            if i == 0:
+        # Vectorized lookup of assigned_by_sp over the SLIC label image
+        get_lab = np.vectorize(lambda sp: assigned_by_sp.get(int(sp), -1))
+        cluster_map = get_lab(labels).astype(np.int32)  # shape (H, W), values in {-1, 0..n_clusters-1}
+
+        # Vessel detection and superpixel reassignment
+        vessel_classes: List[int] = []
+        vessel_contours: List[np.ndarray] = []
+
+        def _reassign_hole_contours(zone_cluster_idx: int,
+                                    mask_zone: np.ndarray,
+                                    vessel_cls_value: int):
+            """
+            zone_cluster_idx: idx_pp or idx_pv (surrounding zone)
+            mask_zone: binary mask (255=zone pixels)
+            vessel_cls_value: 1 for portal field (PP), 0 for central vein (PV)
+            """
+            contours, hierarchy = cv2.findContours(mask_zone, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if contours is None or hierarchy is None:
+                return
+
+            Hh = hierarchy[0]
+            H, W = mask_zone.shape
+
+            # thresholds per zone (always on; from __init__)
+            if zone_cluster_idx == idx_pp:
+                min_area = int(self.min_vessel_area_pp)
+                zone_ratio_thr = float(self.vessel_zone_ratio_thr_pp)
+                min_contrast = float(self.vessel_contrast_min_pp)
+                ring_channels = (self.channels_pp or [])
+            else:
+                min_area = int(self.min_vessel_area_pv)
+                zone_ratio_thr = float(self.vessel_zone_ratio_thr_pv)
+                min_contrast = float(self.vessel_contrast_min_pv)
+                ring_channels = (self.channels_pv or [])
+
+            k = max(1, int(self.vessel_annulus_px))
+            se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+
+            def _mean_over_channels(mask_bool: np.ndarray, channels: List[int]) -> float:
+                if not channels or not np.any(mask_bool):
+                    return 0.0
+                vals = [image_stack[..., c][mask_bool].mean() for c in channels]
+                return float(np.mean(vals)) if vals else 0.0
+
+            for i, cnt in enumerate(contours):
+                # only child contours (holes)
+                if Hh[i][3] == -1:
+                    continue
+
+                area = cv2.contourArea(cnt)
+                if area < max(1, min_area):
+                    continue
+
+                # shape sanity (permissive to allow elongated vessels)
+                peri = max(cv2.arcLength(cnt, True), 1e-6)
+                circularity = float(4.0 * np.pi * area / (peri * peri))
+                if circularity < float(self.vessel_circularity_min):
+                    continue
+
+                # hole mask
+                hole_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                hole_bool = hole_mask > 0
+
+                # ring (annulus) around the hole
+                dil = cv2.dilate(hole_mask, se)
+                ero = cv2.erode(hole_mask, se)
+                ring = cv2.subtract(dil, ero)
+                ring_bool = ring > 0
+                if not np.any(ring_bool):
+                    continue
+
+                # ring must be mostly the same zone
+                zone_ratio = float(np.mean((cluster_map == zone_cluster_idx)[ring_bool]))
+                if zone_ratio < zone_ratio_thr:
+                    continue
+
+                # intensity contrast in defining channels: ring brighter than hole
+                if ring_channels:
+                    ring_mean = _mean_over_channels(ring_bool, ring_channels)
+                    hole_mean = _mean_over_channels(hole_bool, ring_channels)
+                    if (ring_mean - hole_mean) < min_contrast:
+                        continue
+
+                # accept: reassign all superpixels whose pixels fall inside the hole
+                sp_inside = np.unique(labels[hole_bool])
+                for sp in sp_inside:
+                    assigned_by_sp[int(sp)] = zone_cluster_idx
+
+                vessel_classes.append(vessel_cls_value)
+                vessel_contours.append(cnt)
+
+        # PP holes → portal fields; PV holes → central veins
+        mask_pp = (cluster_map == idx_pp).astype(np.uint8) * 255
+        _reassign_hole_contours(idx_pp, mask_pp, vessel_cls_value=1)
+
+        mask_pv = (cluster_map == idx_pv).astype(np.uint8) * 255
+        _reassign_hole_contours(idx_pv, mask_pv, vessel_cls_value=0)
+
+        # Rebuild final per-pixel cluster map after reassignment
+        cluster_map_final = get_lab(labels).astype(np.int32)
+
+        # Helper for consistent grayscale per cluster id using semantic order
+        def _gray_for_cluster(cid: int) -> int:
+            pos = int(np.where(sorted_label_idx == cid)[0][0])
+            if pos == 0:
                 n = 1
-            elif i == self.n_clusters - 1:
+            elif pos == self.n_clusters - 1:
                 n = 3
             else:
                 n = 2
-            template[foreground_clustered == sorted_label_idx[i]] = round(n * 255 / 3)
+            return int(round(n * 255 / 3))
+
+        template = np.zeros(image_stack.shape[:2], dtype=np.uint8)
+        for cid in range(self.n_clusters):
+            template[cluster_map_final == cid] = _gray_for_cluster(cid)
 
         if report_path is not None:
-            cv2.imwrite(str(report_path / "foreground_clustered.png"), template)
+            cv2.imwrite(str(report_path / "foreground_clustered_final.png"), template)
+
+        # Zonation + vessel overlay
+        if report_path is not None:
+            base_vis = image_stack.mean(axis=2).astype(np.uint8)
+            base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
+
+            color_pp = (180, 40, 180)  # BGR
+            color_mid = (60, 160, 60)
+            color_pv = (255, 100, 0)
+
+            zonation_rgb = np.zeros_like(base_rgb, dtype=np.uint8)
+            zonation_rgb[cluster_map_final == idx_pp] = color_pp
+            for mid_idx in idx_mid:
+                zonation_rgb[cluster_map_final == mid_idx] = color_mid
+            zonation_rgb[cluster_map_final == idx_pv] = color_pv
+
+            overlay = cv2.addWeighted(base_rgb, 0.6, zonation_rgb, 0.4, 0.0)
+
+            # outlines always on: central=cyan, portal=magenta
+            for cnt, cls in zip(vessel_contours, vessel_classes):
+                color = (255, 255, 0) if cls == 0 else (255, 0, 255)
+                cv2.drawContours(overlay, [cnt], -1, color, thickness=2)
+
+            cv2.imwrite(str(report_path / "zonation_overlay.png"), overlay)
+            cv2.imwrite(str(report_path / "zonation_rgb.png"), zonation_rgb)
+
+        # TODO: Resharpen zones around vessel
+
+        # TODO: Thinning
 
         console.print("Complete. Run thinning algorithm...", style="info")
 
@@ -504,7 +648,8 @@ class LobuleSegmentor(BaseOperator):
         if report_path is not None:
             cv2.imwrite(str(report_path / "thinned.png"), thinned)
 
-        return thinned, (None, None)  #thinned, (classes, filtered_contours)
+        return thinned, (vessel_classes, vessel_contours)
+
 
 
     def apply(self) -> Metadata:
@@ -648,7 +793,7 @@ if __name__ == "__main__":
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
                                 channels_pp=1,
                                 channels_pv=2,
-                                base_level=1,
+                                base_level=2,
                                 region_size=25)
 
     metadata_segmentation = Segmentor.apply()
