@@ -2,11 +2,11 @@ import numpy as np
 from pathlib import Path
 from rich.prompt import Confirm
 from typing import List, Union, Optional, Tuple, Dict, Any
-from PIL import Image
 import cv2
 import datetime
 import uuid
 from sklearn.cluster import KMeans
+import napari
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -21,7 +21,10 @@ from slidekick.io import save_tif
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
 from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
 from slidekick.processing.lobule_segmentation.process_segments import process_segments_to_mask
-from slidekick.processing.lobule_segmentation.lob_utils import detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed
+from slidekick.processing.lobule_segmentation.lob_utils import (
+    detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
+    downsample_to_max_side, percentile, gray_for_cluster, render_cluster_gray
+)
 
 
 class LobuleSegmentor(BaseOperator):
@@ -43,8 +46,9 @@ class LobuleSegmentor(BaseOperator):
                  ksize: int = 7,
                  n_clusters: int = 3,
                  alpha_pv: float = 2.0,
-                 alpha_pp: float = 3.0,
+                 alpha_pp: float = 2.0,
                  target_superpixels: int = None,
+                 # vessel gating (always on)
                  min_vessel_area_pp: int = 1500,
                  min_vessel_area_pv: int = 1000,
                  vessel_annulus_px: int = 3,
@@ -53,7 +57,12 @@ class LobuleSegmentor(BaseOperator):
                  vessel_circularity_min: float = 0.15,
                  vessel_contrast_min_pp: float = 10.0,
                  vessel_contrast_min_pv: float = 6.0,
-                 vessel_bg_fraction_min: float = 0.20):
+                 vessel_bg_fraction_min: float = 0.20,
+                 # refinement knobs (always on)
+                 dist_midband_rel: float = 0.15,
+                 dist_margin_px: int = 2,
+                 refine_pp_percentile: float = 0.30,
+                 refine_pv_percentile: float = 0.30):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -79,6 +88,10 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_contrast_min_pp: PP ring − lumen contrast (uint8) in PP channels
         @param vessel_contrast_min_pv: PV ring − lumen contrast (uint8) in PV channels
         @param vessel_bg_fraction_min: share of inside SPs that were background before reassignment
+        @param dist_midband_rel: relative band where |d_cv - d_pf| small → MID assignment
+        @param dist_margin_px: absolute pixel margin for PP/PV distance decisions
+        @param refine_pp_percentile: demote weakest PP to MID below this PP-channel percentile
+        @param refine_pv_percentile: demote weakest PV to MID below this PV-channel percentile
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
@@ -91,6 +104,8 @@ class LobuleSegmentor(BaseOperator):
         self.alpha_pv = alpha_pv
         self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
+
+        # vessel gating
         self.min_vessel_area_pp = min_vessel_area_pp
         self.min_vessel_area_pv = min_vessel_area_pv
         self.vessel_annulus_px = vessel_annulus_px
@@ -100,6 +115,13 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_contrast_min_pp = vessel_contrast_min_pp
         self.vessel_contrast_min_pv = vessel_contrast_min_pv
         self.vessel_bg_fraction_min = vessel_bg_fraction_min
+
+        # refinement knobs
+        self.dist_midband_rel = dist_midband_rel
+        self.dist_margin_px = dist_margin_px
+        self.refine_pp_percentile = refine_pp_percentile
+        self.refine_pv_percentile = refine_pv_percentile
+
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
             channel_selection = [channel_selection]
@@ -139,41 +161,6 @@ class LobuleSegmentor(BaseOperator):
                 raise ValueError(f"Identical elements for channels_pp and channels_pv: {overlap}")
         self.channels_pp = channels_pp
         self.channels_pv = channels_pv
-
-
-    @staticmethod
-    def _downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
-        """
-        Downsample image so max(height, width) == max_side, preserving aspect ratio.
-        Uses Pillow LANCZOS for high-quality downscale.
-        No-op if the image is already smaller than max_side.
-        """
-
-        # Ensure we operate on HxW or HxWxC ndarray
-        if not isinstance(img, np.ndarray) or img.ndim not in (2, 3):
-            raise ValueError("Preview expects an ndarray image of shape HxW or HxWxC.")
-
-        h, w = img.shape[:2]
-        longest = max(h, w)
-        if longest <= max_side:
-            return img  # already small enough
-
-        scale = max_side / float(longest)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-
-        # Convert to PIL, resize, back to numpy
-        # Normalize dtype to uint8 for display if needed
-        arr = img
-        if arr.dtype != np.uint8:
-            # clip to [0,255] then cast for stable visualization
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-        pil = Image.fromarray(arr)
-        pil = pil.resize((new_w, new_h), resample=Image.LANCZOS)
-        out = np.asarray(pil)
-
-        return out
 
     def _filter(self, image_stack: np.ndarray) -> np.ndarray:
         """
@@ -235,10 +222,10 @@ class LobuleSegmentor(BaseOperator):
             return
 
         # Downsample each image for preview to a reasonable size (max 2048 px on longest side)
-        thumbs = [self._downsample_to_max_side(im, 2048) for im in images]
+        thumbs = [downsample_to_max_side(im, 2048) for im in images]
 
         # Import Napari and create a viewer for layered display
-        import napari
+        # TODO: Use viewer from slidekick
         viewer = napari.Viewer()
 
         # Add each image as a separate layer in the viewer
@@ -361,7 +348,8 @@ class LobuleSegmentor(BaseOperator):
         Adopts most code from zia.../clustering.py. Uses intensities of pre-defined stain-channels.
         We cluster superpixels, label centers (PP/MID/PV), then search for ring-like PP/PV regions
         and reassign enclosed superpixels as vessels to the surrounding class. Saves zonation overlay
-        with vessel outlines (central=cyan, portal=magenta), then thinning.
+        with vessel outlines (central=cyan, portal=magenta), then thinning. Adds refinement:
+        distance-based filling and histogram cutoffs guided by vessels.
         """
         # 1) Superpixel generation
         image_stack = pad_image(image_stack, pad)
@@ -386,7 +374,7 @@ class LobuleSegmentor(BaseOperator):
         background_pixels: Dict[int, np.ndarray] = {}
         foreground_pixels: Dict[int, np.ndarray] = {}
 
-        console.print("Cluster superpixels into foreground and background pixels", style="info")
+        console.print("Complete. Clustering superpixels into foreground and background pixels...", style="info")
         for label, pixels in super_pixels.items():
             channel_dark_fraction = (pixels <= 0).sum(axis=0) / pixels.shape[0]
             if (channel_dark_fraction > 0.5).any():
@@ -434,7 +422,7 @@ class LobuleSegmentor(BaseOperator):
             plt.close(fig)
 
         # 3) Weighted KMeans over superpixel mean features
-        console.print(f"Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values",
+        console.print(f"Complete. Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values...",
                       style="info")
 
         X = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
@@ -487,6 +475,12 @@ class LobuleSegmentor(BaseOperator):
         # Vectorized lookup of assigned_by_sp over the SLIC label image
         get_lab = np.vectorize(lambda sp: assigned_by_sp.get(int(sp), -1))
         cluster_map = get_lab(labels).astype(np.int32)  # shape (H, W), values in {-1, 0..n_clusters-1}
+
+        if report_path is not None:
+            template_init = render_cluster_gray(cluster_map, sorted_label_idx, self.n_clusters)
+            cv2.imwrite(str(report_path / "foreground_clustered_initial.png"), template_init)
+
+        console.print("Complete. Now detecting vessels in detected zonation...", style="info")
 
         # Vessel detection and superpixel reassignment
         vessel_classes: List[int] = []
@@ -576,7 +570,7 @@ class LobuleSegmentor(BaseOperator):
                 vessel_classes.append(vessel_cls_value)
                 vessel_contours.append(cnt)
 
-        # PP holes → portal fields; PV holes → central veins
+        # PP holes -> portal fields; PV holes -> central veins
         mask_pp = (cluster_map == idx_pp).astype(np.uint8) * 255
         _reassign_hole_contours(idx_pp, mask_pp, vessel_cls_value=1)
 
@@ -586,21 +580,62 @@ class LobuleSegmentor(BaseOperator):
         # Rebuild final per-pixel cluster map after reassignment
         cluster_map_final = get_lab(labels).astype(np.int32)
 
-        # Helper for consistent grayscale per cluster id using semantic order
-        def _gray_for_cluster(cid: int) -> int:
-            pos = int(np.where(sorted_label_idx == cid)[0][0])
-            if pos == 0:
-                n = 1
-            elif pos == self.n_clusters - 1:
-                n = 3
-            else:
-                n = 2
-            return int(round(n * 255 / 3))
+        console.print("Complete. Now refining zonation...", style="info")
 
-        template = np.zeros(image_stack.shape[:2], dtype=np.uint8)
-        for cid in range(self.n_clusters):
-            template[cluster_map_final == cid] = _gray_for_cluster(cid)
+        # Refinement stage: distance-based filling + histogram cutoffs
+        Hh, Wh = cluster_map_final.shape
+        portal_mask = np.zeros((Hh, Wh), dtype=np.uint8)
+        central_mask = np.zeros((Hh, Wh), dtype=np.uint8)
+        for cnt, cls in zip(vessel_contours, vessel_classes):
+            if cls == 1:   # portal field
+                cv2.drawContours(portal_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            else:          # central vein
+                cv2.drawContours(central_mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
+        # distance to vessels (pixels = float32 distance in px)
+        if np.any(portal_mask):  # cv2.distanceTransform expects 0 as target -> invert
+            dist_pf = cv2.distanceTransform(255 - portal_mask, cv2.DIST_L2, 5)
+        else:
+            dist_pf = np.full((Hh, Wh), 1e6, dtype=np.float32)
+        if np.any(central_mask):
+            dist_cv = cv2.distanceTransform(255 - central_mask, cv2.DIST_L2, 5)
+        else:
+            dist_cv = np.full((Hh, Wh), 1e6, dtype=np.float32)
+
+        # fill background (-1) based on nearest vessel with a margin; mid when close
+        bg_mask = (cluster_map_final < 0)
+        if np.any(bg_mask):
+            delta = dist_cv - dist_pf  # negative -> closer to central
+            mid_band = np.abs(delta) <= (self.dist_midband_rel * np.minimum(dist_cv, dist_pf) + self.dist_margin_px)
+            assign_pv = (delta < -self.dist_margin_px) & (~mid_band)
+            assign_pp = (delta > self.dist_margin_px) & (~mid_band)
+
+            mid_choice = idx_mid[0] if len(idx_mid) else idx_pp
+            cluster_map_final[bg_mask & mid_band] = mid_choice
+            cluster_map_final[bg_mask & assign_pp] = idx_pp
+            cluster_map_final[bg_mask & assign_pv] = idx_pv
+
+        # histogram cutoffs to trim weak PP/PV at borders (demote to MID)
+
+        # PP demotion
+        if self.channels_pp is not None and len(idx_mid):
+            pp_zone = (cluster_map_final == idx_pp)
+            if np.any(pp_zone):
+                pp_vals = np.mean(np.stack([image_stack[..., c] for c in self.channels_pp], axis=2), axis=2)
+                thr_pp = percentile(pp_vals[pp_zone], self.refine_pp_percentile)
+                demote_pp = pp_zone & (pp_vals < thr_pp)
+                cluster_map_final[demote_pp] = idx_mid[0]
+
+        # PV demotion
+        if self.channels_pv is not None and len(idx_mid):
+            pv_zone = (cluster_map_final == idx_pv)
+            if np.any(pv_zone):
+                pv_vals = np.mean(np.stack([image_stack[..., c] for c in self.channels_pv], axis=2), axis=2)
+                thr_pv = percentile(pv_vals[pv_zone], self.refine_pv_percentile)
+                demote_pv = pv_zone & (pv_vals < thr_pv)
+                cluster_map_final[demote_pv] = idx_mid[0]
+
+        template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
         if report_path is not None:
             cv2.imwrite(str(report_path / "foreground_clustered_final.png"), template)
 
@@ -649,7 +684,6 @@ class LobuleSegmentor(BaseOperator):
             cv2.imwrite(str(report_path / "thinned.png"), thinned)
 
         return thinned, (vessel_classes, vessel_contours)
-
 
 
     def apply(self) -> Metadata:
@@ -793,7 +827,7 @@ if __name__ == "__main__":
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
                                 channels_pp=1,
                                 channels_pv=2,
-                                base_level=2,
+                                base_level=1,
                                 region_size=25)
 
     metadata_segmentation = Segmentor.apply()

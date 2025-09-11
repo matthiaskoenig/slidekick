@@ -5,6 +5,7 @@ from skimage.morphology import closing, disk
 from skimage.color import label2rgb
 from typing import Tuple, Dict
 from pathlib import Path
+from PIL import Image
 
 
 def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5, report_path: Path = None):
@@ -122,6 +123,82 @@ def build_mask_pyramid_from_processed(
             ).astype(np.int32)
     return out
 
+
 def pad_image(image_stack: np.ndarray, pad: int) -> np.ndarray:
     pad_width = ((pad, pad), (pad, pad), (0, 0))
     return np.pad(image_stack, pad_width, mode="constant", constant_values=0)
+
+
+def downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
+    """
+    Downsample image so max(height, width) == max_side, preserving aspect ratio.
+    Uses Pillow LANCZOS for high-quality downscale.
+    No-op if the image is already smaller than max_side.
+    """
+
+    # Ensure we operate on HxW or HxWxC ndarray
+    if not isinstance(img, np.ndarray) or img.ndim not in (2, 3):
+        raise ValueError("Preview expects an ndarray image of shape HxW or HxWxC.")
+
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return img  # already small enough
+
+    scale = max_side / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    # Convert to PIL, resize, back to numpy
+    # Normalize dtype to uint8 for display if needed
+    arr = img
+    if arr.dtype != np.uint8:
+        # clip to [0,255] then cast for stable visualization
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    pil = Image.fromarray(arr)
+    pil = pil.resize((new_w, new_h), resample=Image.LANCZOS)
+    out = np.asarray(pil)
+
+    return out
+
+def percentile(values: np.ndarray, p: float) -> float:
+    v = values.astype(np.float32).ravel()
+    v = v[~np.isnan(v)]
+    if v.size == 0:
+        return 0.0
+    return float(np.percentile(v, max(0.0, min(100.0, p * 100.0))))
+
+
+def gray_for_cluster(cid: int, sorted_label_idx: np.ndarray, n_clusters: int) -> int:
+    """
+    Map a cluster id to a grayscale value based on semantic order:
+      position 0 (PP) -> 85, middle (MID) -> 170, last (PV) -> 255.
+    Background stays 0 outside this function (caller decides).
+    """
+    try:
+        pos = int(np.where(sorted_label_idx == cid)[0][0])
+    except Exception:
+        # Fallback: mid tone if cid is not in sorted_label_idx
+        pos = 1 if n_clusters > 2 else 0
+    if pos == 0:
+        n = 1
+    elif pos == (n_clusters - 1):
+        n = 3
+    else:
+        n = 2
+    return int(round(n * 255 / 3))
+
+
+def render_cluster_gray(cluster_map: np.ndarray,
+                        sorted_label_idx: np.ndarray,
+                        n_clusters: int) -> np.ndarray:
+    """
+    Render a per-pixel cluster map to a grayscale template using gray_for_cluster.
+    Leaves any values <0 (e.g., background/unassigned) at 0.
+    """
+    h, w = cluster_map.shape[:2]
+    out = np.zeros((h, w), dtype=np.uint8)
+    for cid in range(n_clusters):
+        out[cluster_map == cid] = gray_for_cluster(cid, sorted_label_idx, n_clusters)
+    return out
