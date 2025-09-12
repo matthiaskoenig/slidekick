@@ -383,6 +383,7 @@ class LobuleSegmentor(BaseOperator):
                 foreground_pixels[label] = pixels
 
         fg_keys = list(foreground_pixels.keys())
+        fg_pix_mask = np.isin(labels, np.asarray(fg_keys, dtype=np.int32))
         foreground_pixels_means = {
             lab: np.mean(arr, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()
         }
@@ -478,6 +479,7 @@ class LobuleSegmentor(BaseOperator):
 
         if report_path is not None:
             template_init = render_cluster_gray(cluster_map, sorted_label_idx, self.n_clusters)
+            template_init[~fg_pix_mask] = 0
             cv2.imwrite(str(report_path / "foreground_clustered_initial.png"), template_init)
 
         console.print("Complete. Now detecting vessels in detected zonation...", style="info")
@@ -603,7 +605,7 @@ class LobuleSegmentor(BaseOperator):
             dist_cv = np.full((Hh, Wh), 1e6, dtype=np.float32)
 
         # fill background (-1) based on nearest vessel with a margin; mid when close
-        bg_mask = (cluster_map_final < 0)
+        bg_mask = (cluster_map_final < 0) & fg_pix_mask
         if np.any(bg_mask):
             delta = dist_cv - dist_pf  # negative -> closer to central
             mid_band = np.abs(delta) <= (self.dist_midband_rel * np.minimum(dist_cv, dist_pf) + self.dist_margin_px)
@@ -636,6 +638,7 @@ class LobuleSegmentor(BaseOperator):
                 cluster_map_final[demote_pv] = idx_mid[0]
 
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
+        template[~fg_pix_mask] = 0
         if report_path is not None:
             cv2.imwrite(str(report_path / "foreground_clustered_final.png"), template)
 
@@ -644,15 +647,21 @@ class LobuleSegmentor(BaseOperator):
             base_vis = image_stack.mean(axis=2).astype(np.uint8)
             base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
 
-            color_pp = (180, 40, 180)  # BGR
-            color_mid = (60, 160, 60)
-            color_pv = (255, 100, 0)
+            COLOR_PP = (255, 0, 255)
+            COLOR_MID = (60, 160, 60)
+            COLOR_PV = (0, 165, 255)
 
             zonation_rgb = np.zeros_like(base_rgb, dtype=np.uint8)
-            zonation_rgb[cluster_map_final == idx_pp] = color_pp
+            mask_pp = (cluster_map_final == idx_pp) & fg_pix_mask
+            mask_pv = (cluster_map_final == idx_pv) & fg_pix_mask
+            mask_mid = np.zeros_like(mask_pp, dtype=bool)
             for mid_idx in idx_mid:
-                zonation_rgb[cluster_map_final == mid_idx] = color_mid
-            zonation_rgb[cluster_map_final == idx_pv] = color_pv
+                mask_mid |= (cluster_map_final == mid_idx)
+            mask_mid &= fg_pix_mask
+
+            zonation_rgb[mask_pp] = COLOR_PP
+            zonation_rgb[mask_mid] = COLOR_MID
+            zonation_rgb[mask_pv] = COLOR_PV
 
             overlay = cv2.addWeighted(base_rgb, 0.6, zonation_rgb, 0.4, 0.0)
 
@@ -663,8 +672,6 @@ class LobuleSegmentor(BaseOperator):
 
             cv2.imwrite(str(report_path / "zonation_overlay.png"), overlay)
             cv2.imwrite(str(report_path / "zonation_rgb.png"), zonation_rgb)
-
-        # TODO: Resharpen zones around vessel
 
         # TODO: Thinning
 
