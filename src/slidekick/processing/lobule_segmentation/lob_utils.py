@@ -3,7 +3,7 @@ import cv2
 from skimage.filters import threshold_multiotsu
 from skimage.morphology import closing, disk
 from skimage.color import label2rgb
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List, Optional
 from pathlib import Path
 from PIL import Image
 
@@ -202,3 +202,36 @@ def render_cluster_gray(cluster_map: np.ndarray,
     for cid in range(n_clusters):
         out[cluster_map == cid] = gray_for_cluster(cid, sorted_label_idx, n_clusters)
     return out
+
+
+def nonlinear_channel_weighting(
+    X: np.ndarray,
+    channels_pp: Optional[List[int]],
+    channels_pv: Optional[List[int]],
+    pp_gamma: float = 0.70,
+    pv_gamma: float = 0.85,
+    low_pct: float = 5.0,
+    high_pct: float = 95.0,
+) -> np.ndarray:
+    """
+    Percentile-normalize then gamma-lift selected columns of X.
+    channels_pp get pp_gamma, channels_pv get pv_gamma. Returns a copy.
+    """
+    Xo = X.astype(np.float32, copy=True)
+    eps = 1e-6
+
+    def _lift(cols: List[int], gamma: float):
+        if not cols:
+            return
+        for c in cols:
+            v = Xo[:, c]
+            lo = np.percentile(v, low_pct)
+            hi = np.percentile(v, high_pct)
+            if (hi - lo) <= eps:
+                continue
+            vn = np.clip((v - lo) / (hi - lo + eps), 0.0, 1.0)
+            Xo[:, c] = (vn ** float(gamma)) * (hi - lo) + lo
+
+    _lift(list(channels_pp) if channels_pp is not None else [], pp_gamma)
+    _lift(list(channels_pv) if channels_pv is not None else [], pv_gamma)
+    return Xo

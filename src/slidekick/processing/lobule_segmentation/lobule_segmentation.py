@@ -23,7 +23,7 @@ from slidekick.processing.lobule_segmentation.get_segments import segment_thinne
 from slidekick.processing.lobule_segmentation.process_segments import process_segments_to_mask
 from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
-    downsample_to_max_side, percentile, gray_for_cluster, render_cluster_gray
+    downsample_to_max_side, percentile, gray_for_cluster, render_cluster_gray, nonlinear_channel_weighting
 )
 
 
@@ -45,9 +45,16 @@ class LobuleSegmentor(BaseOperator):
                  multi_otsu: bool = True,
                  ksize: int = 7,
                  n_clusters: int = 3,
+                 target_superpixels: int = None,
+                 adaptive_histonorm: bool = True,
+                 # nonlinear KMeans
+                 nonlinear_kmeans: bool = True,
                  alpha_pv: float = 2.0,
                  alpha_pp: float = 2.0,
-                 target_superpixels: int = None,
+                 pp_gamma: float = 0.70,
+                 pv_gamma: float = 0.85,
+                 nl_low_pct: float = 5.0,
+                 nl_high_pct: float = 95.0,
                  # vessel gating (always on)
                  min_vessel_area_pp: int = 1500,
                  min_vessel_area_pv: int = 1000,
@@ -76,9 +83,15 @@ class LobuleSegmentor(BaseOperator):
         @param region_size: average size of superpixels for SLIC in pixels
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
-        @param alpha_pv: weighting factors for superpixel clustering for pv channels
-        @param alpha_pp: weighting factors for superpixel clustering for pp channels
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
+        @param adaptive_histonorm: use adaptive histogram norm in filtering
+        @param nonlinear_kmeans: use a non-linear feature weighting in K_means
+        @param alpha_pv: weighting factors for superpixel clustering for pv channels in linear KMeans
+        @param alpha_pp: weighting factors for superpixel clustering for pp channels in linear KMeans
+        @param pp_gamma: Gamma exponent applied to PP channels after robust percentile normalization. smaller = stronger boost
+        @param pv_gamma: Gamma exponent applied to PV channels after robust percentile normalization. smaller = stronger boost
+        @param nl_low_pct: Lower percentile used as the per-channel floor before gamma.
+        @param nl_high_pct: Upper percentile used as the per-channel ceiling before gamma.
         @param min_vessel_area_pp: min area (px) for PP-enclosed vessel candidates
         @param min_vessel_area_pv: min area (px) for PV-enclosed vessel candidates
         @param vessel_annulus_px: thickness (px) of ring-consistency check
@@ -104,6 +117,14 @@ class LobuleSegmentor(BaseOperator):
         self.alpha_pv = alpha_pv
         self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
+        self.adaptive_histonorm = adaptive_histonorm
+
+        # Kmeans
+        self.nonlinear_kmeans = nonlinear_kmeans
+        self.pp_gamma = pp_gamma
+        self.pv_gamma = pv_gamma
+        self.nl_low_pct = nl_low_pct
+        self.nl_high_pct = nl_high_pct
 
         # vessel gating
         self.min_vessel_area_pp = min_vessel_area_pp
@@ -193,8 +214,9 @@ class LobuleSegmentor(BaseOperator):
             ch = cv2.medianBlur(ch, ksize=self.ksize)
 
             # adaptive histogram norm (2D only)
-            ch = clahe.apply(ch)
-            ch[ch < 10] = 0  # suppress background altered by CLAHE
+            if self.adaptive_histonorm:
+                ch = clahe.apply(ch)
+                ch[ch < 10] = 0  # suppress background altered by CLAHE
 
             # blur
             ch = cv2.medianBlur(ch, ksize=3)
@@ -368,55 +390,61 @@ class LobuleSegmentor(BaseOperator):
             cv2.imwrite(str(report_path / "superpixels.png"), superpixel_mask)
 
         merged = image_stack.astype(float)
-        super_pixels = {label: merged[labels == label] for label in range(num_labels)}
 
-        # 2) Foreground/background split based on dark fraction across channels
-        background_pixels: Dict[int, np.ndarray] = {}
-        foreground_pixels: Dict[int, np.ndarray] = {}
+        # Vectorized per-label stats (fast)
+        H, W, C = image_stack.shape
+        lab_flat = labels.ravel()
+        img_flat = merged.reshape(-1, C).astype(np.float32)
 
-        console.print("Complete. Clustering superpixels into foreground and background pixels...", style="info")
-        for label, pixels in super_pixels.items():
-            channel_dark_fraction = (pixels <= 0).sum(axis=0) / pixels.shape[0]
-            if (channel_dark_fraction > 0.5).any():
-                background_pixels[label] = pixels
-            else:
-                foreground_pixels[label] = pixels
+        counts = np.bincount(lab_flat, minlength=num_labels).astype(np.int32)
+        nz = counts > 0
 
-        fg_keys = list(foreground_pixels.keys())
-        fg_pix_mask = np.isin(labels, np.asarray(fg_keys, dtype=np.int32))
-        foreground_pixels_means = {
-            lab: np.mean(arr, axis=0).astype(np.float32) for lab, arr in foreground_pixels.items()
-        }
+        dark_flat = (img_flat <= 0).astype(np.uint8)
+        dark_counts = np.vstack([
+            np.bincount(lab_flat, weights=dark_flat[:, c], minlength=num_labels)
+            for c in range(C)
+        ]).T
+        dark_frac = np.divide(dark_counts, counts[:, None], where=nz[:, None])
+
+        fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
+        fg_labels = np.nonzero(fg_label_mask)[0]
+        bg_labels = np.nonzero(~fg_label_mask)[0]
+
+        fg_pix_mask = np.isin(labels, fg_labels)
+
+        sums = np.vstack([
+            np.bincount(lab_flat, weights=img_flat[:, c], minlength=num_labels)
+            for c in range(C)
+        ]).T
+        means = np.zeros_like(sums, dtype=np.float32)
+        means[nz] = sums[nz] / counts[nz, None]
+
+        X_means = means[fg_labels]
+        fg_keys = fg_labels.tolist()
 
         if report_path is not None:
-            out_template = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1], 3), dtype=np.uint8)
-            for i in range(num_labels):
-                if i in background_pixels:
-                    out_template[labels == i] = np.array([0, 0, 0], dtype=np.uint8)
-                else:
-                    out_template[labels == i] = np.array([255, 255, 255], dtype=np.uint8)
+            out_template = np.zeros((H, W, 3), dtype=np.uint8)
+            out_template[fg_pix_mask] = (255, 255, 255)
             cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out_template)
 
-            for k in range(merged.shape[2]):
-                out_gray = np.zeros(shape=(image_stack.shape[0], image_stack.shape[1]), dtype=np.float32)
-                for i, mean_vec in foreground_pixels_means.items():
-                    out_gray[labels == i] = mean_vec[k]
+            for k in range(C):
+                out_gray = means[:, k][labels]
+                out_gray[~fg_pix_mask] = 0
                 m = float(out_gray.max())
                 if m > 0:
                     out_gray = (out_gray / m) * 255.0
                 out_u8 = out_gray.astype(np.uint8)
-                out_rgb = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2RGB)
-                mask_on = (np.all(out_rgb != [0, 0, 0], axis=2)) & (superpixel_mask == 255)
+                out_rgb = cv2.cvtColor(out_u8, cv2.COLOR_GRAY2BGR)
+                mask_on = (out_u8 > 0) & (superpixel_mask == 255)
                 out_rgb[mask_on] = [255, 255, 0]
                 cv2.imwrite(str(report_path / f"superpixel_mean_{k}.png"), out_rgb)
 
-            X_means = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
-            C = X_means.shape[1]
-            fig, axes = plt.subplots(1, C, figsize=(2.8 * C, 3.0), squeeze=False, constrained_layout=True)
-            for c in range(C):
+            C_ = X_means.shape[1]
+            fig, axes = plt.subplots(1, C_, figsize=(2.8 * C_, 3.0), squeeze=False, constrained_layout=True)
+            for c in range(C_):
                 axes[0, c].hist(X_means[:, c], bins=50)
                 axes[0, c].set_title(f"Ch {c} · mean")
-                axes[0, c].set_xlabel("value")
+                axes[0, c].set_xlabel("value");
                 axes[0, c].set_ylabel("count")
             fig.suptitle("Superpixel mean intensity histograms", fontsize=11)
             fig.savefig(str(report_path / "hist_superpixel_means.png"), dpi=150)
@@ -426,20 +454,46 @@ class LobuleSegmentor(BaseOperator):
         console.print(f"Complete. Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values...",
                       style="info")
 
-        X = np.stack([foreground_pixels_means[k] for k in fg_keys], axis=0)
-        C = X.shape[1]
+        if self.nonlinear_kmeans:
+            X = X_means.copy()
+            C = X.shape[1]
 
-        # TODO: Evaluate non-linear weighting
+            # non-linear lifting
+            X = nonlinear_channel_weighting(
+                X,
+                self.channels_pp,
+                self.channels_pv,
+                self.pp_gamma,
+                self.pv_gamma,
+                self.nl_low_pct,
+                self.nl_high_pct,
+            )
 
-        w_feat = np.ones(C, dtype=np.float32)
-        if self.channels_pp is not None:
-            w_feat[self.channels_pp] *= self.alpha_pp
-        if self.channels_pv is not None:
-            w_feat[self.channels_pv] *= self.alpha_pv
-        Xw = X * w_feat
+            # linear weights
+            w_feat = np.ones(C, dtype=np.float32)
+            if self.channels_pp is not None:
+                w_feat[self.channels_pp] *= self.alpha_pp
+            if self.channels_pv is not None:
+                w_feat[self.channels_pv] *= self.alpha_pv
+            Xw = X * w_feat
 
-        kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
-        kmeans.fit(Xw)
+            kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
+            kmeans.fit(Xw)
+
+        else:
+
+            X = X_means
+            C = X.shape[1]
+
+            w_feat = np.ones(C, dtype=np.float32)
+            if self.channels_pp is not None:
+                w_feat[self.channels_pp] *= self.alpha_pp
+            if self.channels_pv is not None:
+                w_feat[self.channels_pv] *= self.alpha_pv
+            Xw = X * w_feat
+
+            kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
+            kmeans.fit(Xw)
 
         centers = kmeans.cluster_centers_ / w_feat
         labels_k = kmeans.labels_
@@ -487,6 +541,8 @@ class LobuleSegmentor(BaseOperator):
         # Vessel detection and superpixel reassignment
         vessel_classes: List[int] = []
         vessel_contours: List[np.ndarray] = []
+
+        # TODO: Fix vessel detection
 
         def _reassign_hole_contours(zone_cluster_idx: int,
                                     mask_zone: np.ndarray,
@@ -582,6 +638,8 @@ class LobuleSegmentor(BaseOperator):
         # Rebuild final per-pixel cluster map after reassignment
         cluster_map_final = get_lab(labels).astype(np.int32)
 
+        ### Refinement droppedfor debugging
+        """
         console.print("Complete. Now refining zonation...", style="info")
 
         # Refinement stage: distance-based filling + histogram cutoffs
@@ -636,7 +694,7 @@ class LobuleSegmentor(BaseOperator):
                 thr_pv = percentile(pv_vals[pv_zone], self.refine_pv_percentile)
                 demote_pv = pv_zone & (pv_vals < thr_pv)
                 cluster_map_final[demote_pv] = idx_mid[0]
-
+        """
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
         template[~fg_pix_mask] = 0
         if report_path is not None:
@@ -835,6 +893,7 @@ if __name__ == "__main__":
                                 channels_pp=1,
                                 channels_pv=2,
                                 base_level=1,
-                                region_size=25)
+                                region_size=25,
+                                adaptive_histonorm=True)
 
     metadata_segmentation = Segmentor.apply()
