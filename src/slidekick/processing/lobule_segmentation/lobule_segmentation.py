@@ -50,26 +50,26 @@ class LobuleSegmentor(BaseOperator):
                  # nonlinear KMeans
                  nonlinear_kmeans: bool = True,
                  alpha_pv: float = 2.0,
-                 alpha_pp: float = 2.0,
-                 pp_gamma: float = 0.70,
-                 pv_gamma: float = 0.85,
+                 alpha_pp: float = 3.0,
+                 pp_gamma: float = 0.65,
+                 pv_gamma: float = 0.75,
                  nl_low_pct: float = 5.0,
-                 nl_high_pct: float = 95.0,
+                 nl_high_pct: float = 90.0,
                  # vessel gating (always on)
-                 min_vessel_area_pp: int = 1500,
-                 min_vessel_area_pv: int = 1000,
-                 vessel_annulus_px: int = 3,
-                 vessel_zone_ratio_thr_pp: float = 0.75,
-                 vessel_zone_ratio_thr_pv: float = 0.60,
-                 vessel_circularity_min: float = 0.15,
-                 vessel_contrast_min_pp: float = 10.0,
-                 vessel_contrast_min_pv: float = 6.0,
-                 vessel_bg_fraction_min: float = 0.20,
+                 min_vessel_area_pp: int = 200,
+                 min_vessel_area_pv: int = 200,
+                 vessel_annulus_px: int = 5,
+                 vessel_zone_ratio_thr_pp: float = 0.45,
+                 vessel_zone_ratio_thr_pv: float = 0.55,
+                 vessel_circularity_min: float = 0.12,
+                 vessel_contrast_min_pp: float = 5.0,
+                 vessel_contrast_min_pv: float = 5.0,
+                 vessel_bg_fraction_min: float = 0.10,
                  # refinement knobs (always on)
-                 dist_midband_rel: float = 0.15,
-                 dist_margin_px: int = 2,
-                 refine_pp_percentile: float = 0.30,
-                 refine_pv_percentile: float = 0.30):
+                 dist_midband_rel: float = 0.30,
+                 dist_margin_px: int = 3,
+                 refine_pp_percentile: float = 0.20,
+                 refine_pv_percentile: float = 0.20):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -450,7 +450,7 @@ class LobuleSegmentor(BaseOperator):
             fig.savefig(str(report_path / "hist_superpixel_means.png"), dpi=150)
             plt.close(fig)
 
-        # 3) Weighted KMeans over superpixel mean features
+        # 2) Weighted KMeans over superpixel mean features
         console.print(f"Complete. Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values...",
                       style="info")
 
@@ -498,7 +498,7 @@ class LobuleSegmentor(BaseOperator):
         centers = kmeans.cluster_centers_ / w_feat
         labels_k = kmeans.labels_
 
-        # Assign semantic roles PP/MID/PV
+        # 3) Assign semantic roles PP/MID/PV
         channels_pp = self.channels_pp
         channels_pv = self.channels_pv
         if (channels_pp is not None) and (channels_pv is not None):
@@ -538,102 +538,162 @@ class LobuleSegmentor(BaseOperator):
 
         console.print("Complete. Now detecting vessels in detected zonation...", style="info")
 
-        # Vessel detection and superpixel reassignment
+        # 4) Vessel detection and superpixel reassignment
         vessel_classes: List[int] = []
         vessel_contours: List[np.ndarray] = []
 
-        # TODO: Fix vessel detection
+        zone_major_thr = getattr(self, "vessel_zone_majority_thr", 0.60)  # majority of ring pixels
+        k = max(1, int(self.vessel_annulus_px))
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
 
-        def _reassign_hole_contours(zone_cluster_idx: int,
-                                    mask_zone: np.ndarray,
-                                    vessel_cls_value: int):
+        tissue_bool = (image_stack.mean(axis=2) > 0)
+        bg_bool = ~tissue_bool
+
+        # TODO: Group vessels if close
+
+        # TODO: Detect vessels wit shared pv+mid or pp+mid zone.
+
+        def _lap_mean(img_u8: np.ndarray, mask_bool: np.ndarray) -> float:
+            if not np.any(mask_bool):
+                return 0.0
+            lap = cv2.Laplacian(img_u8, ddepth=cv2.CV_32F, ksize=3)
+            return float(lap[mask_bool].mean())
+
+        def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
+            Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
             """
-            zone_cluster_idx: idx_pp or idx_pv (surrounding zone)
-            mask_zone: binary mask (255=zone pixels)
-            vessel_cls_value: 1 for portal field (PP), 0 for central vein (PV)
+            Returns list of (hole_bool, ring_bool, contour, area, circularity)
+            from BOTH closed holes and edge-truncated arcs synthesized via erosion.
             """
-            contours, hierarchy = cv2.findContours(mask_zone, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            out = []
+            contours, hierarchy = cv2.findContours(mask_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
             if contours is None or hierarchy is None:
-                return
-
+                return out
             Hh = hierarchy[0]
-            H, W = mask_zone.shape
 
-            # thresholds per zone (always on; from __init__)
-            if zone_cluster_idx == idx_pp:
-                min_area = int(self.min_vessel_area_pp)
-                zone_ratio_thr = float(self.vessel_zone_ratio_thr_pp)
-                min_contrast = float(self.vessel_contrast_min_pp)
-                ring_channels = (self.channels_pp or [])
-            else:
-                min_area = int(self.min_vessel_area_pv)
-                zone_ratio_thr = float(self.vessel_zone_ratio_thr_pv)
-                min_contrast = float(self.vessel_contrast_min_pv)
-                ring_channels = (self.channels_pv or [])
-
-            k = max(1, int(self.vessel_annulus_px))
-            se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
-
-            def _mean_over_channels(mask_bool: np.ndarray, channels: List[int]) -> float:
-                if not channels or not np.any(mask_bool):
-                    return 0.0
-                vals = [image_stack[..., c][mask_bool].mean() for c in channels]
-                return float(np.mean(vals)) if vals else 0.0
+            # permissive minima for candidate gen (final class later)
+            min_area = min(int(self.min_vessel_area_pp), int(self.min_vessel_area_pv))
+            circ_min = float(self.vessel_circularity_min) * 0.9
 
             for i, cnt in enumerate(contours):
-                # only child contours (holes)
-                if Hh[i][3] == -1:
-                    continue
-
-                area = cv2.contourArea(cnt)
-                if area < max(1, min_area):
-                    continue
-
-                # shape sanity (permissive to allow elongated vessels)
-                peri = max(cv2.arcLength(cnt, True), 1e-6)
-                circularity = float(4.0 * np.pi * area / (peri * peri))
-                if circularity < float(self.vessel_circularity_min):
-                    continue
-
-                # hole mask
-                hole_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
-                hole_bool = hole_mask > 0
-
-                # ring (annulus) around the hole
-                dil = cv2.dilate(hole_mask, se)
-                ero = cv2.erode(hole_mask, se)
-                ring = cv2.subtract(dil, ero)
-                ring_bool = ring > 0
-                if not np.any(ring_bool):
-                    continue
-
-                # ring must be mostly the same zone
-                zone_ratio = float(np.mean((cluster_map == zone_cluster_idx)[ring_bool]))
-                if zone_ratio < zone_ratio_thr:
-                    continue
-
-                # intensity contrast in defining channels: ring brighter than hole
-                if ring_channels:
-                    ring_mean = _mean_over_channels(ring_bool, ring_channels)
-                    hole_mean = _mean_over_channels(hole_bool, ring_channels)
-                    if (ring_mean - hole_mean) < min_contrast:
+                # A) CLOSED HOLES (child contours)
+                if Hh[i][3] != -1:
+                    area = cv2.contourArea(cnt)
+                    if area < max(1, min_area):
+                        continue
+                    peri = max(cv2.arcLength(cnt, True), 1e-6)
+                    circ = float(4.0 * np.pi * area / (peri * peri))
+                    if circ < circ_min:
                         continue
 
-                # accept: reassign all superpixels whose pixels fall inside the hole
-                sp_inside = np.unique(labels[hole_bool])
-                for sp in sp_inside:
-                    assigned_by_sp[int(sp)] = zone_cluster_idx
+                    hole_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                    hole_bool = hole_mask > 0
 
-                vessel_classes.append(vessel_cls_value)
-                vessel_contours.append(cnt)
+                    dil = cv2.dilate(hole_mask, se)
+                    ero = cv2.erode(hole_mask, se)
+                    ring = cv2.subtract(dil, ero)
+                    ring_bool = ring > 0
+                    if not np.any(ring_bool):
+                        continue
 
-        # PP holes -> portal fields; PV holes -> central veins
-        mask_pp = (cluster_map == idx_pp).astype(np.uint8) * 255
-        _reassign_hole_contours(idx_pp, mask_pp, vessel_cls_value=1)
+                    out.append((hole_bool, ring_bool, cnt, area, circ))
+                    continue
 
-        mask_pv = (cluster_map == idx_pv).astype(np.uint8) * 255
-        _reassign_hole_contours(idx_pv, mask_pv, vessel_cls_value=0)
+                # B) EDGE / TRUNCATED BLOBS (external contours touching border)
+                x, y, w2, h2 = cv2.boundingRect(cnt)
+                touches_border = (x == 0) or (y == 0) or (x + w2 == W) or (y + h2 == H)
+                if not touches_border:
+                    continue
+
+                area_ext = cv2.contourArea(cnt)
+                if area_ext < max(1, min_area):
+                    continue
+                peri_ext = max(cv2.arcLength(cnt, True), 1e-6)
+                circ_ext = float(4.0 * np.pi * area_ext / (peri_ext * peri_ext))
+                if circ_ext < circ_min:
+                    continue
+
+                ext_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(ext_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+
+                # ensure adjacency to background → “open” ring
+                border_contact = cv2.dilate((bg_bool.astype(np.uint8) * 255), se)
+                if float(np.mean((border_contact > 0)[ext_mask > 0])) < 0.10:
+                    continue
+
+                inner = cv2.erode(ext_mask, se)
+                synth_hole = cv2.erode(inner, se)
+                ring_e = cv2.subtract(inner, synth_hole)
+
+                hole_bool = synth_hole > 0
+                ring_bool = ring_e > 0
+                if not np.any(hole_bool) or not np.any(ring_bool):
+                    continue
+
+                out.append((hole_bool, ring_bool, cnt, area_ext, circ_ext))
+
+            return out
+
+        # unified candidate pool from all labeled tissue (avoid PP↔PV bias)
+        mask_all = np.zeros((H, W), dtype=np.uint8)
+        mask_all[(cluster_map >= 0)] = 255
+        candidates = _collect_candidates_from_mask(mask_all)
+
+        # classify by ring-majority; remove nested; reassign SPs to the decided zone
+        candidates.sort(key=lambda t: t[3], reverse=True)  # largest first
+
+        kept_contours: List[np.ndarray] = []
+        kept_classes: List[int] = []
+
+        for hole_bool, ring_bool, cnt, area_c, circ_c in candidates:
+            # Majority vote on the ring
+            pp_ratio = float(np.mean((cluster_map == idx_pp)[ring_bool]))
+            pv_ratio = float(np.mean((cluster_map == idx_pv)[ring_bool]))
+            maj_ratio = max(pp_ratio, pv_ratio)
+
+            if maj_ratio < zone_major_thr:
+                # gradient rescue if ambiguous
+                cls_channels = self.channels_pp if pp_ratio >= pv_ratio else self.channels_pv
+                if cls_channels:
+                    ch = cls_channels[0]
+                    grad_ring = _lap_mean(image_stack[..., ch], ring_bool)
+                    grad_hole = _lap_mean(image_stack[..., ch], hole_bool)
+                    if (grad_ring - grad_hole) < 2.0:
+                        continue
+                else:
+                    continue
+
+            cls = 1 if pp_ratio >= pv_ratio else 0
+            zone_idx = idx_pp if cls == 1 else idx_pv
+
+            # No nesting: reject if centroid lies inside an already kept contour
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"]);
+                cy = int(M["m01"] / M["m00"])
+            else:
+                x, y, w2, h2 = cv2.boundingRect(cnt)
+                cx, cy = x + w2 // 2, y + h2 // 2
+
+            nested = False
+            for prev in kept_contours:
+                if cv2.pointPolygonTest(prev, (float(cx), float(cy)), False) >= 0:
+                    nested = True
+                    break
+            if nested:
+                continue
+
+            # Reassign enclosed SPs to the classified zone
+            sp_inside = np.unique(labels[hole_bool])
+            for sp in sp_inside:
+                assigned_by_sp[int(sp)] = zone_idx
+
+            kept_contours.append(cnt)
+            kept_classes.append(cls)
+
+        vessel_classes.extend(kept_classes)
+        vessel_contours.extend(kept_contours)
 
         # Rebuild final per-pixel cluster map after reassignment
         cluster_map_final = get_lab(labels).astype(np.int32)
@@ -892,8 +952,8 @@ if __name__ == "__main__":
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
                                 channels_pp=1,
                                 channels_pv=2,
-                                base_level=1,
-                                region_size=25,
+                                base_level=0,
+                                region_size=15,
                                 adaptive_histonorm=True)
 
     metadata_segmentation = Segmentor.apply()
