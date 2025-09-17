@@ -538,7 +538,6 @@ class LobuleSegmentor(BaseOperator):
         tissue_bool = (image_stack.mean(axis=2) > 0)
         bg_bool = ~tissue_bool
 
-
         def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
             Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
             """
@@ -804,8 +803,6 @@ class LobuleSegmentor(BaseOperator):
         # Zonation + vessel overlay
         if report_path is not None:
 
-
-
             base_vis = image_stack.mean(axis=2).astype(np.uint8)
             base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
 
@@ -835,25 +832,66 @@ class LobuleSegmentor(BaseOperator):
             cv2.imwrite(str(report_path / "zonation_overlay.png"), overlay)
             cv2.imwrite(str(report_path / "zonation_rgb.png"), zonation_rgb)
 
-        # TODO: Thinning
+        # approximate tissue outline from current stack: largest external contour of nonzero region
+        tissue_u8 = (tissue_bool.astype(np.uint8) * 255)
+        cnts, _ = cv2.findContours(tissue_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        tissue_boundary = max(cnts, key=cv2.contourArea) if cnts else np.array(
+            [[[0, 0]], [[W - 1, 0]], [[W - 1, H - 1]], [[0, H - 1]]], dtype=np.int32
+        )
+
+        # FROM HERE: ZIA again
+        # shades of gray, n clusters + 2 for background
+
+        class_0_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0]
+        class_1_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 1]
+
+        cv2.drawContours(template, class_0_contours, -1, 255, thickness=cv2.FILLED)
+        cv2.drawContours(template, class_1_contours, -1, 0, thickness=cv2.FILLED)
+
+        template = 255 - template
+
+        template = cv2.medianBlur(template, 5)
+
+        if report_path is not None:
+            cv2.imwrite(str(report_path / "grayscale.png"), template)
+
+        tissue_mask = np.zeros_like(template, dtype=np.uint8)
+        cv2.drawContours(tissue_mask, [tissue_boundary], -1, 255, thickness=cv2.FILLED)
+        tissue_mask = tissue_mask.astype(bool)
+
+        template[~tissue_mask] = 0
+        cv2.drawContours(template, [tissue_boundary], -1, 255, thickness=1)
+
+        if report_path is not None:
+            out_template = np.zeros(shape=(merged.shape[0], merged.shape[1], 4)).astype(np.uint8)
+            cv2.drawContours(out_template, class_0_contours, -1, (255, 255, 0, 127), thickness=cv2.FILLED)
+            cv2.drawContours(out_template, class_0_contours, -1, (255, 255, 0, 255), thickness=2)
+
+            cv2.drawContours(out_template, class_1_contours, -1, (255, 0, 255, 127), thickness=cv2.FILLED)
+            cv2.drawContours(out_template, class_1_contours, -1, (255, 0, 255, 255), thickness=2)
+
+            cv2.drawContours(out_template, [tissue_boundary], -1, (255, 255, 255, 255), thickness=3)
+
+            cv2.imwrite(str(report_path / f"classified_vessels.png"), out_template)
+            cv2.imwrite(str(report_path / f"final_clustered_map.png"), template)
 
         console.print("Complete. Run thinning algorithm...", style="info")
-
-        # TODO: Draw final map + vessels
-
-        template = cv2.medianBlur(255 - template, 5)
-
-        console.print("Complete. Run thinning algorithm...", style="info")
-
         thinned = cv2.ximgproc.thinning(template.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
 
-        # TODO: Double thinning + vessels
+        # drawing the vessels on the mask and thinn again to prevent pixel accumulations the segmentation can't hanlde
+
+        cv2.drawContours(thinned, class_0_contours, -1, 0, thickness=cv2.FILLED)
+        cv2.drawContours(thinned, class_0_contours, -1, 255, thickness=1)
+
+        cv2.drawContours(thinned, class_1_contours, -1, 0, thickness=cv2.FILLED)
+        cv2.drawContours(thinned, class_1_contours, -1, 255, thickness=1, )
+
+        thinned = cv2.ximgproc.thinning(thinned.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
 
         if report_path is not None:
             cv2.imwrite(str(report_path / "thinned.png"), thinned)
 
         return thinned, (vessel_classes, vessel_contours)
-
 
     def apply(self) -> Metadata:
 
@@ -874,6 +912,9 @@ class LobuleSegmentor(BaseOperator):
 
         # Apply filters
         img_stack = self._filter(img_stack)
+
+        for i in range(img_stack.shape[2]):
+            cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
 
         # Show Preview after loading and filtering
         if self.preview:
