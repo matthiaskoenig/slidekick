@@ -59,12 +59,14 @@ class LobuleSegmentor(BaseOperator):
                  min_vessel_area_pp: int = 200,
                  min_vessel_area_pv: int = 200,
                  vessel_annulus_px: int = 5,
-                 vessel_zone_ratio_thr_pp: float = 0.45,
+                 vessel_zone_ratio_thr_pp: float = 0.35,
                  vessel_zone_ratio_thr_pv: float = 0.55,
                  vessel_circularity_min: float = 0.12,
-                 vessel_contrast_min_pp: float = 5.0,
-                 vessel_contrast_min_pv: float = 5.0,
-                 vessel_bg_fraction_min: float = 0.10,
+                 # vessel grouping
+                 vessel_merge_enable: bool = True,
+                 vessel_merge_dist_px: int = 12,
+                 vessel_merge_intensity_drop_max: float = 12.0,
+                 vessel_merge_profile_steps: int = 21,
                  # refinement knobs (always on)
                  dist_midband_rel: float = 0.30,
                  dist_margin_px: int = 3,
@@ -98,9 +100,10 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_zone_ratio_thr_pp: fraction of ring that must be PP
         @param vessel_zone_ratio_thr_pv: fraction of ring that must be PV
         @param vessel_circularity_min: 4πA/P^2 gate; low keeps elongated vessels
-        @param vessel_contrast_min_pp: PP ring − lumen contrast (uint8) in PP channels
-        @param vessel_contrast_min_pv: PV ring − lumen contrast (uint8) in PV channels
-        @param vessel_bg_fraction_min: share of inside SPs that were background before reassignment
+        @param vessel_merge_enable: merge nearby same-class vessels when intensity is continuous
+        @param vessel_merge_dist_px: max gap (px) between vessels to consider merging
+        @param vessel_merge_intensity_drop_max: max allowed intensity drop along the connector (uint8)
+        @param vessel_merge_profile_steps: samples along connector for the drop check
         @param dist_midband_rel: relative band where |d_cv - d_pf| small → MID assignment
         @param dist_margin_px: absolute pixel margin for PP/PV distance decisions
         @param refine_pp_percentile: demote weakest PP to MID below this PP-channel percentile
@@ -133,9 +136,12 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_zone_ratio_thr_pp = vessel_zone_ratio_thr_pp
         self.vessel_zone_ratio_thr_pv = vessel_zone_ratio_thr_pv
         self.vessel_circularity_min = vessel_circularity_min
-        self.vessel_contrast_min_pp = vessel_contrast_min_pp
-        self.vessel_contrast_min_pv = vessel_contrast_min_pv
-        self.vessel_bg_fraction_min = vessel_bg_fraction_min
+
+        # vessel grouping
+        self.vessel_merge_enable = vessel_merge_enable
+        self.vessel_merge_dist_px = vessel_merge_dist_px
+        self.vessel_merge_intensity_drop_max = vessel_merge_intensity_drop_max
+        self.vessel_merge_profile_steps = vessel_merge_profile_steps
 
         # refinement knobs
         self.dist_midband_rel = dist_midband_rel
@@ -542,22 +548,12 @@ class LobuleSegmentor(BaseOperator):
         vessel_classes: List[int] = []
         vessel_contours: List[np.ndarray] = []
 
-        zone_major_thr = getattr(self, "vessel_zone_majority_thr", 0.60)  # majority of ring pixels
         k = max(1, int(self.vessel_annulus_px))
         se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
 
         tissue_bool = (image_stack.mean(axis=2) > 0)
         bg_bool = ~tissue_bool
 
-        # TODO: Group vessels if close
-
-        # TODO: Detect vessels wit shared pv+mid or pp+mid zone.
-
-        def _lap_mean(img_u8: np.ndarray, mask_bool: np.ndarray) -> float:
-            if not np.any(mask_bool):
-                return 0.0
-            lap = cv2.Laplacian(img_u8, ddepth=cv2.CV_32F, ksize=3)
-            return float(lap[mask_bool].mean())
 
         def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
             Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
@@ -640,34 +636,40 @@ class LobuleSegmentor(BaseOperator):
         mask_all[(cluster_map >= 0)] = 255
         candidates = _collect_candidates_from_mask(mask_all)
 
-        # classify by ring-majority; remove nested; reassign SPs to the decided zone
+        # classify by ring-majority; collect (no reassignment yet); then group & reassign
         candidates.sort(key=lambda t: t[3], reverse=True)  # largest first
 
-        kept_contours: List[np.ndarray] = []
-        kept_classes: List[int] = []
+        # We'll keep full info so we can merge later:
+        kept_items: List[Tuple[np.ndarray, np.ndarray, int, int, np.ndarray]] = []
 
         for hole_bool, ring_bool, cnt, area_c, circ_c in candidates:
-            # Majority vote on the ring
-            pp_ratio = float(np.mean((cluster_map == idx_pp)[ring_bool]))
-            pv_ratio = float(np.mean((cluster_map == idx_pv)[ring_bool]))
-            maj_ratio = max(pp_ratio, pv_ratio)
+            # MID-aware classification (exclude MID & BG from denominator)
+            ring_is_mid = np.isin(cluster_map, idx_mid)
+            ring_mid = ring_bool & ring_is_mid
+            ring_bg = ring_bool & (cluster_map < 0)
+            ring_eligible = ring_bool & ~(ring_mid | ring_bg)
+            eligible_n = int(np.count_nonzero(ring_eligible))
+            if eligible_n == 0:
+                continue
 
-            if maj_ratio < zone_major_thr:
-                # gradient rescue if ambiguous
-                cls_channels = self.channels_pp if pp_ratio >= pv_ratio else self.channels_pv
-                if cls_channels:
-                    ch = cls_channels[0]
-                    grad_ring = _lap_mean(image_stack[..., ch], ring_bool)
-                    grad_hole = _lap_mean(image_stack[..., ch], hole_bool)
-                    if (grad_ring - grad_hole) < 2.0:
-                        continue
-                else:
-                    continue
+            pp_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pp)))
+            pv_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pv)))
+            pp_frac = pp_count / float(eligible_n)
+            pv_frac = pv_count / float(eligible_n)
 
-            cls = 1 if pp_ratio >= pv_ratio else 0
-            zone_idx = idx_pp if cls == 1 else idx_pv
+            pp_pass = pp_frac >= float(self.vessel_zone_ratio_thr_pp)
+            pv_pass = pv_frac >= float(self.vessel_zone_ratio_thr_pv)
+            if not (pp_pass or pv_pass):
+                continue
 
-            # No nesting: reject if centroid lies inside an already kept contour
+            if pp_pass and (not pv_pass or pp_frac >= pv_frac):
+                cls = 1
+                zone_idx = idx_pp
+            else:
+                cls = 0
+                zone_idx = idx_pv
+
+            # No nesting (centroid inside an existing kept contour of ANY class)
             M = cv2.moments(cnt)
             if M["m00"] > 0:
                 cx = int(M["m10"] / M["m00"]);
@@ -677,23 +679,137 @@ class LobuleSegmentor(BaseOperator):
                 cx, cy = x + w2 // 2, y + h2 // 2
 
             nested = False
-            for prev in kept_contours:
-                if cv2.pointPolygonTest(prev, (float(cx), float(cy)), False) >= 0:
+            for (_h, prev_cnt, _c, _z, _r) in kept_items:
+                if cv2.pointPolygonTest(prev_cnt, (float(cx), float(cy)), False) >= 0:
                     nested = True
                     break
             if nested:
                 continue
 
-            # Reassign enclosed SPs to the classified zone
-            sp_inside = np.unique(labels[hole_bool])
+            kept_items.append((hole_bool, cnt, cls, zone_idx, ring_bool))
+
+        # group close vessels with continuous intensity
+        merge_enable = self.vessel_merge_enable
+        merge_dist_px = self.vessel_merge_dist_px
+        merge_drop_max = self.vessel_merge_intensity_drop_max
+        merge_steps = self.vessel_merge_profile_steps
+
+        def _closest_points(c1: np.ndarray, c2: np.ndarray) -> Tuple[Tuple[int, int], Tuple[int, int], float]:
+            # contours are (N,1,2); subsample to keep it fast
+            p1 = c1[:, 0, :]
+            p2 = c2[:, 0, :]
+            s1 = max(1, len(p1) // 128);
+            s2 = max(1, len(p2) // 128)
+            p1s = p1[::s1];
+            p2s = p2[::s2]
+            dif = p1s[:, None, :] - p2s[None, :, :]
+            d2 = np.einsum('ijk,ijk->ij', dif, dif)
+            i, j = np.unravel_index(np.argmin(d2), d2.shape)
+            a = (int(p1s[i, 0]), int(p1s[i, 1]))
+            b = (int(p2s[j, 0]), int(p2s[j, 1]))
+            return a, b, float(np.sqrt(d2[i, j]))
+
+        def _profile_drop(a: Tuple[int, int], b: Tuple[int, int], cls: int) -> float:
+            # sample mean intensity along the connecting line in the class's channels
+            n = max(5, merge_steps)
+            xs = np.clip(np.round(np.linspace(a[0], b[0], n)).astype(int), 0, W - 1)
+            ys = np.clip(np.round(np.linspace(a[1], b[1], n)).astype(int), 0, H - 1)
+            chs = self.channels_pp if cls == 1 else self.channels_pv
+            if not chs:
+                return 0.0
+            vals = []
+            for c in chs:
+                vals.append(image_stack[ys, xs, c].astype(np.float32))
+            prof = np.mean(np.stack(vals, axis=1), axis=1)  # (n,)
+            k = max(1, n // 5)
+            ref = 0.5 * (prof[:k].mean() + prof[-k:].mean())
+            drop = max(0.0, float(ref - prof.min()))
+            return drop
+
+        # Build adjacency by proximity + continuity (same class only)
+        N = len(kept_items)
+        adj = [[] for _ in range(N)]
+        if merge_enable and N > 1:
+            # pre-check with bbox inflation to avoid all-pairs cost
+            bboxes = [cv2.boundingRect(item[1]) for item in kept_items]  # of contours
+            for i in range(N):
+                (x1, y1, w1, h1) = bboxes[i]
+                cls_i = kept_items[i][2]
+                for j in range(i + 1, N):
+                    if kept_items[j][2] != cls_i:
+                        continue  # never merge across classes
+                    (x2, y2, w2, h2) = bboxes[j]
+                    # quick reject if far by bbox
+                    if (x2 > x1 + w1 + merge_dist_px) or (x1 > x2 + w2 + merge_dist_px) or \
+                            (y2 > y1 + h1 + merge_dist_px) or (y1 > y2 + h2 + merge_dist_px):
+                        continue
+                    # precise gap
+                    a, b, d = _closest_points(kept_items[i][1], kept_items[j][1])
+                    if d > merge_dist_px:
+                        continue
+                    drop = _profile_drop(a, b, cls_i)
+                    if drop <= merge_drop_max:
+                        adj[i].append(j)
+                        adj[j].append(i)
+
+        # Connected components -> merged vessels
+        visited = [False] * N
+        merged_items: List[Tuple[np.ndarray, np.ndarray, int, int]] = []  # (hole_mask, contour, cls, zone_idx)
+
+        for i in range(N):
+            if visited[i]:
+                continue
+            # BFS component
+            queue = [i]
+            comp = []
+            visited[i] = True
+            while queue:
+                u = queue.pop()
+                comp.append(u)
+                for v in adj[u]:
+                    if not visited[v]:
+                        visited[v] = True
+                        queue.append(v)
+            if len(comp) == 1:
+                # single kept item as-is
+                hole_bool, cnt, cls, zone_idx, _ring_bool = kept_items[comp[0]]
+                # convert hole mask to u8 for contour
+                hole_u8 = (hole_bool.astype(np.uint8) * 255)
+                # ensure we have a closed contour for the hole
+                # (if it's an edge-type synth hole, it is already closed)
+                merged_items.append((hole_u8 > 0, cnt, cls, zone_idx))
+            else:
+                # union of holes in the component
+                hole_union = np.zeros((H, W), dtype=np.uint8)
+                cls0 = kept_items[comp[0]][2]
+                zone0 = kept_items[comp[0]][3]
+                for kidx in comp:
+                    hole_union |= (kept_items[kidx][0].astype(np.uint8) * 255)
+                # optional smooth
+                hole_union = cv2.morphologyEx(hole_union, cv2.MORPH_CLOSE,
+                                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+                # re-extract a single contour (largest area)
+                cnts_merge, _ = cv2.findContours(hole_union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts_merge:
+                    continue
+                # pick largest
+                areas = [cv2.contourArea(c) for c in cnts_merge]
+                cbest = cnts_merge[int(np.argmax(areas))]
+                merged_items.append((hole_union > 0, cbest, cls0, zone0))
+
+        # Now commit: reassign SPs for merged vessels and populate outputs
+        vessel_classes_local: List[int] = []
+        vessel_contours_local: List[np.ndarray] = []
+
+        for hole_mask_bool, contour_final, cls, zone_idx in merged_items:
+            sp_inside = np.unique(labels[hole_mask_bool])
             for sp in sp_inside:
                 assigned_by_sp[int(sp)] = zone_idx
+            vessel_contours_local.append(contour_final)
+            vessel_classes_local.append(cls)
 
-            kept_contours.append(cnt)
-            kept_classes.append(cls)
-
-        vessel_classes.extend(kept_classes)
-        vessel_contours.extend(kept_contours)
+        vessel_classes.extend(vessel_classes_local)
+        vessel_contours.extend(vessel_contours_local)
 
         # Rebuild final per-pixel cluster map after reassignment
         cluster_map_final = get_lab(labels).astype(np.int32)
