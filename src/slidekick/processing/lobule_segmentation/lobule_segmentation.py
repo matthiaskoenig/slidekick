@@ -66,12 +66,7 @@ class LobuleSegmentor(BaseOperator):
                  vessel_merge_enable: bool = True,
                  vessel_merge_dist_px: int = 12,
                  vessel_merge_intensity_drop_max: float = 12.0,
-                 vessel_merge_profile_steps: int = 21,
-                 # refinement knobs (always on)
-                 dist_midband_rel: float = 0.30,
-                 dist_margin_px: int = 3,
-                 refine_pp_percentile: float = 0.20,
-                 refine_pv_percentile: float = 0.20):
+                 vessel_merge_profile_steps: int = 21):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -104,10 +99,6 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_merge_dist_px: max gap (px) between vessels to consider merging
         @param vessel_merge_intensity_drop_max: max allowed intensity drop along the connector (uint8)
         @param vessel_merge_profile_steps: samples along connector for the drop check
-        @param dist_midband_rel: relative band where |d_cv - d_pf| small → MID assignment
-        @param dist_margin_px: absolute pixel margin for PP/PV distance decisions
-        @param refine_pp_percentile: demote weakest PP to MID below this PP-channel percentile
-        @param refine_pv_percentile: demote weakest PV to MID below this PV-channel percentile
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
@@ -142,12 +133,6 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_merge_dist_px = vessel_merge_dist_px
         self.vessel_merge_intensity_drop_max = vessel_merge_intensity_drop_max
         self.vessel_merge_profile_steps = vessel_merge_profile_steps
-
-        # refinement knobs
-        self.dist_midband_rel = dist_midband_rel
-        self.dist_margin_px = dist_margin_px
-        self.refine_pp_percentile = refine_pp_percentile
-        self.refine_pv_percentile = refine_pv_percentile
 
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -414,7 +399,6 @@ class LobuleSegmentor(BaseOperator):
 
         fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
         fg_labels = np.nonzero(fg_label_mask)[0]
-        bg_labels = np.nonzero(~fg_label_mask)[0]
 
         fg_pix_mask = np.isin(labels, fg_labels)
 
@@ -540,7 +524,7 @@ class LobuleSegmentor(BaseOperator):
         if report_path is not None:
             template_init = render_cluster_gray(cluster_map, sorted_label_idx, self.n_clusters)
             template_init[~fg_pix_mask] = 0
-            cv2.imwrite(str(report_path / "foreground_clustered_initial.png"), template_init)
+            cv2.imwrite(str(report_path / "foreground_clustered.png"), template_init)
 
         console.print("Complete. Now detecting vessels in detected zonation...", style="info")
 
@@ -814,70 +798,14 @@ class LobuleSegmentor(BaseOperator):
         # Rebuild final per-pixel cluster map after reassignment
         cluster_map_final = get_lab(labels).astype(np.int32)
 
-        ### Refinement droppedfor debugging
-        """
-        console.print("Complete. Now refining zonation...", style="info")
-
-        # Refinement stage: distance-based filling + histogram cutoffs
-        Hh, Wh = cluster_map_final.shape
-        portal_mask = np.zeros((Hh, Wh), dtype=np.uint8)
-        central_mask = np.zeros((Hh, Wh), dtype=np.uint8)
-        for cnt, cls in zip(vessel_contours, vessel_classes):
-            if cls == 1:   # portal field
-                cv2.drawContours(portal_mask, [cnt], -1, 255, thickness=cv2.FILLED)
-            else:          # central vein
-                cv2.drawContours(central_mask, [cnt], -1, 255, thickness=cv2.FILLED)
-
-        # distance to vessels (pixels = float32 distance in px)
-        if np.any(portal_mask):  # cv2.distanceTransform expects 0 as target -> invert
-            dist_pf = cv2.distanceTransform(255 - portal_mask, cv2.DIST_L2, 5)
-        else:
-            dist_pf = np.full((Hh, Wh), 1e6, dtype=np.float32)
-        if np.any(central_mask):
-            dist_cv = cv2.distanceTransform(255 - central_mask, cv2.DIST_L2, 5)
-        else:
-            dist_cv = np.full((Hh, Wh), 1e6, dtype=np.float32)
-
-        # fill background (-1) based on nearest vessel with a margin; mid when close
-        bg_mask = (cluster_map_final < 0) & fg_pix_mask
-        if np.any(bg_mask):
-            delta = dist_cv - dist_pf  # negative -> closer to central
-            mid_band = np.abs(delta) <= (self.dist_midband_rel * np.minimum(dist_cv, dist_pf) + self.dist_margin_px)
-            assign_pv = (delta < -self.dist_margin_px) & (~mid_band)
-            assign_pp = (delta > self.dist_margin_px) & (~mid_band)
-
-            mid_choice = idx_mid[0] if len(idx_mid) else idx_pp
-            cluster_map_final[bg_mask & mid_band] = mid_choice
-            cluster_map_final[bg_mask & assign_pp] = idx_pp
-            cluster_map_final[bg_mask & assign_pv] = idx_pv
-
-        # histogram cutoffs to trim weak PP/PV at borders (demote to MID)
-
-        # PP demotion
-        if self.channels_pp is not None and len(idx_mid):
-            pp_zone = (cluster_map_final == idx_pp)
-            if np.any(pp_zone):
-                pp_vals = np.mean(np.stack([image_stack[..., c] for c in self.channels_pp], axis=2), axis=2)
-                thr_pp = percentile(pp_vals[pp_zone], self.refine_pp_percentile)
-                demote_pp = pp_zone & (pp_vals < thr_pp)
-                cluster_map_final[demote_pp] = idx_mid[0]
-
-        # PV demotion
-        if self.channels_pv is not None and len(idx_mid):
-            pv_zone = (cluster_map_final == idx_pv)
-            if np.any(pv_zone):
-                pv_vals = np.mean(np.stack([image_stack[..., c] for c in self.channels_pv], axis=2), axis=2)
-                thr_pv = percentile(pv_vals[pv_zone], self.refine_pv_percentile)
-                demote_pv = pv_zone & (pv_vals < thr_pv)
-                cluster_map_final[demote_pv] = idx_mid[0]
-        """
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
         template[~fg_pix_mask] = 0
-        if report_path is not None:
-            cv2.imwrite(str(report_path / "foreground_clustered_final.png"), template)
 
         # Zonation + vessel overlay
         if report_path is not None:
+
+
+
             base_vis = image_stack.mean(axis=2).astype(np.uint8)
             base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
 
