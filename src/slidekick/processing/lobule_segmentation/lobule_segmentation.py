@@ -66,7 +66,8 @@ class LobuleSegmentor(BaseOperator):
                  vessel_merge_enable: bool = True,
                  vessel_merge_dist_px: int = 12,
                  vessel_merge_intensity_drop_max: float = 12.0,
-                 vessel_merge_profile_steps: int = 21):
+                 vessel_merge_profile_steps: int = 21,
+                 min_area_px: int = 200):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -99,6 +100,7 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_merge_dist_px: max gap (px) between vessels to consider merging
         @param vessel_merge_intensity_drop_max: max allowed intensity drop along the connector (uint8)
         @param vessel_merge_profile_steps: samples along connector for the drop check
+        @param min_area_px: Define area threshold to filter out very small polygons (noise)
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
@@ -133,6 +135,9 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_merge_dist_px = vessel_merge_dist_px
         self.vessel_merge_intensity_drop_max = vessel_merge_intensity_drop_max
         self.vessel_merge_profile_steps = vessel_merge_profile_steps
+
+        # lobule generation
+        self.min_area_px = min_area_px
 
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -972,26 +977,23 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Creating lines segments from skeleton...", style="info")
 
         # Steps 8: segments
-        line_segments = segment_thinned_image(thinned)
+        line_segments = segment_thinned_image(thinned, report_path=report_path)
 
         console.print("Complete. Creating segmentation mask...", style="info")
 
         # Step 9: Creating lobule and vessel polygons from line segments and vessel contours
-        mask = process_segments_to_mask(line_segments, thinned.shape, report_path=report_path)
+        mask = process_segments_to_mask(line_segments, thinned.shape, report_path=report_path, min_area_px=self.min_area_px)
 
         # Crop mask by padding
         mask_cropped = mask[pad:-pad, pad:-pad]
 
         # Preview
-        # Left: Orig, Middle: Overlay, Right: Mask only
         if self.preview:
             # Original as mean projection
             orig_vis = img_stack.mean(axis=2).astype(np.uint8)
             # Skeleton cropped to match mask/img_stack
             overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
-            # Mask visualization as binary 0/255 for clarity
-            mask_vis = (mask_cropped > 0).astype(np.uint8) * 255
-            self._preview_images([orig_vis, overlay_vis, mask_vis], titles=["Original", "Segmentation Overlay", "Mask"])
+            self._preview_images([orig_vis, overlay_vis], titles=["Original", "Segmentation Overlay"])
 
         console.print("Complete. Back-mapping mask to all pyramid levels...", style="info")
 

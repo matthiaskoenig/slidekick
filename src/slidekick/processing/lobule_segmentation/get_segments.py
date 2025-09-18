@@ -6,10 +6,16 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 # simple copy of https://github.com/matthiaskoenig/zonation-image-analysis/blob/develop/src/zia/pipeline/pipeline_components/algorithm/segementation/get_segments.py
+# SPEEDUPS
+# - self.pixels is a set[(row, col)] for O(1) membership/removal
+# - get_loop_end uses set membership instead of nested any()
+# - is_ortho_and_aligned uses scalar math (no small NumPy arrays)
+
 
 class LineSegmentsFinder:
     def __init__(self, pixels: List[Tuple[int, int]], image_shape: Tuple[int, int]):
-        self.pixels = pixels
+        # store pixels as a SET of tuples -> O(1) membership/removal
+        self.pixels = set(pixels)
         self.image_shape = image_shape
         self.segments_finished = []
         self.segments_to_do = []
@@ -40,9 +46,11 @@ class LineSegmentsFinder:
         @param remove: if True, the found pixels are removed from the pixels list
         @return: list of found connected pixels.
         """
+        # set membership -> O(1) each
         n_pixels = [n for n in neighbors if n in self.pixels]
         if remove:
             for n_pixel in n_pixels:
+                # set.remove is O(1)
                 self.pixels.remove(n_pixel)
         return n_pixels
 
@@ -53,7 +61,9 @@ class LineSegmentsFinder:
         @param neighbors: neighboring pixels, which might be the end of another segment
         @return: list of the found connected segments
         """
-        return list(filter(lambda s: any([s[-1] == n for n in neighbors]), self.segments_to_do))
+        # speed: use set membership rather than any([...])
+        nset = set(neighbors)
+        return [s for s in self.segments_to_do if s and (s[-1] in nset)]
 
     def walk_segment(self, segment: List[tuple[int, int]]) -> None:
         """
@@ -99,9 +109,12 @@ class LineSegmentsFinder:
             finished_segments = self.check_connected_segments(ortho_connected_segments, this_pixel, segment)
             if len(finished_segments) != 0:
                 for s in finished_segments:
-                    self.segments_to_do.remove(s)
+                    # safe remove (list) – keep structure
+                    if s in self.segments_to_do:
+                        self.segments_to_do.remove(s)
                     self.segments_finished.append(s)
-                    ortho_connected_segments.remove(s)
+                    if s in ortho_connected_segments:
+                        ortho_connected_segments.remove(s)
                 if len(orthogonally_connected) == 0 and len(ortho_connected_segments) == 0:
                     segment.append(finished_segments[0][-1])
                     self.segments_finished.append(segment)
@@ -117,9 +130,11 @@ class LineSegmentsFinder:
         finished_segments = self.check_connected_segments(diag_connected_segments, this_pixel, segment)
         if len(finished_segments) != 0:
             for s in finished_segments:
-                self.segments_to_do.remove(s)
+                if s in self.segments_to_do:
+                    self.segments_to_do.remove(s)
                 self.segments_finished.append(s)
-                diag_connected_segments.remove(s)
+                if s in diag_connected_segments:
+                    diag_connected_segments.remove(s)
             if len(diagonally_connected) == 0 and len(diag_connected_segments) == 0:
                 segment.append(finished_segments[0][-1])
                 self.segments_finished.append(segment)
@@ -175,16 +190,12 @@ class LineSegmentsFinder:
                     self.segments_to_do.append([connected_segment[-1], con_pixel])
                 continue
 
-            connected_segments = self.get_simple_connected_segments(n_diagonal, diag_connected)
-            if len(connected_segments) != 0:
+            connected_segments2 = self.get_simple_connected_segments(n_diagonal, diag_connected)
+            if len(connected_segments2) != 0:
                 finished.append(connected_segment)
-                for con_seg in connected_segments:
+                for con_seg in connected_segments2:
                     self.segments_to_do.append([connected_segment[-1], con_seg[-1]])
                 continue
-
-        # if len(finished) != 0:
-        # segment.append(finished[0][-1])
-        #    self.segments_finished.append(segment)
 
         return finished
 
@@ -275,7 +286,8 @@ class LineSegmentsFinder:
 
         # if 1 connected segment is found and no connected pixel -> end by merging connected segment
         elif len(connected_segments) == 1 and len(connected_pixels) == 0:
-            self.segments_to_do.remove(connected_segments[0])
+            if connected_segments[0] in self.segments_to_do:
+                self.segments_to_do.remove(connected_segments[0])
             connected_segments[0].reverse()
             segment.extend(connected_segments[0])
             self.segments_finished.append(segment)
@@ -288,7 +300,8 @@ class LineSegmentsFinder:
             self.segments_finished.append(segment)
 
             for connected_segment in connected_segments:
-                self.segments_to_do.remove(connected_segment)
+                if connected_segment in self.segments_to_do:
+                    self.segments_to_do.remove(connected_segment)
                 connected_segment.append(this_pixel)
                 self.segments_finished.append(connected_segment)
 
@@ -354,8 +367,9 @@ class LineSegmentsFinder:
                 branches = self.get_diagonally_branching_pixel(orthogonally_connected[0], diagonally_connected)
                 if len(branches) != 0:
                     for branch in branches:
-                        self.pixels.remove(branch)
-                        orthogonally_connected.append(branch)
+                        if branch in self.pixels:
+                            self.pixels.remove(branch)
+                            orthogonally_connected.append(branch)
 
             for p in orthogonally_connected:
                 self.segments_to_do.append([this_pixel, p])
@@ -377,6 +391,7 @@ class LineSegmentsFinder:
         """
         Runs the line segmentation.
         """
+        # self.pixels is a set -> .pop() gives an arbitrary pixel (fast O(1))
         while len(self.pixels) > 0:
             pixel = self.pixels.pop()
             self.initialize(pixel)
@@ -397,14 +412,14 @@ class LineSegmentsFinder:
         return [s for s in connected_segments if len(segment) > 2 or (s[0] != segment[0] and not self.is_ortho_and_aligned(s, segment))]
 
     def is_ortho_and_aligned(self, s1, s2) -> bool:
-        v1 = np.array([s1[1][0] - s1[0][0], s1[1][1] - s1[0][1]])
-        v2 = np.array([s2[1][0] - s2[0][0], s2[1][1] - s2[0][1]])
-
+        # scalar arithmetic (faster than tiny NumPy arrays)
+        dx1 = s1[1][0] - s1[0][0]
+        dy1 = s1[1][1] - s1[0][1]
+        dx2 = s2[1][0] - s2[0][0]
+        dy2 = s2[1][1] - s2[0][1]
+        cross = dx1 * dy2 - dy1 * dx2
         d = abs(s1[0][0] - s2[0][0]) + abs(s1[0][1] - s2[0][1])
-
-        if np.all(np.cross(v1, v2) == 0) and d == 1:
-            return True
-        return False
+        return (cross == 0) and (d == 1)
 
     def get_branching_neighbors(self, neighbors_diag: List[Tuple[int, int]], connected_pixels: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """
@@ -421,7 +436,6 @@ class LineSegmentsFinder:
 
 def segment_thinned_image(image: np.ndarray, write=False, report_path: Path = None) -> List[List[Tuple[int, int]]]:
     pixels = np.argwhere(image == 255)
-
     pixels = [tuple(coords) for coords in pixels]
 
     segmenter = LineSegmentsFinder(pixels, image.shape[:2])
@@ -432,13 +446,16 @@ def segment_thinned_image(image: np.ndarray, write=False, report_path: Path = No
             pickle.dump(segmenter, f)
 
     if report_path is not None:
+        report_path.mkdir(parents=True, exist_ok=True)
         fig, ax = plt.subplots(dpi=300)
-        ax: plt.Axes
         ax.invert_yaxis()
-        colors = np.random.rand(len(segements_finished), 3)  # Random RGB values between 0 and 1
+        ax.imshow(image, cmap="gray", vmin=0, vmax=255)  # show skeleton as background
+        colors = np.random.rand(len(segements_finished), 3)  # Random RGB rows in [0,1]
         for i, line in enumerate(segements_finished):
-            x, y = zip(*line)
-            ax.plot(y, x, marker="none", color=colors[i], linewidth=1, alpha=0.8)
-            ax.axis("off")
-            plt.savefig(report_path / "line_segmentation.png")
+            x, y = zip(*line)  # (row, col) -> plot as (y, x)
+            ax.plot(y, x, linewidth=1, color=colors[i], alpha=0.9)
+        ax.axis("off")
+        fig.savefig(report_path / "line_segmentation.png", bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+
     return segements_finished
