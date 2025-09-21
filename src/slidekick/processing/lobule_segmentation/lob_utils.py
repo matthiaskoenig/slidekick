@@ -162,13 +162,6 @@ def downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
 
     return out
 
-def percentile(values: np.ndarray, p: float) -> float:
-    v = values.astype(np.float32).ravel()
-    v = v[~np.isnan(v)]
-    if v.size == 0:
-        return 0.0
-    return float(np.percentile(v, max(0.0, min(100.0, p * 100.0))))
-
 
 def gray_for_cluster(cid: int, sorted_label_idx: np.ndarray, n_clusters: int) -> int:
     """

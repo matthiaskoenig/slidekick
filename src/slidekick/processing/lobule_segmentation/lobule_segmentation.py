@@ -23,9 +23,8 @@ from slidekick.processing.lobule_segmentation.get_segments import segment_thinne
 from slidekick.processing.lobule_segmentation.process_segments import process_segments_to_mask
 from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
-    downsample_to_max_side, percentile, gray_for_cluster, render_cluster_gray, nonlinear_channel_weighting
+    downsample_to_max_side, render_cluster_gray, nonlinear_channel_weighting
 )
-
 
 class LobuleSegmentor(BaseOperator):
     """
