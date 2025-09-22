@@ -5,12 +5,23 @@ from typing import Tuple, List, Optional
 import numpy as np
 from matplotlib import pyplot as plt
 
-# simple copy of https://github.com/matthiaskoenig/zonation-image-analysis/blob/develop/src/zia/pipeline/pipeline_components/algorithm/segementation/get_segments.py
+# copy of https://github.com/matthiaskoenig/zonation-image-analysis/blob/develop/src/zia/pipeline/pipeline_components/algorithm/segementation/get_segments.py
 # SPEEDUPS
 # - self.pixels is a set[(row, col)] for O(1) membership/removal
 # - get_loop_end uses set membership instead of nested any()
 # - is_ortho_and_aligned uses scalar math (no small NumPy arrays)
+# CHANGES
+# - Dead-end policy: segments that reach 0 next pixels are DROPPED (not finished) to “cut back to last split”.
+# - walk_segment fallthroughs (after merge checks) now DROP partials when nothing remains to extend.
+# - Diagonal-path fallthrough does the same DROP to avoid keeping open tails.
+# - check_connected_segments signature aligned with call sites:
+#   (connected_segments, orig_pixel, segment, connected_pixels)
+# - check_connected_segments only marks neighbor segments finished up to their tail
+#   and QUEUES new growth from their tails; it does not force-finish the current segment.
 
+# TODO: Dropped segments check if they can be mapped to outer lobule
+# TODO: Still some lines into nothing persist
+# TODO: Some lines are split while then going into nothings
 
 class LineSegmentsFinder:
     def __init__(self, pixels: List[Tuple[int, int]], image_shape: Tuple[int, int]):
@@ -65,139 +76,214 @@ class LineSegmentsFinder:
         nset = set(neighbors)
         return [s for s in self.segments_to_do if s and (s[-1] in nset)]
 
-    def walk_segment(self, segment: List[tuple[int, int]]) -> None:
+    def walk_segment(self, segment: List[Tuple[int, int]]) -> None:
         """
-        should take a segment until there is no or multiple connected pixels
+        Single-step walker. Modified fallthroughs:
+        - If nothing remains to extend after merge checks, DROP the partial
+          instead of finishing it, so we cut back to the last split.
         """
         this_pixel = segment[-1]
+
         n_ortho = self.get_neighbors(this_pixel)
-        n_diagonal = self.get_neighbors(this_pixel, ortho=False)
+        n_diag = self.get_neighbors(this_pixel, ortho=False)
 
-        # remove already visited from neighbors
-        if segment[-2] in n_ortho:
-            n_ortho.remove(segment[-2])
-        if segment[-2] in n_diagonal:
-            n_diagonal.remove(segment[-2])
+        # exclude where we came from
+        if len(segment) >= 2:
+            prev = segment[-2]
+            if prev in n_ortho:
+                n_ortho.remove(prev)
+            if prev in n_diag:
+                n_diag.remove(prev)
 
-        # get orthogonally connected pixels
         orthogonally_connected = self.get_connected_pixels(n_ortho)
-        # orthogonally connected segments
         ortho_connected_segments = self.get_simple_connected_segments(n_ortho, orthogonally_connected)
         ortho_connected_segments = self.filter_connected_segments(ortho_connected_segments, segment)
 
-        # if only one orthogonally connected pixel or segment is found there might be a diagonally branching pixel or segment
+        # If exactly one continuation overall, probe potential diagonal branch
         if (len(orthogonally_connected) + len(ortho_connected_segments)) == 1:
             if len(orthogonally_connected) == 1:
                 connected_pixel = orthogonally_connected[0]
             else:
                 connected_pixel = ortho_connected_segments[0][-1]
 
-            # find the diagonal neighbor that is far from the orthogonally connected pixel
-            potential_branch = self.get_potential_branching_pixel(segment[-2], connected_pixel, n_diagonal)
-
-            # if that neighbor exists, check if it is another pixel or another segment end
+            potential_branch = self.get_potential_branching_pixel(
+                segment[-2] if len(segment) >= 2 else this_pixel,
+                connected_pixel,
+                n_diag
+            )
             if potential_branch is not None:
+                # if pixel exists, pull it now; otherwise attach the queued segment that ends there
                 if potential_branch in self.pixels:
                     orthogonally_connected.append(potential_branch)
                     self.pixels.remove(potential_branch)
                 else:
-                    diag_segment = list(filter(lambda x: x[-1] == potential_branch, self.segments_to_do))
-                    ortho_connected_segments.extend(diag_segment)
+                    diag_seg = list(filter(lambda x: x[-1] == potential_branch, self.segments_to_do))
+                    ortho_connected_segments.extend(diag_seg)
 
-        # if one entry exists, extend the segment otherwise check for diagonal pixels
+        # Handle orthogonal continuations or merges
         if len(orthogonally_connected) > 0 or len(ortho_connected_segments) > 0:
-            finished_segments = self.check_connected_segments(ortho_connected_segments, this_pixel, segment)
-            if len(finished_segments) != 0:
-                for s in finished_segments:
-                    # safe remove (list) – keep structure
-                    if s in self.segments_to_do:
-                        self.segments_to_do.remove(s)
-                    self.segments_finished.append(s)
-                    if s in ortho_connected_segments:
-                        ortho_connected_segments.remove(s)
-                if len(orthogonally_connected) == 0 and len(ortho_connected_segments) == 0:
-                    segment.append(finished_segments[0][-1])
-                    self.segments_finished.append(segment)
-                    return
-                else:
-                    orthogonally_connected.append(finished_segments[0][-1])
+            finished_segments = self.check_connected_segments(
+                ortho_connected_segments, this_pixel, segment, orthogonally_connected
+            )
+
+            # If nothing remains after merge checks → DROP the partial (cut back to split)
+            if len(orthogonally_connected) == 0 and len(ortho_connected_segments) == 0:
+                return
+
+            # If merges produced finished pieces, store them
+            if finished_segments:
+                self.segments_finished.extend(finished_segments)
+
+            # If there is exactly one pixel continuation and no attached segment, extend and recurse
+            if len(orthogonally_connected) == 1 and len(ortho_connected_segments) == 0:
+                segment.append(orthogonally_connected[0])
+                self.walk_segment(segment)
+                return
+
+            # Otherwise delegate to unified extender (handles merges and forks)
             self.extend_segment(this_pixel, segment, orthogonally_connected, ortho_connected_segments)
             return
 
-        diagonally_connected = self.get_connected_pixels(n_diagonal)
-        diag_connected_segments = self.get_simple_connected_segments(n_diagonal, diagonally_connected)
-        diag_connected_segments = self.filter_connected_segments(diag_connected_segments, segment)
-        finished_segments = self.check_connected_segments(diag_connected_segments, this_pixel, segment)
-        if len(finished_segments) != 0:
-            for s in finished_segments:
-                if s in self.segments_to_do:
-                    self.segments_to_do.remove(s)
-                self.segments_finished.append(s)
-                if s in diag_connected_segments:
-                    diag_connected_segments.remove(s)
-            if len(diagonally_connected) == 0 and len(diag_connected_segments) == 0:
-                segment.append(finished_segments[0][-1])
-                self.segments_finished.append(segment)
+        # No orthogonal continuation. Try diagonal branches
+        branches = self.get_branching_neighbors(n_diag, orthogonally_connected)
+        if len(branches) > 0:
+            for branch in branches:
+                if branch in self.pixels:
+                    self.pixels.remove(branch)
+                    self.segments_to_do.append([this_pixel, branch])
+            self.nodes.append(this_pixel)
+            return
+
+        diagonally_connected = self.get_connected_pixels(n_diag)
+        diagonal_connected_segments = self.get_simple_connected_segments(n_diag, diagonally_connected)
+        diagonal_connected_segments = self.filter_connected_segments(diagonal_connected_segments, segment)
+
+        if len(diagonally_connected) > 0 or len(diagonal_connected_segments) > 0:
+            finished_segments = self.check_connected_segments(
+                diagonal_connected_segments, this_pixel, segment, diagonally_connected
+            )
+
+            # If nothing left after checks → DROP partial
+            if len(diagonally_connected) == 0 and len(diagonal_connected_segments) == 0:
                 return
-            else:
-                diagonally_connected.append(finished_segments[0][-1])
-        self.extend_segment(this_pixel, segment, diagonally_connected, diag_connected_segments)
+
+            if finished_segments:
+                self.segments_finished.extend(finished_segments)
+
+            if len(diagonally_connected) == 1 and len(diagonal_connected_segments) == 0:
+                segment.append(diagonally_connected[0])
+                self.walk_segment(segment)
+                return
+
+            self.extend_segment(this_pixel, segment, diagonally_connected, diagonal_connected_segments)
+            return
+
+        # Truly nothing to do in any direction → DROP partial
         return
 
-    def check_connected_segments(self, connected_segments: List[List[Tuple[int, int]]], orig_pixel, segment: List[Tuple[int, int]]) -> List[
-        List[Tuple[int, int]]]:
+    def check_connected_segments(self,
+                                 connected_segments: List[List[Tuple[int, int]]],
+                                 orig_pixel: Tuple[int, int],
+                                 segment: List[Tuple[int, int]],
+                                 connected_pixels: List[Tuple[int, int]]) -> List[List[Tuple[int, int]]]:
         """
-        this method is needed to check if encountered segments have connected pixels or segments. These would otherwise get lost
-        because the segment is removed from the segments to do list.
-        @param connected_segments: list of connected segments
-        @param orig_pixel: the pixel of which the neighbor is adjacent to the connected segments
-        """
-        finished = []
-        for connected_segment in connected_segments:
-            this_pixel = connected_segment[-1]
-            n_ortho = self.get_neighbors(this_pixel)
-            n_diagonal = self.get_neighbors(this_pixel, ortho=False)
+        Re-check queued neighbor segments at a junction and re-queue their growth so we don't lose branches.
 
-            # remove already visited from neighbors
+        Args:
+            connected_segments: segments whose tail touches the current pixel neighborhood.
+            orig_pixel:         pixel at which we are evaluating the junction (the 'this_pixel' in caller).
+            segment:            current growing segment (not modified here).
+            connected_pixels:   current list of pixel continuations (not used except for symmetry with caller).
+
+        Returns:
+            finished_segments: segments that should be considered complete up to their current tail.
+                               New growth from their tails is queued into self.segments_to_do.
+        """
+        finished_segments: List[List[Tuple[int, int]]] = []
+
+        for seg2 in connected_segments:
+            # Tail of neighbor segment
+            if len(seg2) == 0:
+                continue
+            tail = seg2[-1]
+            prev = seg2[-2] if len(seg2) >= 2 else orig_pixel
+
+            # Neighbors around tail, exclude where it came from and the current origin pixel
+            n_ortho = self.get_neighbors(tail)
+            n_diag = self.get_neighbors(tail, ortho=False)
+
+            if prev in n_ortho:
+                n_ortho.remove(prev)
+            if prev in n_diag:
+                n_diag.remove(prev)
             if orig_pixel in n_ortho:
                 n_ortho.remove(orig_pixel)
-            if orig_pixel in n_diagonal:
-                n_diagonal.remove(orig_pixel)
+            if orig_pixel in n_diag:
+                n_diag.remove(orig_pixel)
 
-            if connected_segment[0] in n_ortho:
-                n_ortho.remove(connected_segment[0])
-            if connected_segment[0] in n_diagonal:
-                n_diagonal.remove(connected_segment[0])
+            # Available continuations from seg2's tail
+            cont_pixels_ortho = self.get_connected_pixels(n_ortho)
+            cont_segs_ortho = self.get_simple_connected_segments(n_ortho, cont_pixels_ortho)
+            cont_segs_ortho = self.filter_connected_segments(cont_segs_ortho, seg2)
 
-            orthogonally_connected = self.get_connected_pixels(n_ortho)
-            if len(orthogonally_connected) != 0:
-                finished.append(connected_segment)
-                for con_pixel in orthogonally_connected:
-                    self.segments_to_do.append([connected_segment[-1], con_pixel])
-                continue
+            # Optional diagonal probe for branching patterns identical to the caller logic
+            if (len(cont_pixels_ortho) + len(cont_segs_ortho)) == 1:
+                if len(cont_pixels_ortho) == 1:
+                    probe_pixel = cont_pixels_ortho[0]
+                else:
+                    probe_pixel = cont_segs_ortho[0][-1]
 
-            ortho_connected_segments = self.get_simple_connected_segments(n_ortho, orthogonally_connected)
-            if len(ortho_connected_segments) != 0:
-                finished.append(connected_segment)
-                for con_seg in ortho_connected_segments:
-                    self.segments_to_do.append([connected_segment[-1], con_seg[-1]])
-                continue
+                pot = self.get_potential_branching_pixel(prev, probe_pixel, n_diag)
+                if pot is not None:
+                    if pot in self.pixels:
+                        cont_pixels_ortho.append(pot)
+                        self.pixels.remove(pot)
+                    else:
+                        diag_seg = list(filter(lambda x: x[-1] == pot, self.segments_to_do))
+                        cont_segs_ortho.extend(diag_seg)
 
-            diag_connected = self.get_connected_pixels(n_diagonal)
-            if len(diag_connected) != 0:
-                finished.append(connected_segment)
-                for con_pixel in diag_connected:
-                    self.segments_to_do.append([connected_segment[-1], con_pixel])
-                continue
+            # Also consider diagonal-only continuations when no ortho options
+            cont_pixels_diag = []
+            cont_segs_diag = []
+            if len(cont_pixels_ortho) == 0 and len(cont_segs_ortho) == 0:
+                branches = self.get_branching_neighbors(n_diag, cont_pixels_ortho)
+                for b in branches:
+                    if b in self.pixels:
+                        self.pixels.remove(b)
+                        cont_pixels_diag.append(b)
+                extra = self.get_connected_pixels(n_diag)
+                cont_pixels_diag.extend(extra)
+                cont_segs_diag = self.get_simple_connected_segments(n_diag, extra)
+                cont_segs_diag = self.filter_connected_segments(cont_segs_diag, seg2)
 
-            connected_segments2 = self.get_simple_connected_segments(n_diagonal, diag_connected)
-            if len(connected_segments2) != 0:
-                finished.append(connected_segment)
-                for con_seg in connected_segments2:
-                    self.segments_to_do.append([connected_segment[-1], con_seg[-1]])
-                continue
+            has_continuation = (
+                                       len(cont_pixels_ortho) + len(cont_segs_ortho) + len(cont_pixels_diag) + len(
+                                   cont_segs_diag)
+                               ) > 0
 
-        return finished
+            # If seg2 can continue from its tail, mark it finished up to tail and queue new growth
+            if has_continuation:
+                finished_segments.append(seg2)
+
+                # Queue orthogonal pixel continuations
+                for p in cont_pixels_ortho:
+                    self.segments_to_do.append([tail, p])
+
+                # Queue orthogonal segment continuations
+                for s in cont_segs_ortho:
+                    self.segments_to_do.append([tail, s[-1]])
+
+                # Queue diagonal pixel continuations
+                for p in cont_pixels_diag:
+                    self.segments_to_do.append([tail, p])
+
+                # Queue diagonal segment continuations
+                for s in cont_segs_diag:
+                    self.segments_to_do.append([tail, s[-1]])
+
+            # If no continuation, we do nothing here; caller will decide whether to drop or finish its own segment.
+
+        return finished_segments
 
     def get_diagonally_branching_pixel(self, ortho: Tuple[int, int], diag: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         return list(filter(lambda d: self.is_branch(ortho, d), diag))
@@ -272,73 +358,70 @@ class LineSegmentsFinder:
                        connected_pixels: List[Tuple[int, int]],
                        connected_segments: List[List[Tuple[int, int]]]) -> None:
         """
-        Extends or finishes the current segment based on the connected pixels and the connected segments
-        @param this_pixel: the current pixel
-        @param segment: the current segment
-        @param connected_pixels: pixels connected to current pixel
-        @param connected_segments: segments connected to current pixel
-        @return: None
+        Merge-first policy. If only one attached segment and no pixel, merge it.
+        Otherwise fork. When nothing to merge, defer to pixel-only handler which
+        enforces the "drop dead tail" rule.
         """
-        # if no connection found -> branch ending in the void
+        # No connected segments -> handle purely by pixel logic
         if len(connected_segments) == 0:
             self.extend_segment_pixels_only(this_pixel, segment, connected_pixels)
             return
 
-        # if 1 connected segment is found and no connected pixel -> end by merging connected segment
-        elif len(connected_segments) == 1 and len(connected_pixels) == 0:
-            if connected_segments[0] in self.segments_to_do:
-                self.segments_to_do.remove(connected_segments[0])
-            connected_segments[0].reverse()
-            segment.extend(connected_segments[0])
-            self.segments_finished.append(segment)
-
+        # Exactly one connected segment and no pixel -> merge and finish
+        if len(connected_segments) == 1 and len(connected_pixels) == 0:
+            seg2 = connected_segments[0]
+            # ensure seg2 is oriented away from this_pixel
+            if len(seg2) >= 2 and seg2[-2] == this_pixel:
+                # already oriented
+                merged = segment + seg2[-1:]
+            else:
+                # reverse so tail touches this_pixel
+                seg2 = list(reversed(seg2))
+                merged = segment + seg2[-1:]
+            self.segments_finished.append(merged)
             return
 
-        # if more than one connection -> finish segments and add connected pixels to segments to do
-        else:
-            self.nodes.append(this_pixel)
-            self.segments_finished.append(segment)
-
-            for connected_segment in connected_segments:
-                if connected_segment in self.segments_to_do:
-                    self.segments_to_do.remove(connected_segment)
-                connected_segment.append(this_pixel)
-                self.segments_finished.append(connected_segment)
-
-            for connected_pixel in connected_pixels:
-                self.segments_to_do.append([this_pixel, connected_pixel])
-
-            return
+        # Otherwise it's a junction: end current here, end any attached segments at the node,
+        # and queue all new branches starting from the node.
+        self.nodes.append(this_pixel)
+        self.segments_finished.append(segment)
+        for seg2 in connected_segments:
+            # normalize to end at node
+            if seg2[-1] != this_pixel:
+                if seg2[0] == this_pixel:
+                    seg2 = list(reversed(seg2))
+                # if neither end is the node, leave as-is; upstream code should only pass tails here
+            self.segments_finished.append(seg2)
+        for p in connected_pixels:
+            self.segments_to_do.append([this_pixel, p])
+        return
 
     def extend_segment_pixels_only(self,
                                    this_pixel: Tuple[int, int],
                                    segment: List[Tuple[int, int]],
                                    connected_pixels: List[Tuple[int, int]]) -> None:
         """
-        Extends or finished the current segment with based on the connected pixels.
-        @param this_pixel: the current pixel
-        @param segment: the current segment
-        @param connected_pixels: the pixels connected to the current pixel
-        @return: None
+        Cut back to the last split:
+        - 0 next pixels  -> drop this partial (do NOT finish).
+        - 1 next pixel   -> extend and continue walking.
+        - >1 next pixels -> mark node, finish current partial here, and fork.
         """
+        # 0 next pixels → dead tail; drop it so we "return to last split"
         if len(connected_pixels) == 0:
-            self.segments_finished.append(segment)
             return
 
-        # if one connected pixel is found -> walk on
+        # 1 next pixel → extend inline and continue
         if len(connected_pixels) == 1:
             segment.append(connected_pixels[0])
             self.walk_segment(segment)
             return
 
-        # if multiple connections found -> pixel is node, initialize new segments
-        if len(connected_pixels) > 1:
-            self.nodes.append(this_pixel)
-            self.segments_finished.append(segment)
-
-            for connected_pixel in connected_pixels:
-                self.segments_to_do.append([this_pixel, connected_pixel])
-            return
+        # >1 next pixels → split: finish current partial and queue branches
+        self.nodes.append(this_pixel)
+        self.segments_finished.append(segment)
+        for p in connected_pixels:
+            self.segments_to_do.append([this_pixel, p])
+        return
 
     def process_segments(self):
         """

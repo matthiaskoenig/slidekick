@@ -54,19 +54,19 @@ class LobuleSegmentor(BaseOperator):
                  pv_gamma: float = 0.75,
                  nl_low_pct: float = 5.0,
                  nl_high_pct: float = 90.0,
-                 # vessel gating (always on)
+                 # vessel gating
                  min_vessel_area_pp: int = 200,
                  min_vessel_area_pv: int = 200,
                  vessel_annulus_px: int = 5,
                  vessel_zone_ratio_thr_pp: float = 0.35,
                  vessel_zone_ratio_thr_pv: float = 0.55,
                  vessel_circularity_min: float = 0.12,
-                 # vessel grouping
+                 # vessel grouping  # TODO. Check if this is necessary after all other stuff is fixed
                  vessel_merge_enable: bool = True,
                  vessel_merge_dist_px: int = 12,
                  vessel_merge_intensity_drop_max: float = 12.0,
                  vessel_merge_profile_steps: int = 21,
-                 min_area_px: int = 200):
+                 min_area_px: int = 5000):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -882,13 +882,13 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Run thinning algorithm...", style="info")
         thinned = cv2.ximgproc.thinning(template.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
 
-        # drawing the vessels on the mask and thinn again to prevent pixel accumulations the segmentation can't hanlde
+        # drawing the vessels on the mask and thin again to prevent pixel accumulations the segmentation can't handle
 
-        cv2.drawContours(thinned, class_0_contours, -1, 0, thickness=cv2.FILLED)
-        cv2.drawContours(thinned, class_0_contours, -1, 255, thickness=1)
+        #cv2.drawContours(thinned, class_0_contours, -1, 0, thickness=cv2.FILLED)
+        #cv2.drawContours(thinned, class_0_contours, -1, 255, thickness=1)
 
-        cv2.drawContours(thinned, class_1_contours, -1, 0, thickness=cv2.FILLED)
-        cv2.drawContours(thinned, class_1_contours, -1, 255, thickness=1, )
+        #cv2.drawContours(thinned, class_1_contours, -1, 0, thickness=cv2.FILLED)
+        #cv2.drawContours(thinned, class_1_contours, -1, 255, thickness=1, )
 
         thinned = cv2.ximgproc.thinning(thinned.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
 
@@ -1039,7 +1039,7 @@ if __name__ == "__main__":
                                 channels_pp=1,
                                 channels_pv=2,
                                 base_level=0,
-                                region_size=15,
+                                region_size=25,
                                 adaptive_histonorm=True)
 
     metadata_segmentation = Segmentor.apply()
