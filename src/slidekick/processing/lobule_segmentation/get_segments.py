@@ -20,8 +20,6 @@ from matplotlib import pyplot as plt
 #   and QUEUES new growth from their tails; it does not force-finish the current segment.
 
 # TODO: Dropped segments check if they can be mapped to outer lobule
-# TODO: Still some lines into nothing persist
-# TODO: Some lines are split while then going into nothings
 
 class LineSegmentsFinder:
     def __init__(self, pixels: List[Tuple[int, int]], image_shape: Tuple[int, int]):
@@ -126,7 +124,7 @@ class LineSegmentsFinder:
                 ortho_connected_segments, this_pixel, segment, orthogonally_connected
             )
 
-            # If nothing remains after merge checks → DROP the partial (cut back to split)
+            # If nothing remains after merge checks -> DROP the partial (cut back to split)
             if len(orthogonally_connected) == 0 and len(ortho_connected_segments) == 0:
                 return
 
@@ -178,7 +176,7 @@ class LineSegmentsFinder:
             self.extend_segment(this_pixel, segment, diagonally_connected, diagonal_connected_segments)
             return
 
-        # Truly nothing to do in any direction → DROP partial
+        # Truly nothing to do in any direction -> DROP partial
         return
 
     def check_connected_segments(self,
@@ -329,23 +327,6 @@ class LineSegmentsFinder:
         else:
             raise ValueError(f"Value {d} is not allowed.")
 
-    def get_connected_segments(self,
-                               neighbors_ortho: List[Tuple[int, int]],
-                               neighbors_diag: List[Tuple[int, int]],
-                               connected_pixels: List[Tuple[int, int]]) -> List[List[Tuple[int, int]]]:
-        """
-        Gets all the orthogonally connected segments and diagonally connected segments which are not adjacent to
-        any of the orthogonally connected segments.
-        @param neighbors_ortho: orthogonally connected neighboring pixels
-        @param neighbors_diag: diagonally connected neighboring pixels
-        @param connected_pixels: actual connected pixels.
-        @return: list of connected segments
-        """
-        branching_n_diag = self.get_branching_neighbors(neighbors_diag, connected_pixels)
-        # get the potential branching diagonal neighbors
-        remaining_n = list(filter(lambda x: x not in connected_pixels, neighbors_ortho + branching_n_diag))
-        return self.get_loop_end(remaining_n)
-
     def get_simple_connected_segments(self,
                                       neighbors: List[Tuple[int, int]],
                                       connected_pixels: List[Tuple[int, int]]) -> List[List[Tuple[int, int]]]:
@@ -471,14 +452,13 @@ class LineSegmentsFinder:
         return
 
     def run(self) -> List[List[Tuple[int, int]]]:
-        """
-        Runs the line segmentation.
-        """
-        # self.pixels is a set -> .pop() gives an arbitrary pixel (fast O(1))
         while len(self.pixels) > 0:
             pixel = self.pixels.pop()
             self.initialize(pixel)
             self.process_segments()
+
+        # prune entire dead branches
+        self.prune_dead_branches()
 
         return self.segments_finished
 
@@ -515,6 +495,66 @@ class LineSegmentsFinder:
             return []
         potential_branches = [n for n in neighbors_diag if self.is_branch(connected_pixels[0], n)]
         return potential_branches
+
+    def prune_dead_branches(self) -> None:
+        """
+        Recursively remove branches that end in nothing.
+        Uses degrees computed from segment endpoints only.
+        Keeps loops. O(#segments + #endpoints).
+        """
+        if not self.segments_finished:
+            return
+
+        from collections import defaultdict, deque
+
+        # endpoints list
+        ends = [(seg[0], seg[-1]) for seg in self.segments_finished]
+
+        # degree from segments themselves
+        deg = defaultdict(int)
+        touch = defaultdict(set)  # point -> set(segment idx)
+        for i, (a, b) in enumerate(ends):
+            deg[a] += 1
+            deg[b] += 1
+            touch[a].add(i)
+            touch[b].add(i)
+
+        removed = [False] * len(self.segments_finished)
+
+        # leaf = point with degree 1
+        q = deque([p for p, d in deg.items() if d == 1])
+
+        while q:
+            p = q.popleft()
+            if deg.get(p, 0) != 1:
+                continue
+            # remove the single incident segment
+            s_idx = next(iter(touch[p]))
+            if removed[s_idx]:
+                continue
+            removed[s_idx] = True
+
+            a, b = ends[s_idx]
+            other = b if p == a else a
+
+            # update degree and adjacency
+            touch[p].remove(s_idx)
+            deg[p] -= 1
+            if deg[p] == 0:
+                del deg[p]
+                del touch[p]
+
+            if s_idx in touch[other]:
+                touch[other].remove(s_idx)
+                deg[other] -= 1
+                if deg[other] == 1:
+                    q.append(other)
+                if deg[other] == 0:
+                    del deg[other]
+                    del touch[other]
+
+        # keep non-removed segments
+        self.segments_finished = [seg for i, seg in enumerate(self.segments_finished) if not removed[i]]
 
 
 def segment_thinned_image(image: np.ndarray, write=False, report_path: Path = None) -> List[List[Tuple[int, int]]]:
