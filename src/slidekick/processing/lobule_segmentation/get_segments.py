@@ -18,6 +18,8 @@ from matplotlib import pyplot as plt
 #   (connected_segments, orig_pixel, segment, connected_pixels)
 # - check_connected_segments only marks neighbor segments finished up to their tail
 #   and QUEUES new growth from their tails; it does not force-finish the current segment.
+# - Small-gap closure near open ends: before dropping, probe a radius-2 ring for a single pixel
+#   or queued-tail and bridge it (mirrors segments_to_mask’s “close tiny gaps” effect).
 
 class LineSegmentsFinder:
     def __init__(self, pixels: List[Tuple[int, int]], image_shape: Tuple[int, int]):
@@ -72,6 +74,65 @@ class LineSegmentsFinder:
         nset = set(neighbors)
         return [s for s in self.segments_to_do if s and (s[-1] in nset)]
 
+    def _neighbors_radius(self, pixel: Tuple[int, int], r: int) -> List[Tuple[int, int]]:
+        """Square (Chebyshev) ring neighbors at exact radius r within image bounds."""
+        h, w = pixel
+        ih, iw = self.image_shape
+        out = []
+        for dh in range(-r, r+1):
+            for dw in range(-r, r+1):
+                if max(abs(dh), abs(dw)) != r:
+                    continue
+                nh, nw = h + dh, w + dw
+                if 0 <= nh < ih and 0 <= nw < iw:
+                    out.append((nh, nw))
+        return out
+
+    def _try_gap_bridge(self, segment: List[Tuple[int, int]], max_r: int = 5) -> bool:
+        """
+        Small-gap closure near an open end. Mirrors segments_to_mask's 3x3 dilation idea.
+        If no 8-neighbor continuation exists, probe a ring at radius 2 and, if exactly one
+        candidate pixel or queued-tail is found, extend to it and continue recursion.
+        Returns True if the segment was extended and recursion continued.
+        """
+        this_pixel = segment[-1]
+        prev = segment[-2] if len(segment) >= 2 else None
+        # scan radius 2 only; radius 1 is already handled by ortho/diag neighbors
+        cands = self._neighbors_radius(this_pixel, max_r)
+        # heuristic: prefer aligned with prev if present
+        def aligned(p):
+            if prev is None:
+                return True
+            dh1 = this_pixel[0] - prev[0]
+            dw1 = this_pixel[1] - prev[1]
+            dh2 = p[0] - this_pixel[0]
+            dw2 = p[1] - this_pixel[1]
+            return (dh1 == 0 and dh2 == 0) or (dw1 == 0 and dw2 == 0) or (abs(dh1) == abs(dw1) and abs(dh2) == abs(dw2))
+        pix_hits = [p for p in cands if p in self.pixels]
+        seg_hits = [s for s in self.segments_to_do if s and (s[-1] in cands)]
+        # unique target logic
+        target_pixel = None
+        if len(pix_hits) + len(seg_hits) == 1:
+            if len(pix_hits) == 1:
+                target_pixel = pix_hits[0]
+                self.pixels.remove(target_pixel)
+                segment.append(target_pixel)
+                self.walk_segment(segment)
+                return True
+            else:
+                # attach to the queued segment tail
+                neighbor_seg = seg_hits[0]
+                self.extend_segment(this_pixel, segment, [], [neighbor_seg])
+                return True
+        # if multiple, try pick single aligned pixel
+        aligned_hits = [p for p in pix_hits if aligned(p)]
+        if len(aligned_hits) == 1 and len(seg_hits) == 0:
+            self.pixels.remove(aligned_hits[0])
+            segment.append(aligned_hits[0])
+            self.walk_segment(segment)
+            return True
+        return False
+
     def walk_segment(self, segment: List[Tuple[int, int]]) -> None:
         """
         Single-step walker. Modified fallthroughs:
@@ -124,6 +185,9 @@ class LineSegmentsFinder:
 
             # If nothing remains after merge checks -> DROP the partial (cut back to split)
             if len(orthogonally_connected) == 0 and len(ortho_connected_segments) == 0:
+                # small-gap closure attempt before dropping
+                if self._try_gap_bridge(segment):
+                    return
                 return
 
             # If merges produced finished pieces, store them
@@ -161,6 +225,8 @@ class LineSegmentsFinder:
 
             # If nothing left after checks → DROP partial
             if len(diagonally_connected) == 0 and len(diagonal_connected_segments) == 0:
+                if self._try_gap_bridge(segment):
+                    return
                 return
 
             if finished_segments:
@@ -174,7 +240,9 @@ class LineSegmentsFinder:
             self.extend_segment(this_pixel, segment, diagonally_connected, diagonal_connected_segments)
             return
 
-        # Truly nothing to do in any direction -> DROP partial
+        # Truly nothing to do in any direction -> try small-gap closure, else DROP partial
+        if self._try_gap_bridge(segment):
+            return
         return
 
     def check_connected_segments(self,
@@ -253,9 +321,8 @@ class LineSegmentsFinder:
                 cont_segs_diag = self.filter_connected_segments(cont_segs_diag, seg2)
 
             has_continuation = (
-                                       len(cont_pixels_ortho) + len(cont_segs_ortho) + len(cont_pixels_diag) + len(
-                                   cont_segs_diag)
-                               ) > 0
+                len(cont_pixels_ortho) + len(cont_segs_ortho) + len(cont_pixels_diag) + len(cont_segs_diag)
+            ) > 0
 
             # If seg2 can continue from its tail, mark it finished up to tail and queue new growth
             if has_continuation:
