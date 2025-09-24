@@ -3,6 +3,8 @@ import cv2
 from typing import List, Tuple, Optional
 from pathlib import Path
 
+# TODO: Dropped segments check if they can be mapped to outer lobule
+# TODO: Then drop dead branches
 
 def _ensure_closed_polyline(seg: List[Tuple[int, int]], max_gap2: int = 2) -> Optional[np.ndarray]:
     """

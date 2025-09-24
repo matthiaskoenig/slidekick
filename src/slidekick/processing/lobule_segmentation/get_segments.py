@@ -19,8 +19,6 @@ from matplotlib import pyplot as plt
 # - check_connected_segments only marks neighbor segments finished up to their tail
 #   and QUEUES new growth from their tails; it does not force-finish the current segment.
 
-# TODO: Dropped segments check if they can be mapped to outer lobule
-
 class LineSegmentsFinder:
     def __init__(self, pixels: List[Tuple[int, int]], image_shape: Tuple[int, int]):
         # store pixels as a SET of tuples -> O(1) membership/removal

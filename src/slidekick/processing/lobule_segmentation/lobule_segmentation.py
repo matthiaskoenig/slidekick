@@ -20,7 +20,7 @@ from slidekick.io import save_tif
 
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
 from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
-from slidekick.processing.lobule_segmentation.process_segments import process_segments_to_mask
+from slidekick.processing.lobule_segmentation.segments_to_mask import process_segments_to_mask
 from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
     downsample_to_max_side, render_cluster_gray, nonlinear_channel_weighting
