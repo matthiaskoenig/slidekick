@@ -31,7 +31,7 @@ def _ensure_closed_polyline(seg: List[Tuple[int, int]], max_gap2: int = 2) -> Op
 
 def _colorize_labels(mask: np.ndarray) -> np.ndarray:
     """
-    Quick pseudo-color for a label mask (H,W), uint16 → RGB uint8 for debugging.
+    Quick pseudo-color for a label mask (H,W), uint16 -> RGB uint8 for debugging.
     """
     h, w = mask.shape[:2]
     out = np.zeros((h, w, 3), dtype=np.uint8)
@@ -121,7 +121,7 @@ def process_segments_to_mask(
     # lab: 0..num-1, where 0 is background per OpenCV (but our 'free' uses 1=free)
 
     if num <= 1:
-        # No free-space components other than background → return empty
+        # No free-space components other than background -> return empty
         mask_empty = np.zeros((H, W), dtype=np.uint16)
         if report_path is not None:
             cv2.imwrite(str(report_path / "polygon_mask.png"), mask_empty)

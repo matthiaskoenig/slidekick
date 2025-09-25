@@ -600,7 +600,7 @@ class LobuleSegmentor(BaseOperator):
                 ext_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(ext_mask, [cnt], -1, 255, thickness=cv2.FILLED)
 
-                # ensure adjacency to background → “open” ring
+                # ensure adjacency to background -> “open” ring
                 border_contact = cv2.dilate((bg_bool.astype(np.uint8) * 255), se)
                 if float(np.mean((border_contact > 0)[ext_mask > 0])) < 0.10:
                     continue

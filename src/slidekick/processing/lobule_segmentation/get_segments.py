@@ -223,7 +223,7 @@ class LineSegmentsFinder:
                 diagonal_connected_segments, this_pixel, segment, diagonally_connected
             )
 
-            # If nothing left after checks → DROP partial
+            # If nothing left after checks -> DROP partial
             if len(diagonally_connected) == 0 and len(diagonal_connected_segments) == 0:
                 if self._try_gap_bridge(segment):
                     return
@@ -452,17 +452,17 @@ class LineSegmentsFinder:
         - 1 next pixel   -> extend and continue walking.
         - >1 next pixels -> mark node, finish current partial here, and fork.
         """
-        # 0 next pixels → dead tail; drop it so we "return to last split"
+        # 0 next pixels -> dead tail; drop it so we "return to last split"
         if len(connected_pixels) == 0:
             return
 
-        # 1 next pixel → extend inline and continue
+        # 1 next pixel -> extend inline and continue
         if len(connected_pixels) == 1:
             segment.append(connected_pixels[0])
             self.walk_segment(segment)
             return
 
-        # >1 next pixels → split: finish current partial and queue branches
+        # >1 next pixels -> split: finish current partial and queue branches
         self.nodes.append(this_pixel)
         self.segments_finished.append(segment)
         for p in connected_pixels:
