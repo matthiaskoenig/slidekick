@@ -66,7 +66,7 @@ class LobuleSegmentor(BaseOperator):
                  vessel_merge_dist_px: int = 12,
                  vessel_merge_intensity_drop_max: float = 12.0,
                  vessel_merge_profile_steps: int = 21,
-                 min_area_px: int = 5000):
+                 min_area_px: int = 15000):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
