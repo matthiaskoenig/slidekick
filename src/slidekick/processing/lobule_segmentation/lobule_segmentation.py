@@ -981,7 +981,12 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Creating segmentation mask...", style="info")
 
         # Step 9: Creating lobule and vessel polygons from line segments and vessel contours
-        mask = process_segments_to_mask(line_segments, thinned.shape, report_path=report_path, min_area_px=self.min_area_px)
+        mask = process_segments_to_mask(line_segments, thinned.shape,
+                                        cv_contours=[cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0],
+                                        portal_contours=[cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 1],
+            report_path=report_path,
+            min_area_px=self.min_area_px
+        )
 
         # Crop mask by padding
         mask_cropped = mask[pad:-pad, pad:-pad]
