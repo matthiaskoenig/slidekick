@@ -1,345 +1,242 @@
-from typing import List, Tuple, Optional, Dict
-
-import cv2
+# segments_to_mask.py
 import numpy as np
+import cv2
+from typing import List, Tuple, Optional
 from pathlib import Path
 
 
-def _colorize_labels(mask: np.ndarray) -> np.ndarray:
-    """Colorize an instance-labeled mask for quick visualization."""
-    h, w = mask.shape[:2]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    labels = np.unique(mask)
-    labels = labels[labels != 0]
-    if labels.size == 0:
-        return out
-    rng = np.random.default_rng(12345)
-    colors = {int(lb): rng.integers(64, 256, size=3, dtype=np.uint8) for lb in labels}
-    # robust per-channel assignment avoids boolean indexing shape pitfalls
-    for lb in labels:
-        m = (mask == int(lb))
-        clr = colors[int(lb)]
-        out[..., 0][m] = clr[0]
-        out[..., 1][m] = clr[1]
-        out[..., 2][m] = clr[2]
-    return out
+def _neighbors8(r: int, c: int, H: int, W: int):
+    r0 = max(0, r - 1)
+    r1 = min(H - 1, r + 1)
+    c0 = max(0, c - 1)
+    c1 = min(W - 1, c + 1)
+    for rr in range(r0, r1 + 1):
+        for cc in range(c0, c1 + 1):
+            if rr == r and cc == c:
+                continue
+            yield rr, cc
+
+
+def _rasterize_skeleton(segments: Optional[List[np.ndarray]], shape: Tuple[int, int]) -> np.ndarray:
+    H, W = map(int, shape)
+    sk = np.zeros((H, W), dtype=np.uint8)
+    if not segments:
+        return sk
+    for seg in segments:
+        if seg is None or len(seg) < 2:
+            continue
+        pts = np.asarray(seg, dtype=float)
+        for i in range(len(pts) - 1):
+            r0, c0 = pts[i]
+            r1, c1 = pts[i + 1]
+            cv2.line(sk, (int(c0), int(r0)), (int(c1), int(r1)), 255, 1, lineType=cv2.LINE_8)
+    return sk
+
+
+def _degree_map(skel01: np.ndarray) -> np.ndarray:
+    k = np.ones((3, 3), dtype=np.uint8)
+    conv = cv2.filter2D(skel01.astype(np.uint8), ddepth=cv2.CV_16S, kernel=k, borderType=cv2.BORDER_CONSTANT)
+    deg = (conv - skel01.astype(np.int16)).astype(np.int16)
+    return deg
+
+
+def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tuple[int, np.ndarray]:
+    if close_iter > 0:
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        closed = (skel01.astype(np.uint8) * 255).copy()
+        for _ in range(close_iter):
+            closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, se, iterations=1)
+    else:
+        closed = (skel01.astype(np.uint8) * 255).copy()
+
+    bg = (closed == 0).astype(np.uint8)
+    num_labels, lab = cv2.connectedComponents(bg, connectivity=4)
+
+    H, W = lab.shape
+    border_ids = set(np.unique(np.r_[lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]]))
+    keep = np.ones(num_labels, dtype=bool)
+    for bid in border_ids:
+        keep[bid] = False
+    keep[0] = False
+
+    remap = np.zeros(num_labels, dtype=np.int32)
+    nid = 1
+    for i in range(1, num_labels):
+        if keep[i]:
+            remap[i] = nid
+            nid += 1
+    holes_lab = remap[lab]
+    num_holes = nid - 1
+    return num_holes, holes_lab
 
 
 def process_segments_to_mask(
-        segments: List[List[Tuple[int, int]]],
-        image_shape: Tuple[int, int],
-        cv_contours: Optional[List[np.ndarray]] = None,
-        portal_contours: Optional[List[np.ndarray]] = None,
-        report_path: Optional[Path] = None,
-        min_area_px: int = 50,
+    segments: Optional[List[np.ndarray]],
+    image_shape: Tuple[int, int],
+    cv_contours: Optional[List[np.ndarray]] = None,
+    report_path: Optional[str] = None,
+    min_area_px: int = 50,
+    L_MIN: Optional[int] = None,
+    node_scope: str = "removed",
 ) -> np.ndarray:
-    """
-    Convert segments into closed-loop instances. Save a debug overlay.
-    """
-    H, W = int(image_shape[0]), int(image_shape[1])
-    if H <= 0 or W <= 0:
-        raise ValueError("image_shape must be positive (H, W)")
+    H, W = map(int, image_shape)
 
-    # Rasterize 1px wall and thicken slightly
-    wall = np.zeros((H, W), dtype=np.uint8)
-    for seg in segments:
-        if len(seg) < 2:
-            continue
-        pts_xy = np.array([[c, r] for (r, c) in seg], dtype=np.int32).reshape(-1, 1, 2)
-        r0, c0 = seg[0]
-        r1, c1 = seg[-1]
-        is_close = (r0 - r1) ** 2 + (c0 - c1) ** 2 <= 2
-        cv2.polylines(wall, [pts_xy], isClosed=(len(seg) >= 4 and is_close), color=255, thickness=1, lineType=cv2.LINE_8)
-        for (rA, cA), (rB, cB) in zip(seg[:-1], seg[1:]):
-            cv2.line(wall, (int(cA), int(rA)), (int(cB), int(rB)), color=255, thickness=1, lineType=cv2.LINE_8)
+    base_skeleton = _rasterize_skeleton(segments, (H, W))
+    base_skeleton = (base_skeleton > 0).astype(np.uint8)
 
-    wall_thin = wall.copy()
-    if np.any(wall):
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        wall = cv2.dilate(wall, k, iterations=1)
+    num_holes, holes_lab = _holes_from_closed_skeleton(base_skeleton, close_iter=1)
 
-    if report_path is not None:
-        Path(report_path).mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(Path(report_path) / "segments_raster.png"), wall)
-
-    # Connected components on free space
-    free = (wall == 0).astype(np.uint8)
-    num, lab = cv2.connectedComponents(free, connectivity=8)
-
-    # Debug overlay: all detected loop segments in red, kept paths in cyan, removed overlay in magenta
-    loop_filtering(segments, lab, num, cv_contours, portal_contours, min_area_px, report_path, wall_thin)
-
-    if num <= 1:
-        return np.zeros((H, W), dtype=np.uint16)
-
-    # Keep components not touching border
-    border_labels = np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]]))
-    keep_mask = np.ones(num, dtype=bool)
-    keep_mask[0] = False
-    keep_mask[border_labels] = False
-
-    remap = np.zeros(num, dtype=np.uint16)
-    nid = 1
-    for lbl in range(1, num):
-        if keep_mask[lbl]:
-            remap[lbl] = np.uint16(nid)
-            nid += 1
-    instance = remap[lab]
-
-    if report_path is not None:
-        cv2.imwrite(str(Path(report_path) / "polygon_mask.png"), _colorize_labels(instance))
-        np.save(str(Path(report_path) / "polygon_mask_labels.npy"), instance)
-
-    return instance
-
-
-def loop_filtering(
-        segments: List[List[Tuple[int, int]]],
-        lab: np.ndarray,
-        num: int,
-        cv_contours: Optional[List[np.ndarray]],
-        portal_contours: Optional[List[np.ndarray]],
-        min_area_px: int,
-        report_path: Optional[Path],
-        wall_thin: Optional[np.ndarray] = None,
-) -> None:
-    """
-    Visualization only.
-    Red: all loop-forming segments.
-    Cyan: new kept paths.
-    Magenta: overlay for loops that get removed.
-    """
-    if report_path is None:
-        return
-
-    H, W = lab.shape[:2]
-
-    # Central-vein mask from contours
     cv_mask = np.zeros((H, W), dtype=np.uint8)
     if cv_contours:
         try:
-            cv2.drawContours(cv_mask, cv_contours, -1, 255, thickness=cv2.FILLED)
+            cv2.drawContours(cv_mask, cv_contours, contourIdx=-1, color=255, thickness=cv2.FILLED, lineType=cv2.LINE_8)
         except Exception:
-            cv_cnts = [np.asarray(c, dtype=np.int32) for c in cv_contours]
-            cv2.drawContours(cv_mask, cv_cnts, -1, 255, thickness=cv2.FILLED)
+            cv_cnts = [np.asarray(cnt, dtype=np.int32) for cnt in cv_contours]
+            cv2.drawContours(cv_mask, cv_cnts, contourIdx=-1, color=255, thickness=cv2.FILLED, lineType=cv2.LINE_8)
 
-    # Identify border-touching labels
-    border_ids = np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]]))
-
-    # Areas per label
-    num_labels = int(lab.max()) + 1 if num is None else int(num)
-    areas = np.bincount(lab.ravel(), minlength=num_labels)
-
-    # Inner component ids
-    inner_ids = [i for i in range(1, num_labels) if (i not in border_ids and np.any(lab == i))]
-
-    # Removal set
+    keep_label = np.zeros(num_holes + 1, dtype=bool)
     removed_ids: List[int] = []
-    for i in inner_ids:
-        region_bool = (lab == i)
-        area = int(areas[i])
-        has_cv = bool(np.any(cv_mask[region_bool]))
-        if area < max(1, int(min_area_px)) or (not has_cv):
-            removed_ids.append(i)
-
-    # Prepare overlay
-    canvas = np.zeros((H, W, 3), dtype=np.uint8)
-
-    # Build rings and regions for all inner labels
-    ring_dilate = 2
-    se1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    se_d = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_dilate + 1, 2 * ring_dilate + 1))
-
-    rings: Dict[int, np.ndarray] = {}
-    ring_dists: Dict[int, np.ndarray] = {}
-    regions: Dict[int, np.ndarray] = {}
-    bboxes: Dict[int, Tuple[int, int, int, int]] = {}
-
-    for cid in inner_ids:
-        region_u8 = (lab == cid).astype(np.uint8) * 255
-        ring = cv2.morphologyEx(region_u8, cv2.MORPH_GRADIENT, se1)
-        ring = cv2.dilate(ring, se_d, iterations=1)
-        rings[cid] = ring
-        ring_dists[cid] = cv2.distanceTransform(255 - (ring > 0).astype(np.uint8) * 255, cv2.DIST_L2, 3)
-        regions[cid] = region_u8
-        ys, xs = np.where(ring > 0)
-        if ys.size == 0:
-            bboxes[cid] = (0, 0, -1, -1)
+    for hid in range(1, num_holes + 1):
+        region = (holes_lab == hid)
+        area = int(region.sum())
+        has_cv = bool((cv_mask[region] > 0).any())
+        if area >= int(min_area_px) and has_cv:
+            keep_label[hid] = True
         else:
-            bboxes[cid] = (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
+            removed_ids.append(hid)
 
-    # Precompute segment arrays and bboxes
-    seg_coords: List[Optional[np.ndarray]] = []
-    seg_bboxes: List[Tuple[int, int, int, int]] = []
-    for seg in segments:
-        if not seg or len(seg) < 2:
-            seg_coords.append(None)
-            seg_bboxes.append((0, 0, -1, -1))
+    thin_bool = base_skeleton.astype(bool)
+    deg = _degree_map(base_skeleton)
+
+    side = min(H, W)
+    L_MIN_auto = max(6, int(round(0.0025 * side))) if L_MIN is None else int(L_MIN)
+    SHORT_LEN = max(3, int(round(0.0010 * side)))
+    L_VIS = max(L_MIN_auto, SHORT_LEN)
+
+    se3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k3 = np.ones((3, 3), dtype=np.uint8)
+
+    canvas = np.zeros((H, W, 3), dtype=np.uint8)
+    canvas[thin_bool] = (150, 150, 150)
+
+    if node_scope == "removed":
+        loop_ids = removed_ids
+    elif node_scope == "kept":
+        loop_ids = [i for i in range(1, num_holes + 1) if keep_label[i]]
+    else:
+        loop_ids = list(range(1, num_holes + 1))
+
+    node_points: List[Tuple[int, int]] = []
+
+    # Precompute ring for all loops to allow stopping BFS when touching any loop
+    all_rings = np.zeros((H, W), dtype=np.uint8)
+    for hid in range(1, num_holes + 1):
+        region_i = (holes_lab == hid).astype(np.uint8) * 255
+        ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)
+        all_rings |= (ring_i > 0).astype(np.uint8)
+
+    for hid in loop_ids:
+        region = (holes_lab == hid).astype(np.uint8) * 255
+        if region.sum() == 0:
             continue
-        arr = np.array(seg, dtype=np.int32)
-        seg_coords.append(arr)
-        rmin = int(arr[:, 0].min())
-        rmax = int(arr[:, 0].max())
-        cmin = int(arr[:, 1].min())
-        cmax = int(arr[:, 1].max())
-        seg_bboxes.append((rmin, cmin, rmax, cmax))
 
-    def bbox_intersect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-        ar0, ac0, ar1, ac1 = a
-        br0, bc0, br1, bc1 = b
-        return not (ar1 < br0 or br1 < ar0 or ac1 < bc0 or bc1 < ac0)
+        ring_thin = cv2.morphologyEx(region, cv2.MORPH_GRADIENT, se3)
+        near_ring = cv2.dilate(ring_thin, se3, iterations=1) > 0
+        red_mask = thin_bool & (ring_thin > 0)
 
-    # Parameters
-    snap_dist = 1.5  # px distance to consider "on-boundary"
-    ring_overlap_frac = 0.80
-    min_overlap_px = 5
+        canvas[(ring_thin > 0)] = (0, 0, 255)
 
-    # Helper: cluster points within tol (Chebyshev radius in px)
-    def _cluster_points(pts: List[Tuple[int, int]], tol: int = 2) -> List[Tuple[int, int]]:
-        if len(pts) <= 1:
-            return pts
-        pts_arr = np.array(pts, dtype=np.int32)
+        junction = (deg >= 3)
+        walkable = thin_bool & (~near_ring)
+        walkable_n = cv2.filter2D(walkable.astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT)
+
+        cand = junction & near_ring & (walkable_n > 0)
+        diag_touch = (deg == 2) & near_ring & (walkable_n > 0)
+        cand |= diag_touch
+
+        # connectivity seeds: walkable pixels that touch near_ring
+        touch_near = cv2.filter2D((near_ring > 0).astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT) > 0
+        seeds = walkable & touch_near
+
+        # BFS from seeds limited by L_VIS and stopping when hitting any loop ring
+        visited = np.zeros((H, W), dtype=np.uint8)
+        sr, sc = np.where(seeds)
+        q = [(int(r), int(c), 0) for r, c in zip(sr, sc)]
+        for r, c, _ in q:
+            visited[r, c] = 1
+        while q:
+            pr, pc, d = q.pop(0)
+            if d >= L_VIS:
+                continue
+            for nr, nc in _neighbors8(pr, pc, H, W):
+                if visited[nr, nc]:
+                    continue
+                if not walkable[nr, nc]:
+                    continue
+                if all_rings[nr, nc]:
+                    continue
+                visited[nr, nc] = 1
+                q.append((nr, nc, d + 1))
+
+        canvas[visited.astype(bool)] = (0, 0, 255)
+
+        rr, cc = np.where(cand)
+        for r, c in zip(rr, cc):
+            nbrs = [(rr2, cc2) for rr2, cc2 in _neighbors8(r, c, H, W) if walkable[rr2, cc2]]
+            if not nbrs:
+                continue
+
+            q = [(rr2, cc2, 1) for rr2, cc2 in nbrs]
+            seen = set([(r, c)] + [(rr2, cc2) for rr2, cc2 in nbrs])
+            best_d = 0
+            accept = False
+
+            while q and not accept:
+                pr, pc, d = q.pop(0)
+                best_d = max(best_d, d)
+                if d >= L_MIN_auto:
+                    accept = True
+                    break
+                for nr, nc in _neighbors8(pr, pc, H, W):
+                    if not walkable[nr, nc]:
+                        continue
+                    if (nr, nc) in seen:
+                        continue
+                    seen.add((nr, nc))
+                    q.append((nr, nc, d + 1))
+
+            if accept or best_d >= SHORT_LEN:
+                node_points.append((r, c))
+
+    if len(node_points) > 0:
+        pts = np.array(node_points, dtype=np.int32)
+        cluster_r = 3 if side >= 256 else 2
         used = np.zeros(len(pts), dtype=bool)
-        centers: List[Tuple[int, int]] = []
         for i in range(len(pts)):
             if used[i]:
                 continue
-            pi = pts_arr[i]
-            d = np.max(np.abs(pts_arr - pi), axis=1)  # Chebyshev
-            group = np.where((d <= tol) & (~used))[0]
-            used[group] = True
-            cen = np.mean(pts_arr[group], axis=0).astype(int)
-            centers.append((int(cen[0]), int(cen[1])))
-        return centers
+            p = pts[i]
+            dcheb = np.max(np.abs(pts - p), axis=1)
+            grp = np.where((dcheb <= cluster_r) & (~used))[0]
+            used[grp] = True
+            r, c = np.mean(pts[grp], axis=0).astype(int)
+            cv2.drawMarker(
+                canvas,
+                (int(c), int(r)),
+                (0, 255, 255),
+                markerType=cv2.MARKER_TILTED_CROSS,
+                markerSize=9,
+                thickness=2,
+                line_type=cv2.LINE_8,
+            )
 
-    # Helper: draw path along contour indices i..j going forward (cyan)
-    def _draw_arc(cnt_xy: np.ndarray, i: int, j: int) -> None:
-        N = len(cnt_xy)
-        if N < 2:
-            return
-        idxs = []
-        k = i
-        while True:
-            idxs.append(k)
-            if k == j:
-                break
-            k = (k + 1) % N
-        for a, b in zip(idxs[:-1], idxs[1:]):
-            x1, y1 = int(cnt_xy[a, 0]), int(cnt_xy[a, 1])
-            x2, y2 = int(cnt_xy[b, 0]), int(cnt_xy[b, 1])
-            cv2.line(canvas, (x1, y1), (x2, y2), (255, 255, 0), 1, lineType=cv2.LINE_8)
+    if report_path is not None:
+        cv2.imwrite(str(Path(report_path) / "filtered_loops.png"), canvas)
 
-    # Draw loop-forming segments for all inner labels in red. Overlay magenta where removed.
-    connectors_by_rid: Dict[int, List[Dict]] = {rid: [] for rid in removed_ids}
-
-    for cid in inner_ids:
-        rb = bboxes[cid]
-        if rb[2] < rb[0] or rb[3] < rb[1]:
-            continue
-        dist = ring_dists[cid]
-
-        for sid, arr in enumerate(seg_coords):
-            if arr is None:
-                continue
-            if not bbox_intersect(seg_bboxes[sid], rb):
-                continue
-
-            rs = arr[:, 0].clip(0, H - 1)
-            cs = arr[:, 1].clip(0, W - 1)
-            d = dist[rs, cs]
-            on = d <= snap_dist
-            L = int(len(arr))
-            hits = int(on.sum())
-            if L == 0:
-                continue
-
-            # Segment on loop boundary -> draw red baseline
-            if on[0] and on[-1] and hits >= min_overlap_px and (hits / float(L)) >= ring_overlap_frac:
-                seg = segments[sid]
-                for (rA, cA), (rB, cB) in zip(seg[:-1], seg[1:]):
-                    # red (BGR)
-                    cv2.line(canvas, (int(cA), int(rA)), (int(cB), int(rB)), (0, 0, 255), 1, lineType=cv2.LINE_8)
-                    # overlay magenta if this loop is slated for removal
-                    if cid in removed_ids:
-                        cv2.line(canvas, (int(cA), int(rA)), (int(cB), int(rB)), (255, 0, 255), 1, lineType=cv2.LINE_8)
-                continue
-
-            # Connector: exactly one endpoint on the ring
-            if cid in removed_ids and (on[0] ^ on[-1]):
-                near_end = 0 if on[0] else -1
-                far_end = -1 if on[0] else 0
-                node_rc = (int(arr[near_end, 0]), int(arr[near_end, 1]))
-                far_rc = (int(arr[far_end, 0]), int(arr[far_end, 1]))
-
-                # classify whether the far end is on any removed ring
-                to_removed = False
-                for rid2 in removed_ids:
-                    dist2 = ring_dists[rid2]
-                    if dist2[min(max(far_rc[0], 0), H - 1), min(max(far_rc[1], 0), W - 1)] <= snap_dist:
-                        to_removed = True
-                        break
-
-                connectors_by_rid[cid].append({
-                    "segment_id": int(sid),
-                    "node": node_rc,
-                    "far": far_rc,
-                    "to_removed": bool(to_removed),
-                })
-
-    # For each removed loop, compute cyan kept path using the two-node rule
-    for rid in removed_ids:
-        region_u8 = regions[rid]
-
-        # Nodes = unique connector touch points
-        nodes_raw = [d["node"] for d in connectors_by_rid[rid]]
-        node_pts = _cluster_points(nodes_raw, tol=2)
-
-        if len(node_pts) < 2:
-            continue
-
-        if len(node_pts) == 2:
-            # Extract outer contour for arc measurement
-            cnts, _ = cv2.findContours(region_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            if not cnts:
-                continue
-            areas_cnt = [cv2.contourArea(c) for c in cnts]
-            cnt = cnts[int(np.argmax(areas_cnt))]
-            pts_xy = cnt[:, 0, :]  # (N,2) x,y
-
-            def nearest_idx(node_rc: Tuple[int, int]) -> int:
-                r, c = node_rc
-                dx = pts_xy[:, 0] - c
-                dy = pts_xy[:, 1] - r
-                return int(np.argmin(dx * dx + dy * dy))
-
-            i0 = nearest_idx(node_pts[0])
-            i1 = nearest_idx(node_pts[1])
-
-            dif = np.diff(pts_xy, axis=0, append=pts_xy[:1, :])
-            edge = np.sqrt((dif[:, 0] ** 2 + dif[:, 1] ** 2).astype(np.float64))
-            perim = float(edge.sum())
-
-            def arc_len_forward(a: int, b: int) -> float:
-                if a == b:
-                    return 0.0
-                if b >= a:
-                    return float(edge[a:b].sum())
-                else:
-                    return float(edge[a:].sum() + edge[:b].sum())
-
-            L1 = arc_len_forward(i0, i1)
-            L2 = max(perim - L1, 0.0)
-
-            if max(L1, L2) > 1.10 * min(L1, L2):
-                if L1 <= L2:
-                    _draw_arc(pts_xy, i0, i1)
-                else:
-                    _draw_arc(pts_xy, i1, i0)
-            else:
-                p0 = (int(pts_xy[i0, 0]), int(pts_xy[i0, 1]))
-                p1 = (int(pts_xy[i1, 0]), int(pts_xy[i1, 1]))
-                cv2.line(canvas, p0, p1, (255, 255, 0), 1, lineType=cv2.LINE_8)
-
-    # Save overlay
-    Path(report_path).mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(Path(report_path) / "filtered_loops.png"), canvas)
+    if num_holes == 0:
+        return np.zeros((H, W), dtype=np.uint16)
+    remap = np.zeros(num_holes + 1, dtype=np.uint16)
+    for hid in range(1, num_holes + 1):
+        remap[hid] = hid
+    instance = remap[holes_lab].astype(np.uint16)
+    return instance
