@@ -4,7 +4,7 @@ from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 
 
-RING_SAMPLE_STEP = 3  # subsample contour points when mapping loop→segments (>=1). 1 = no subsampling.
+RING_SAMPLE_STEP = 3  # subsample contour points when mapping loop->segments (>=1). 1 = no subsampling.
 
 
 def _neighbors8(r: int, c: int, H: int, W: int):
@@ -232,10 +232,10 @@ def process_segments_to_mask(
         region_i = (holes_lab == hid).astype(np.uint8) * 255
         ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)  # thin ring
         ring_cache[hid] = ring_i
-        near_ring_cache[hid] = cv2.dilate(ring_i, se3, iterations=1) > 0  # NOTE: from ring_i, not region_i
+        near_ring_cache[hid] = cv2.dilate(ring_i, se3, iterations=1) > 0  # from ring_i
         all_rings |= (ring_i > 0).astype(np.uint8)
 
-    # 6) Global DT labels for loop→segment mapping
+    # 6) Global DT labels for loop->segment mapping
     inv = np.where(base_skeleton01 > 0, 0, 255).astype(np.uint8)
     _, labels = cv2.distanceTransformWithLabels(
         inv, distanceType=cv2.DIST_L2, maskSize=3, labelType=cv2.DIST_LABEL_PIXEL
@@ -246,6 +246,7 @@ def process_segments_to_mask(
 
     # 7) Visuals and mappings
     node_points: List[Tuple[int, int]] = []
+    nodes_by_loop: Dict[int, List[Tuple[int, int]]] = {}  # per-loop raw node detections
 
     for hid in range(1, num_holes + 1):
         ring_thin = ring_cache[hid]
@@ -256,7 +257,7 @@ def process_segments_to_mask(
             ring_on_skel = thin_bool & near_ring
             canvas[ring_on_skel] = (0, 0, 255)
 
-        # loop→segment mapping (uses geometric ring, independent of red drawing)
+        # loop->segment mapping (uses geometric ring, independent of red drawing)
         ordered_seg_ids = _ordered_loop_segments_voronoi(
             ring_thin, labels, S_idx, W, sample_step=max(1, int(RING_SAMPLE_STEP))
         )
@@ -332,6 +333,7 @@ def process_segments_to_mask(
                     q2.append((nr, nc, d + 1))
             if accept or best_d >= SHORT_LEN:
                 node_points.append((r, c))
+                nodes_by_loop.setdefault(hid, []).append((r, c))
 
     # cluster and draw node markers
     if len(node_points) > 0:
@@ -352,9 +354,41 @@ def process_segments_to_mask(
                 (0, 255, 255),
                 markerType=cv2.MARKER_TILTED_CROSS,
                 markerSize=9,
-                thickness=2,
+                thickness=1,
                 line_type=cv2.LINE_8,
             )
+
+    # cluster nodes per loop to avoid duplicate counting around the same junction
+    cluster_r = 3 if side >= 256 else 2
+    cluster_counts: Dict[int, int] = {}
+    for hid, pts_list in nodes_by_loop.items():
+        if not pts_list:
+            cluster_counts[hid] = 0
+            continue
+        arr = np.asarray(pts_list, dtype=np.int32)
+        used = np.zeros(len(arr), dtype=bool)
+        count = 0
+        for i in range(len(arr)):
+            if used[i]:
+                continue
+            p = arr[i]
+            dcheb = np.max(np.abs(arr - p), axis=1)
+            grp = np.where((dcheb <= cluster_r) & (~used))[0]
+            used[grp] = True
+            count += 1
+        cluster_counts[hid] = count
+
+    # connectivity from loop->segment mapping
+    conn_counts: Dict[int, int] = {hid: len(loop2seg.get(hid, [])) for hid in ring_scope_ids}
+
+    # Flag only when both are small: <2 clustered nodes AND <2 connected segments
+    few_node_ids = [
+        hid for hid in ring_scope_ids
+        if (cluster_counts.get(hid, 0) < 2) and (conn_counts.get(hid, 0) < 2)
+    ]
+    for hid in few_node_ids:
+        ring_on_skel = thin_bool & near_ring_cache[hid]
+        canvas[ring_on_skel] = (255, 0, 255)  # solid magenta
 
     # 8) Persist debug artifacts
     if report_path is not None:
