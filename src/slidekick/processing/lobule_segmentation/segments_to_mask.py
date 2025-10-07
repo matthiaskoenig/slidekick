@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
+import json
 
 
 RING_SAMPLE_STEP = 3  # subsample contour points when mapping loop->segments (>=1). 1 = no subsampling.
@@ -20,7 +21,6 @@ def _neighbors8(r: int, c: int, H: int, W: int):
 
 
 def _degree_map(skel01: np.ndarray) -> np.ndarray:
-    # 8-neighborhood degree for each skeleton pixel.
     k = np.ones((3, 3), dtype=np.uint8)
     conv = cv2.filter2D(skel01.astype(np.uint8), ddepth=cv2.CV_16S, kernel=k, borderType=cv2.BORDER_CONSTANT)
     deg = (conv - skel01.astype(np.int16)).astype(np.int16)
@@ -28,8 +28,6 @@ def _degree_map(skel01: np.ndarray) -> np.ndarray:
 
 
 def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tuple[int, np.ndarray]:
-    # Close tiny gaps on the 1-px skeleton, label background components,
-    # and return interior “hole” labels as 1..num_holes.
     if close_iter > 0:
         se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         closed = (skel01.astype(np.uint8) * 255).copy()
@@ -46,7 +44,7 @@ def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tupl
     keep = np.ones(num_labels, dtype=bool)
     for bid in border_ids:
         keep[bid] = False
-    keep[0] = False  # background id
+    keep[0] = False
 
     remap = np.zeros(num_labels, dtype=np.int32)
     nid = 1
@@ -63,13 +61,6 @@ def _rasterize_and_index(
     segments: Optional[List[np.ndarray]],
     shape: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build 1-px skeleton and per-pixel segment index in a single pass.
-
-    Returns:
-      skel01  : uint8 binary skeleton {0,1}
-      S_idx   : int32 image with the first segment id drawn at each pixel, or -1 if none
-    """
     H, W = map(int, shape)
     skel01 = np.zeros((H, W), dtype=np.uint8)
     S_idx = np.full((H, W), -1, dtype=np.int32)
@@ -112,12 +103,6 @@ def _ordered_loop_segments_voronoi(
     W: int,
     sample_step: int = 1,
 ) -> List[int]:
-    """
-    Map the loop ring pixels to an ordered, run-length-compressed list of segment ids
-    using a single global distanceTransformWithLabels result.
-
-    labels: int32; cv2.DIST_LABEL_PIXEL. For a non-zero pixel, labels[r,c] = (y*W + x) + 1 of the closest zero pixel.
-    """
     contours, _ = cv2.findContours(ring_thin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return []
@@ -170,19 +155,20 @@ def process_segments_to_mask(
 ) -> np.ndarray:
     """
     Debug overlay and hole-instance label map.
-    Visuals: skeleton (grey), loop boundary drawn on skeleton (red) but only for scoped loops, candidate nodes (yellow).
-    Segmentation output unchanged. Writes loop2seg/seg2loops if report_path is set.
+      grey   = original skeleton
+      red    = segments of loops to be treated
+      magenta= treated segments slated for deletion
+      cyan   = treated segments kept
+      white  = segments of other loops kept as is
+      orange = dead branches after deletion (disabled here)
     """
     H, W = map(int, image_shape)
 
-    # 1) Skeleton + per-pixel segment index
     base_skeleton01, S_idx = _rasterize_and_index(segments, (H, W))
     thin_bool = base_skeleton01.astype(bool)
 
-    # 2) Holes from closed skeleton
     num_holes, holes_lab = _holes_from_closed_skeleton(base_skeleton01, close_iter=1)
 
-    # 3) Vessel mask for gating
     cv_mask = np.zeros((H, W), dtype=np.uint8)
     if cv_contours:
         try:
@@ -202,7 +188,6 @@ def process_segments_to_mask(
         else:
             removed_ids.append(hid)
 
-    # 4) Viz scaffolding
     deg = _degree_map(base_skeleton01)
 
     side = min(H, W)
@@ -214,9 +199,8 @@ def process_segments_to_mask(
     k3 = np.ones((3, 3), dtype=np.uint8)
 
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
-    canvas[thin_bool] = (150, 150, 150)  # skeleton in grey
+    canvas[thin_bool] = (150, 150, 150)
 
-    # which loops to show red + run BFS/node detection
     if node_scope == "removed":
         ring_scope_ids = removed_ids
     elif node_scope == "kept":
@@ -224,18 +208,16 @@ def process_segments_to_mask(
     else:
         ring_scope_ids = list(range(1, num_holes + 1))
 
-    # 5) Per-hole rings and union for BFS stop set
     all_rings = np.zeros((H, W), dtype=np.uint8)
     ring_cache: Dict[int, np.ndarray] = {}
     near_ring_cache: Dict[int, np.ndarray] = {}
     for hid in range(1, num_holes + 1):
         region_i = (holes_lab == hid).astype(np.uint8) * 255
-        ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)  # thin ring
+        ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)
         ring_cache[hid] = ring_i
-        near_ring_cache[hid] = cv2.dilate(ring_i, se3, iterations=1) > 0  # from ring_i
+        near_ring_cache[hid] = cv2.dilate(ring_i, se3, iterations=1) > 0
         all_rings |= (ring_i > 0).astype(np.uint8)
 
-    # 6) Global DT labels for loop->segment mapping
     inv = np.where(base_skeleton01 > 0, 0, 255).astype(np.uint8)
     _, labels = cv2.distanceTransformWithLabels(
         inv, distanceType=cv2.DIST_L2, maskSize=3, labelType=cv2.DIST_LABEL_PIXEL
@@ -244,20 +226,17 @@ def process_segments_to_mask(
     loop2seg: Dict[int, List[int]] = {}
     seg2loops: Dict[int, List[int]] = {}
 
-    # 7) Visuals and mappings
     node_points: List[Tuple[int, int]] = []
-    nodes_by_loop: Dict[int, List[Tuple[int, int]]] = {}  # per-loop raw node detections
+    nodes_by_loop: Dict[int, List[Tuple[int, int]]] = {}
 
     for hid in range(1, num_holes + 1):
         ring_thin = ring_cache[hid]
         near_ring = near_ring_cache[hid]
 
-        # draw red only for scoped loops; draw ON skeleton to avoid 1px offset
         if hid in ring_scope_ids:
             ring_on_skel = thin_bool & near_ring
             canvas[ring_on_skel] = (0, 0, 255)
 
-        # loop->segment mapping (uses geometric ring, independent of red drawing)
         ordered_seg_ids = _ordered_loop_segments_voronoi(
             ring_thin, labels, S_idx, W, sample_step=max(1, int(RING_SAMPLE_STEP))
         )
@@ -272,11 +251,9 @@ def process_segments_to_mask(
                 if not lst or lst[-1] != hid:
                     lst.append(hid)
 
-        # skip heavy work outside scope
         if hid not in ring_scope_ids:
             continue
 
-        # candidate node detection (original logic; uses near_ring from ring_thin)
         junction = (deg >= 3)
         walkable = thin_bool & (~near_ring)
         walkable_n = cv2.filter2D(walkable.astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT)
@@ -284,7 +261,6 @@ def process_segments_to_mask(
         diag_touch = (deg == 2) & near_ring & (walkable_n > 0)
         cand |= diag_touch
 
-        # limited BFS from seeds for debug wash
         touch_near = cv2.filter2D((near_ring > 0).astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT) > 0
         seeds = walkable & touch_near
         visited = np.zeros((H, W), dtype=np.uint8)
@@ -308,7 +284,6 @@ def process_segments_to_mask(
                     q.append((nr, nc, d + 1))
             canvas[visited.astype(bool)] = (0, 0, 255)
 
-        # accept/mark node pixels
         rr, cc = np.where(cand)
         for r, c in zip(rr, cc):
             nbrs = [(rr2, cc2) for rr2, cc2 in _neighbors8(r, c, H, W) if walkable[rr2, cc2]]
@@ -335,7 +310,6 @@ def process_segments_to_mask(
                 node_points.append((r, c))
                 nodes_by_loop.setdefault(hid, []).append((r, c))
 
-    # cluster and draw node markers
     if len(node_points) > 0:
         pts = np.array(node_points, dtype=np.int32)
         cluster_r = 3 if side >= 256 else 2
@@ -358,7 +332,6 @@ def process_segments_to_mask(
                 line_type=cv2.LINE_8,
             )
 
-    # cluster nodes per loop to avoid duplicate counting around the same junction
     cluster_r = 3 if side >= 256 else 2
     cluster_counts: Dict[int, int] = {}
     for hid, pts_list in nodes_by_loop.items():
@@ -378,25 +351,103 @@ def process_segments_to_mask(
             count += 1
         cluster_counts[hid] = count
 
-    # connectivity from loop->segment mapping
     conn_counts: Dict[int, int] = {hid: len(loop2seg.get(hid, [])) for hid in ring_scope_ids}
 
-    # Flag only when both are small: <2 clustered nodes AND <2 connected segments
     few_node_ids = [
         hid for hid in ring_scope_ids
         if (cluster_counts.get(hid, 0) < 2) and (conn_counts.get(hid, 0) < 2)
     ]
     for hid in few_node_ids:
         ring_on_skel = thin_bool & near_ring_cache[hid]
-        canvas[ring_on_skel] = (255, 0, 255)  # solid magenta
+        canvas[ring_on_skel] = (255, 0, 255)
 
-    # 8) Persist debug artifacts
+    catalog: Dict[str, set] = {
+        "all": set(),
+        "treated": set(),
+        "deleted": set(),
+        "kept_treated": set(),
+        "kept_other": set(),
+        "dead": set(),
+    }
+
+    if segments is not None:
+        catalog["all"] = set(range(len(segments)))
+    else:
+        catalog["all"] = set(int(s) for s in np.unique(S_idx) if s >= 0)
+
+    treated: set = set()
+    for hid in ring_scope_ids:
+        for sid in loop2seg.get(hid, []):
+            if sid >= 0:
+                treated.add(int(sid))
+    catalog["treated"] = treated
+
+    deleted: set = set()
+    for hid in few_node_ids:
+        for sid in loop2seg.get(hid, []):
+            if sid >= 0:
+                deleted.add(int(sid))
+    catalog["deleted"] = deleted
+
+    catalog["kept_treated"] = treated - deleted
+
+    other_loop_ids = [hid for hid in range(1, num_holes + 1) if hid not in ring_scope_ids]
+    other_loop_seg_ids: set = set()
+    for hid in other_loop_ids:
+        for sid in loop2seg.get(hid, []):
+            if sid >= 0:
+                other_loop_seg_ids.add(int(sid))
+    catalog["dead"] = set()  # branch removal disabled
+    catalog["kept_other"] = other_loop_seg_ids - treated
+
+    def _paint(seg_ids: set, bgr: Tuple[int, int, int]):
+        if not seg_ids:
+            return
+        m = np.isin(S_idx, np.fromiter(seg_ids, dtype=np.int32))
+        canvas[m] = bgr
+
+    _paint(catalog["kept_other"], (255, 255, 255))   # white
+    _paint(catalog["treated"], (0, 0, 255))          # red
+    _paint(catalog["kept_treated"], (255, 255, 0))   # cyan
+    _paint(catalog["deleted"], (255, 0, 255))        # magenta
+    _paint(catalog["dead"], (0, 165, 255))           # orange (none)
+
     if report_path is not None:
         outdir = Path(report_path)
         outdir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(outdir / "filtered_loops.png"), canvas)
 
-    # 9) Segmentation output unchanged
+        for key in ["all", "treated", "deleted", "kept_treated", "kept_other", "dead"]:
+            with open(outdir / f"segments_{key}.txt", "w") as f:
+                for sid in sorted(catalog[key]):
+                    f.write(f"{sid}\n")
+
+        with open(outdir / "segment_catalog.json", "w") as f:
+            json.dump({k: sorted(map(int, v)) for k, v in catalog.items()}, f, indent=2)
+
+        with open(outdir / "loop2seg.json", "w") as f:
+            json.dump({int(k): list(map(int, v)) for k, v in loop2seg.items()}, f, indent=2)
+        with open(outdir / "seg2loops.json", "w") as f:
+            json.dump({int(k): list(map(int, v)) for k, v in seg2loops.items()}, f, indent=2)
+
+        with open(outdir / "loops_flagged_for_deletion.txt", "w") as f:
+            for hid in sorted(map(int, few_node_ids)):
+                f.write(f"{hid}\n")
+
+        dbg = dict(
+            num_holes=int(num_holes),
+            scoped=len(ring_scope_ids),
+            magenta=len(few_node_ids),
+            seg_all=len(catalog["all"]),
+            seg_treated=len(catalog["treated"]),
+            seg_deleted=len(catalog["deleted"]),
+            seg_dead=len(catalog["dead"]),
+            seg_kept_other=len(catalog["kept_other"]),
+            seg_kept_treated=len(catalog["kept_treated"]),
+        )
+        with open(outdir / "debug_counts.json", "w") as f:
+            json.dump(dbg, f, indent=2)
+
     if num_holes == 0:
         return np.zeros((H, W), dtype=np.uint16)
     remap = np.zeros(num_holes + 1, dtype=np.uint16)
