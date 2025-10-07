@@ -1,8 +1,10 @@
-# segments_to_mask.py
 import numpy as np
 import cv2
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from pathlib import Path
+
+
+RING_SAMPLE_STEP = 3  # subsample contour points when mapping loop→segments (>=1). 1 = no subsampling.
 
 
 def _neighbors8(r: int, c: int, H: int, W: int):
@@ -17,23 +19,8 @@ def _neighbors8(r: int, c: int, H: int, W: int):
             yield rr, cc
 
 
-def _rasterize_skeleton(segments: Optional[List[np.ndarray]], shape: Tuple[int, int]) -> np.ndarray:
-    H, W = map(int, shape)
-    sk = np.zeros((H, W), dtype=np.uint8)
-    if not segments:
-        return sk
-    for seg in segments:
-        if seg is None or len(seg) < 2:
-            continue
-        pts = np.asarray(seg, dtype=float)
-        for i in range(len(pts) - 1):
-            r0, c0 = pts[i]
-            r1, c1 = pts[i + 1]
-            cv2.line(sk, (int(c0), int(r0)), (int(c1), int(r1)), 255, 1, lineType=cv2.LINE_8)
-    return sk
-
-
 def _degree_map(skel01: np.ndarray) -> np.ndarray:
+    # 8-neighborhood degree for each skeleton pixel.
     k = np.ones((3, 3), dtype=np.uint8)
     conv = cv2.filter2D(skel01.astype(np.uint8), ddepth=cv2.CV_16S, kernel=k, borderType=cv2.BORDER_CONSTANT)
     deg = (conv - skel01.astype(np.int16)).astype(np.int16)
@@ -41,6 +28,8 @@ def _degree_map(skel01: np.ndarray) -> np.ndarray:
 
 
 def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tuple[int, np.ndarray]:
+    # Close tiny gaps on the 1-px skeleton, label background components,
+    # and return interior “hole” labels as 1..num_holes.
     if close_iter > 0:
         se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         closed = (skel01.astype(np.uint8) * 255).copy()
@@ -57,7 +46,7 @@ def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tupl
     keep = np.ones(num_labels, dtype=bool)
     for bid in border_ids:
         keep[bid] = False
-    keep[0] = False
+    keep[0] = False  # background id
 
     remap = np.zeros(num_labels, dtype=np.int32)
     nid = 1
@@ -70,6 +59,106 @@ def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tupl
     return num_holes, holes_lab
 
 
+def _rasterize_and_index(
+    segments: Optional[List[np.ndarray]],
+    shape: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build 1-px skeleton and per-pixel segment index in a single pass.
+
+    Returns:
+      skel01  : uint8 binary skeleton {0,1}
+      S_idx   : int32 image with the first segment id drawn at each pixel, or -1 if none
+    """
+    H, W = map(int, shape)
+    skel01 = np.zeros((H, W), dtype=np.uint8)
+    S_idx = np.full((H, W), -1, dtype=np.int32)
+    if not segments:
+        return skel01, S_idx
+
+    tmp = np.zeros((H, W), dtype=np.uint8)
+
+    for sid, seg in enumerate(segments):
+        if seg is None or len(seg) < 2:
+            continue
+        pts = np.asarray(seg, dtype=np.float32)
+        pts = np.round(pts).astype(np.int32)  # (row, col)
+        if len(pts) < 2:
+            continue
+
+        tmp.fill(0)
+        pts_cv = pts[:, ::-1].reshape(-1, 1, 2)  # (x,y)
+        cv2.polylines(tmp, [pts_cv], isClosed=False, color=255, thickness=1, lineType=cv2.LINE_8)
+
+        nz = cv2.findNonZero(tmp)
+        if nz is None:
+            continue
+        xy = nz[:, 0]
+        cc = xy[:, 0]
+        rr = xy[:, 1]
+
+        skel01[rr, cc] = 1
+        mnew = (S_idx[rr, cc] == -1)
+        if np.any(mnew):
+            S_idx[rr[mnew], cc[mnew]] = sid
+
+    return skel01, S_idx
+
+
+def _ordered_loop_segments_voronoi(
+    ring_thin: np.ndarray,
+    labels: np.ndarray,
+    S_idx: np.ndarray,
+    W: int,
+    sample_step: int = 1,
+) -> List[int]:
+    """
+    Map the loop ring pixels to an ordered, run-length-compressed list of segment ids
+    using a single global distanceTransformWithLabels result.
+
+    labels: int32; cv2.DIST_LABEL_PIXEL. For a non-zero pixel, labels[r,c] = (y*W + x) + 1 of the closest zero pixel.
+    """
+    contours, _ = cv2.findContours(ring_thin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return []
+    cnt = max(contours, key=cv2.contourArea)
+    pts = cnt.reshape(-1, 2)  # (x,y)
+
+    if sample_step > 1:
+        pts = pts[::sample_step]
+
+    H, Wimg = labels.shape
+    assert Wimg == W
+
+    ids: List[int] = []
+    for x, y in pts:
+        y = int(y)
+        x = int(x)
+        if not (0 <= y < H and 0 <= x < W):
+            continue
+        lbl = int(labels[y, x])
+        if lbl <= 0:
+            sid = int(S_idx[y, x])
+        else:
+            idx0 = lbl - 1
+            y0 = idx0 // W
+            x0 = idx0 % W
+            sid = int(S_idx[y0, x0])
+        ids.append(sid)
+
+    ordered: List[int] = []
+    last = None
+    for sid in ids:
+        if sid == -1:
+            continue
+        if last is None or sid != last:
+            ordered.append(sid)
+            last = sid
+    if len(ordered) >= 2 and ordered[0] == ordered[-1]:
+        ordered.pop()
+    return ordered
+
+
 def process_segments_to_mask(
     segments: Optional[List[np.ndarray]],
     image_shape: Tuple[int, int],
@@ -79,13 +168,21 @@ def process_segments_to_mask(
     L_MIN: Optional[int] = None,
     node_scope: str = "removed",
 ) -> np.ndarray:
+    """
+    Debug overlay and hole-instance label map.
+    Visuals: skeleton (grey), loop boundary drawn on skeleton (red) but only for scoped loops, candidate nodes (yellow).
+    Segmentation output unchanged. Writes loop2seg/seg2loops if report_path is set.
+    """
     H, W = map(int, image_shape)
 
-    base_skeleton = _rasterize_skeleton(segments, (H, W))
-    base_skeleton = (base_skeleton > 0).astype(np.uint8)
+    # 1) Skeleton + per-pixel segment index
+    base_skeleton01, S_idx = _rasterize_and_index(segments, (H, W))
+    thin_bool = base_skeleton01.astype(bool)
 
-    num_holes, holes_lab = _holes_from_closed_skeleton(base_skeleton, close_iter=1)
+    # 2) Holes from closed skeleton
+    num_holes, holes_lab = _holes_from_closed_skeleton(base_skeleton01, close_iter=1)
 
+    # 3) Vessel mask for gating
     cv_mask = np.zeros((H, W), dtype=np.uint8)
     if cv_contours:
         try:
@@ -105,8 +202,8 @@ def process_segments_to_mask(
         else:
             removed_ids.append(hid)
 
-    thin_bool = base_skeleton.astype(bool)
-    deg = _degree_map(base_skeleton)
+    # 4) Viz scaffolding
+    deg = _degree_map(base_skeleton01)
 
     side = min(H, W)
     L_MIN_auto = max(6, int(round(0.0025 * side))) if L_MIN is None else int(L_MIN)
@@ -117,82 +214,111 @@ def process_segments_to_mask(
     k3 = np.ones((3, 3), dtype=np.uint8)
 
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
-    canvas[thin_bool] = (150, 150, 150)
+    canvas[thin_bool] = (150, 150, 150)  # skeleton in grey
 
+    # which loops to show red + run BFS/node detection
     if node_scope == "removed":
-        loop_ids = removed_ids
+        ring_scope_ids = removed_ids
     elif node_scope == "kept":
-        loop_ids = [i for i in range(1, num_holes + 1) if keep_label[i]]
+        ring_scope_ids = [i for i in range(1, num_holes + 1) if keep_label[i]]
     else:
-        loop_ids = list(range(1, num_holes + 1))
+        ring_scope_ids = list(range(1, num_holes + 1))
 
-    node_points: List[Tuple[int, int]] = []
-
-    # Precompute ring for all loops to allow stopping BFS when touching any loop
+    # 5) Per-hole rings and union for BFS stop set
     all_rings = np.zeros((H, W), dtype=np.uint8)
+    ring_cache: Dict[int, np.ndarray] = {}
+    near_ring_cache: Dict[int, np.ndarray] = {}
     for hid in range(1, num_holes + 1):
         region_i = (holes_lab == hid).astype(np.uint8) * 255
-        ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)
+        ring_i = cv2.morphologyEx(region_i, cv2.MORPH_GRADIENT, se3)  # thin ring
+        ring_cache[hid] = ring_i
+        near_ring_cache[hid] = cv2.dilate(ring_i, se3, iterations=1) > 0  # NOTE: from ring_i, not region_i
         all_rings |= (ring_i > 0).astype(np.uint8)
 
-    for hid in loop_ids:
-        region = (holes_lab == hid).astype(np.uint8) * 255
-        if region.sum() == 0:
+    # 6) Global DT labels for loop→segment mapping
+    inv = np.where(base_skeleton01 > 0, 0, 255).astype(np.uint8)
+    _, labels = cv2.distanceTransformWithLabels(
+        inv, distanceType=cv2.DIST_L2, maskSize=3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+
+    loop2seg: Dict[int, List[int]] = {}
+    seg2loops: Dict[int, List[int]] = {}
+
+    # 7) Visuals and mappings
+    node_points: List[Tuple[int, int]] = []
+
+    for hid in range(1, num_holes + 1):
+        ring_thin = ring_cache[hid]
+        near_ring = near_ring_cache[hid]
+
+        # draw red only for scoped loops; draw ON skeleton to avoid 1px offset
+        if hid in ring_scope_ids:
+            ring_on_skel = thin_bool & near_ring
+            canvas[ring_on_skel] = (0, 0, 255)
+
+        # loop→segment mapping (uses geometric ring, independent of red drawing)
+        ordered_seg_ids = _ordered_loop_segments_voronoi(
+            ring_thin, labels, S_idx, W, sample_step=max(1, int(RING_SAMPLE_STEP))
+        )
+        loop2seg[hid] = ordered_seg_ids
+        for sid in ordered_seg_ids:
+            if sid < 0:
+                continue
+            lst = seg2loops.get(sid)
+            if lst is None:
+                seg2loops[sid] = [hid]
+            else:
+                if not lst or lst[-1] != hid:
+                    lst.append(hid)
+
+        # skip heavy work outside scope
+        if hid not in ring_scope_ids:
             continue
 
-        ring_thin = cv2.morphologyEx(region, cv2.MORPH_GRADIENT, se3)
-        near_ring = cv2.dilate(ring_thin, se3, iterations=1) > 0
-        red_mask = thin_bool & (ring_thin > 0)
-
-        canvas[(ring_thin > 0)] = (0, 0, 255)
-
+        # candidate node detection (original logic; uses near_ring from ring_thin)
         junction = (deg >= 3)
         walkable = thin_bool & (~near_ring)
         walkable_n = cv2.filter2D(walkable.astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT)
-
         cand = junction & near_ring & (walkable_n > 0)
         diag_touch = (deg == 2) & near_ring & (walkable_n > 0)
         cand |= diag_touch
 
-        # connectivity seeds: walkable pixels that touch near_ring
+        # limited BFS from seeds for debug wash
         touch_near = cv2.filter2D((near_ring > 0).astype(np.uint8), cv2.CV_16S, k3, borderType=cv2.BORDER_CONSTANT) > 0
         seeds = walkable & touch_near
-
-        # BFS from seeds limited by L_VIS and stopping when hitting any loop ring
         visited = np.zeros((H, W), dtype=np.uint8)
         sr, sc = np.where(seeds)
-        q = [(int(r), int(c), 0) for r, c in zip(sr, sc)]
-        for r, c, _ in q:
-            visited[r, c] = 1
-        while q:
-            pr, pc, d = q.pop(0)
-            if d >= L_VIS:
-                continue
-            for nr, nc in _neighbors8(pr, pc, H, W):
-                if visited[nr, nc]:
+        if len(sr) > 0:
+            q = [(int(r), int(c), 0) for r, c in zip(sr, sc)]
+            for r, c, _ in q:
+                visited[r, c] = 1
+            while q:
+                pr, pc, d = q.pop(0)
+                if d >= L_VIS:
                     continue
-                if not walkable[nr, nc]:
-                    continue
-                if all_rings[nr, nc]:
-                    continue
-                visited[nr, nc] = 1
-                q.append((nr, nc, d + 1))
+                for nr, nc in _neighbors8(pr, pc, H, W):
+                    if visited[nr, nc]:
+                        continue
+                    if not walkable[nr, nc]:
+                        continue
+                    if all_rings[nr, nc]:
+                        continue
+                    visited[nr, nc] = 1
+                    q.append((nr, nc, d + 1))
+            canvas[visited.astype(bool)] = (0, 0, 255)
 
-        canvas[visited.astype(bool)] = (0, 0, 255)
-
+        # accept/mark node pixels
         rr, cc = np.where(cand)
         for r, c in zip(rr, cc):
             nbrs = [(rr2, cc2) for rr2, cc2 in _neighbors8(r, c, H, W) if walkable[rr2, cc2]]
             if not nbrs:
                 continue
-
-            q = [(rr2, cc2, 1) for rr2, cc2 in nbrs]
+            q2 = [(rr2, cc2, 1) for rr2, cc2 in nbrs]
             seen = set([(r, c)] + [(rr2, cc2) for rr2, cc2 in nbrs])
             best_d = 0
             accept = False
-
-            while q and not accept:
-                pr, pc, d = q.pop(0)
+            while q2 and not accept:
+                pr, pc, d = q2.pop(0)
                 best_d = max(best_d, d)
                 if d >= L_MIN_auto:
                     accept = True
@@ -203,11 +329,11 @@ def process_segments_to_mask(
                     if (nr, nc) in seen:
                         continue
                     seen.add((nr, nc))
-                    q.append((nr, nc, d + 1))
-
+                    q2.append((nr, nc, d + 1))
             if accept or best_d >= SHORT_LEN:
                 node_points.append((r, c))
 
+    # cluster and draw node markers
     if len(node_points) > 0:
         pts = np.array(node_points, dtype=np.int32)
         cluster_r = 3 if side >= 256 else 2
@@ -230,9 +356,13 @@ def process_segments_to_mask(
                 line_type=cv2.LINE_8,
             )
 
+    # 8) Persist debug artifacts
     if report_path is not None:
-        cv2.imwrite(str(Path(report_path) / "filtered_loops.png"), canvas)
+        outdir = Path(report_path)
+        outdir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(outdir / "filtered_loops.png"), canvas)
 
+    # 9) Segmentation output unchanged
     if num_holes == 0:
         return np.zeros((H, W), dtype=np.uint16)
     remap = np.zeros(num_holes + 1, dtype=np.uint16)
