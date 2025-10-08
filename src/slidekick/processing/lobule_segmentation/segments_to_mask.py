@@ -363,10 +363,10 @@ def process_segments_to_mask(
 
     catalog: Dict[str, set] = {
         "all": set(),
-        "treated": set(),
+        "marked": set(),
         "deleted": set(),
-        "kept_treated": set(),
-        "kept_other": set(),
+        "kept": set(),
+        "untreated": set(),
         "dead": set(),
     }
 
@@ -380,7 +380,16 @@ def process_segments_to_mask(
         for sid in loop2seg.get(hid, []):
             if sid >= 0:
                 treated.add(int(sid))
-    catalog["treated"] = treated
+    catalog["marked"] = treated
+
+    other_loop_ids = [hid for hid in range(1, num_holes + 1) if hid not in ring_scope_ids]
+    other_loop_seg_ids: set = set()
+    for hid in other_loop_ids:
+        for sid in loop2seg.get(hid, []):
+            if sid >= 0:
+                other_loop_seg_ids.add(int(sid))
+
+    catalog["untreated"] = other_loop_seg_ids - treated
 
     deleted: set = set()
     for hid in few_node_ids:
@@ -389,16 +398,7 @@ def process_segments_to_mask(
                 deleted.add(int(sid))
     catalog["deleted"] = deleted
 
-    catalog["kept_treated"] = treated - deleted
-
-    other_loop_ids = [hid for hid in range(1, num_holes + 1) if hid not in ring_scope_ids]
-    other_loop_seg_ids: set = set()
-    for hid in other_loop_ids:
-        for sid in loop2seg.get(hid, []):
-            if sid >= 0:
-                other_loop_seg_ids.add(int(sid))
-    catalog["dead"] = set()  # branch removal disabled
-    catalog["kept_other"] = other_loop_seg_ids - treated
+    catalog["kept"] = set()
 
     def _paint(seg_ids: set, bgr: Tuple[int, int, int]):
         if not seg_ids:
@@ -406,47 +406,16 @@ def process_segments_to_mask(
         m = np.isin(S_idx, np.fromiter(seg_ids, dtype=np.int32))
         canvas[m] = bgr
 
-    _paint(catalog["kept_other"], (255, 255, 255))   # white
-    _paint(catalog["treated"], (0, 0, 255))          # red
-    _paint(catalog["kept_treated"], (255, 255, 0))   # cyan
+    _paint(catalog["untreated"], (255, 255, 255))    # white
+    _paint(catalog["marked"], (0, 0, 255))          # red
+    _paint(catalog["kept"], (255, 255, 0))           # cyan
     _paint(catalog["deleted"], (255, 0, 255))        # magenta
-    _paint(catalog["dead"], (0, 165, 255))           # orange (none)
+    _paint(catalog["dead"], (0, 165, 255))           # orange
 
     if report_path is not None:
         outdir = Path(report_path)
         outdir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(outdir / "filtered_loops.png"), canvas)
-
-        for key in ["all", "treated", "deleted", "kept_treated", "kept_other", "dead"]:
-            with open(outdir / f"segments_{key}.txt", "w") as f:
-                for sid in sorted(catalog[key]):
-                    f.write(f"{sid}\n")
-
-        with open(outdir / "segment_catalog.json", "w") as f:
-            json.dump({k: sorted(map(int, v)) for k, v in catalog.items()}, f, indent=2)
-
-        with open(outdir / "loop2seg.json", "w") as f:
-            json.dump({int(k): list(map(int, v)) for k, v in loop2seg.items()}, f, indent=2)
-        with open(outdir / "seg2loops.json", "w") as f:
-            json.dump({int(k): list(map(int, v)) for k, v in seg2loops.items()}, f, indent=2)
-
-        with open(outdir / "loops_flagged_for_deletion.txt", "w") as f:
-            for hid in sorted(map(int, few_node_ids)):
-                f.write(f"{hid}\n")
-
-        dbg = dict(
-            num_holes=int(num_holes),
-            scoped=len(ring_scope_ids),
-            magenta=len(few_node_ids),
-            seg_all=len(catalog["all"]),
-            seg_treated=len(catalog["treated"]),
-            seg_deleted=len(catalog["deleted"]),
-            seg_dead=len(catalog["dead"]),
-            seg_kept_other=len(catalog["kept_other"]),
-            seg_kept_treated=len(catalog["kept_treated"]),
-        )
-        with open(outdir / "debug_counts.json", "w") as f:
-            json.dump(dbg, f, indent=2)
 
     if num_holes == 0:
         return np.zeros((H, W), dtype=np.uint16)
