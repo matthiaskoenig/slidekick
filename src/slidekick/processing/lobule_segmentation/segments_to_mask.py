@@ -4,7 +4,6 @@ from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 import json
 
-
 RING_SAMPLE_STEP = 3  # subsample contour points when mapping loop->segments (>=1). 1 = no subsampling.
 
 
@@ -58,8 +57,8 @@ def _holes_from_closed_skeleton(skel01: np.ndarray, close_iter: int = 1) -> Tupl
 
 
 def _rasterize_and_index(
-    segments: Optional[List[np.ndarray]],
-    shape: Tuple[int, int],
+        segments: Optional[List[np.ndarray]],
+        shape: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     H, W = map(int, shape)
     skel01 = np.zeros((H, W), dtype=np.uint8)
@@ -97,11 +96,11 @@ def _rasterize_and_index(
 
 
 def _ordered_loop_segments_voronoi(
-    ring_thin: np.ndarray,
-    labels: np.ndarray,
-    S_idx: np.ndarray,
-    W: int,
-    sample_step: int = 1,
+        ring_thin: np.ndarray,
+        labels: np.ndarray,
+        S_idx: np.ndarray,
+        W: int,
+        sample_step: int = 1,
 ) -> List[int]:
     contours, _ = cv2.findContours(ring_thin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
@@ -145,13 +144,13 @@ def _ordered_loop_segments_voronoi(
 
 
 def process_segments_to_mask(
-    segments: Optional[List[np.ndarray]],
-    image_shape: Tuple[int, int],
-    cv_contours: Optional[List[np.ndarray]] = None,
-    report_path: Optional[str] = None,
-    min_area_px: int = 50,
-    L_MIN: Optional[int] = None,
-    node_scope: str = "removed",
+        segments: Optional[List[np.ndarray]],
+        image_shape: Tuple[int, int],
+        cv_contours: Optional[List[np.ndarray]] = None,
+        report_path: Optional[str] = None,
+        min_area_px: int = 50,
+        L_MIN: Optional[int] = None,
+        node_scope: str = "removed",
 ) -> np.ndarray:
     """
     Debug overlay and hole-instance label map.
@@ -179,6 +178,8 @@ def process_segments_to_mask(
 
     keep_label = np.zeros(num_holes + 1, dtype=bool)
     removed_ids: List[int] = []
+    ring_mark_mask = np.zeros((H, W), dtype=bool)
+
     for hid in range(1, num_holes + 1):
         region = (holes_lab == hid)
         area = int(region.sum())
@@ -235,7 +236,7 @@ def process_segments_to_mask(
 
         if hid in ring_scope_ids:
             ring_on_skel = thin_bool & near_ring
-            canvas[ring_on_skel] = (0, 0, 255)
+            ring_mark_mask |= ring_on_skel
 
         ordered_seg_ids = _ordered_loop_segments_voronoi(
             ring_thin, labels, S_idx, W, sample_step=max(1, int(RING_SAMPLE_STEP))
@@ -361,6 +362,36 @@ def process_segments_to_mask(
         ring_on_skel = thin_bool & near_ring_cache[hid]
         canvas[ring_on_skel] = (255, 0, 255)
 
+    # --- Split segments at ring boundary so catalog is exact ---
+    # Identify crossing segments: those with pixels both inside and outside ring_mark_mask.
+    valid_mask = (S_idx >= 0) & thin_bool
+    sid_all = S_idx[valid_mask]
+    sid_inside = S_idx[valid_mask & ring_mark_mask]
+    sid_outside = S_idx[valid_mask & (~ring_mark_mask)]
+    import numpy as _np
+    total_counts = _np.bincount(sid_all, minlength=int(S_idx.max()) + 1 if S_idx.size else 0)
+    in_counts = _np.bincount(sid_inside, minlength=total_counts.size) if sid_inside.size else _np.zeros_like(
+        total_counts)
+    out_counts = _np.bincount(sid_outside, minlength=total_counts.size) if sid_outside.size else _np.zeros_like(
+        total_counts)
+    crossing_ids = _np.nonzero((in_counts > 0) & (out_counts > 0))[0].tolist()
+
+    if crossing_ids:
+        S_idx2 = S_idx.copy()
+        next_sid = int(S_idx.max()) + 1
+        se3_loc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        for sid in crossing_ids:
+            # split only the INSIDE connected components into new ids
+            mask_inside = ((S_idx2 == sid) & ring_mark_mask).astype(_np.uint8)
+            if mask_inside.any():
+                num_cc, labels_cc = cv2.connectedComponents(mask_inside, connectivity=8)
+                for cid in range(1, num_cc):
+                    S_idx2[(labels_cc == cid)] = next_sid
+                    next_sid += 1
+        S_idx = S_idx2
+        del S_idx2
+    # -----------------------------------------------------------
+
     catalog: Dict[str, set] = {
         "all": set(),
         "marked": set(),
@@ -370,16 +401,17 @@ def process_segments_to_mask(
         "dead": set(),
     }
 
-    if segments is not None:
-        catalog["all"] = set(range(len(segments)))
-    else:
-        catalog["all"] = set(int(s) for s in np.unique(S_idx) if s >= 0)
+    catalog["all"] = set(int(s) for s in np.unique(S_idx) if s >= 0)
 
-    treated: set = set()
-    for hid in ring_scope_ids:
-        for sid in loop2seg.get(hid, []):
-            if sid >= 0:
-                treated.add(int(sid))
+    # Select segments whose pixels are fully inside the ring_mark_mask
+    valid2 = (S_idx >= 0) & thin_bool
+    sid_all2 = S_idx[valid2]
+    sid_in2 = S_idx[valid2 & ring_mark_mask]
+    import numpy as _np
+    total2 = _np.bincount(sid_all2, minlength=int(S_idx.max()) + 1 if S_idx.size else 0)
+    inside2 = _np.bincount(sid_in2, minlength=total2.size) if sid_in2.size else _np.zeros_like(total2)
+    marked_ids = _np.nonzero((total2 > 0) & (inside2 == total2))[0]
+    treated: set = set(int(x) for x in marked_ids.tolist())
     catalog["marked"] = treated
 
     other_loop_ids = [hid for hid in range(1, num_holes + 1) if hid not in ring_scope_ids]
@@ -389,16 +421,47 @@ def process_segments_to_mask(
             if sid >= 0:
                 other_loop_seg_ids.add(int(sid))
 
-    catalog["untreated"] = other_loop_seg_ids - treated
+    catalog["untreated"] = catalog["all"] - (catalog["marked"] | catalog["kept"] | catalog["deleted"])
 
     deleted: set = set()
     for hid in few_node_ids:
         for sid in loop2seg.get(hid, []):
             if sid >= 0:
                 deleted.add(int(sid))
+    deleted &= catalog["marked"]
     catalog["deleted"] = deleted
 
     catalog["kept"] = set()
+
+    # per-segment ownership pixels (matches overlay)
+    segment_pixels: Dict[int, List[List[int]]] = {}
+    skel_mask = (base_skeleton01.astype(bool)) & (S_idx >= 0)
+    rr, cc = np.where(skel_mask)
+    for r, c in zip(rr.tolist(), cc.tolist()):
+        sid = int(S_idx[r, c])
+        segment_pixels.setdefault(sid, []).append([int(r), int(c)])
+
+    # ensure all catalog ids present, even if empty
+    for sid in catalog["all"]:
+        segment_pixels.setdefault(int(sid), [])
+
+    # stable ordering
+    for sid, pts in segment_pixels.items():
+        if pts:
+            pts.sort(key=lambda rc: (rc[0], rc[1]))
+
+    debug_json = {
+        "version": 3,
+        "image_shape": {"H": int(H), "W": int(W)},
+        "catalog": {
+            "all": sorted(int(x) for x in catalog["all"]),
+            "marked": sorted(int(x) for x in catalog["marked"]),
+            "deleted": sorted(int(x) for x in catalog["deleted"]),
+            "kept": sorted(int(x) for x in catalog["kept"]),
+            "untreated": sorted(int(x) for x in catalog["untreated"]),
+        },
+        "segments": {str(int(k)): v for k, v in segment_pixels.items()},
+    }
 
     def _paint(seg_ids: set, bgr: Tuple[int, int, int]):
         if not seg_ids:
@@ -406,16 +469,17 @@ def process_segments_to_mask(
         m = np.isin(S_idx, np.fromiter(seg_ids, dtype=np.int32))
         canvas[m] = bgr
 
-    _paint(catalog["untreated"], (255, 255, 255))    # white
-    _paint(catalog["marked"], (0, 0, 255))          # red
-    _paint(catalog["kept"], (255, 255, 0))           # cyan
-    _paint(catalog["deleted"], (255, 0, 255))        # magenta
-    _paint(catalog["dead"], (0, 165, 255))           # orange
+    _paint(catalog["untreated"], (255, 255, 255))  # white
+    _paint(catalog["marked"], (0, 0, 255))  # red
+    _paint(catalog["kept"], (255, 255, 0))  # cyan
+    _paint(catalog["deleted"], (255, 0, 255))  # magenta
+    _paint(catalog["dead"], (0, 165, 255))  # orange
 
     if report_path is not None:
         outdir = Path(report_path)
         outdir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(outdir / "filtered_loops.png"), canvas)
+        (outdir / "debug.json").write_text(json.dumps(debug_json, indent=2), encoding="utf-8")
 
     if num_holes == 0:
         return np.zeros((H, W), dtype=np.uint16)
