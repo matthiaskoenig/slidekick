@@ -987,7 +987,6 @@ class LobuleSegmentor(BaseOperator):
             cv_contours=[cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0],
             report_path=report_path,
             min_area_px=self.min_area_px,
-            L_MIN=None
         )
 
         # Crop mask by padding
