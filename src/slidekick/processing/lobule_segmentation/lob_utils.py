@@ -228,3 +228,39 @@ def nonlinear_channel_weighting(
     _lift(list(channels_pp) if channels_pp is not None else [], pp_gamma)
     _lift(list(channels_pv) if channels_pv is not None else [], pv_gamma)
     return Xo
+
+
+def to_base_full(contours_xy: List[np.ndarray],
+                  pad_px: int,
+                  bbox_base: Tuple[int, int, int, int],
+                  proc_hw: Tuple[int, int],
+                  roi_hw_base: Tuple[int, int]) -> List[np.ndarray]:
+    # contours_xy: OpenCV (x,y) in padded-ROI coordinates
+    Hproc, Wproc = proc_hw
+    Hb, Wb = roi_hw_base
+    min_r, min_c, _, _ = bbox_base
+    sx = Wb / float(max(Wproc, 1))
+    sy = Hb / float(max(Hproc, 1))
+    out: List[np.ndarray] = []
+    for cnt in contours_xy:
+        pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 2)
+        pts[:, 0] = (pts[:, 0] - float(pad_px)) * sx + float(min_c)
+        pts[:, 1] = (pts[:, 1] - float(pad_px)) * sy + float(min_r)
+        out.append(pts.reshape(-1, 1, 2).astype(np.int32))
+    return out
+
+
+def rescale_full(contours_xy: List[np.ndarray],
+                  Hsrc: int, Wsrc: int, Hdst: int, Wdst: int) -> List[np.ndarray]:
+    # scale contours from a full-frame source size to a full-frame destination size
+    if not contours_xy:
+        return []
+    sx = float(Wdst) / float(max(Wsrc, 1))
+    sy = float(Hdst) / float(max(Hsrc, 1))
+    out: List[np.ndarray] = []
+    for cnt in contours_xy:
+        pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 2)
+        pts[:, 0] *= sx
+        pts[:, 1] *= sy
+        out.append(pts.reshape(-1, 1, 2).astype(np.int32))
+    return out

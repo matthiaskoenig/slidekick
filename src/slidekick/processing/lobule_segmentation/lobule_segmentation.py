@@ -21,9 +21,10 @@ from slidekick.io import save_tif
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
 from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
 from slidekick.processing.lobule_segmentation.segments_to_mask import process_segments_to_mask
+from slidekick.processing.lobule_segmentation.portality import mask_to_portality
 from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
-    downsample_to_max_side, render_cluster_gray, nonlinear_channel_weighting
+    downsample_to_max_side, render_cluster_gray, nonlinear_channel_weighting, to_base_full, rescale_full
 )
 
 class LobuleSegmentor(BaseOperator):
@@ -897,7 +898,7 @@ class LobuleSegmentor(BaseOperator):
 
         return thinned, (vessel_classes, vessel_contours)
 
-    def apply(self) -> Metadata:
+    def apply(self) -> Tuple[Metadata, Metadata]:
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         short_id = uuid.uuid4().hex[:8]
@@ -992,41 +993,94 @@ class LobuleSegmentor(BaseOperator):
         # Crop mask by padding
         mask_cropped = mask[pad:-pad, pad:-pad]
 
-        # Preview
-        if self.preview:
-            # Original as mean projection
-            orig_vis = img_stack.mean(axis=2).astype(np.uint8)
-            # Skeleton cropped to match mask/img_stack
-            overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
-            self._preview_images([orig_vis, overlay_vis], titles=["Original", "Segmentation Overlay"])
-
         console.print("Complete. Back-mapping mask to all pyramid levels...", style="info")
 
-        # Build masks for every level (steps 1–3)
+        # Step 10: Build masks for every level
         mask_pyramid = build_mask_pyramid_from_processed(
             mask_cropped=mask_cropped,
             img_size_base=img_size_base,  # ROI size at base_level (after bbox crop)
-            bbox_base=bbox,  # bbox in base_level coords used for the crop
+            bbox_base=bbox,  # bbox in base_level coords
             orig_shapes=orig_shapes,  # {level: (H,W)} from self.load_image(0)
             base_level=self.base_level,
         )
 
-        console.print("Complete.", style="info")
+        console.print("Complete. Creating portality map at every pyramid level...", style="info")
 
-        # TODO: package `full_mask` as a new Metadata and save
+        # Prepare vessel contours in base-level full-frame coordinates
+        proc_h, proc_w = mask_cropped.shape
+        Hb, Wb = img_size_base
+        Hfull_base, Wfull_base = orig_shapes[self.base_level]
+        min_r, min_c, max_r, max_c = bbox
 
+        cv_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 0]
+        pf_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 1]
+
+        cv_cnt_base = to_base_full(cv_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
+        pf_cnt_base = to_base_full(pf_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
+
+        # Compute per-level portality
+        portality_pyramid: Dict[int, np.ndarray] = {}
+        for lvl, (Hdst, Wdst) in orig_shapes.items():
+            full_mask = mask_pyramid[lvl]
+            if lvl == self.base_level:
+                cv_lvl = cv_cnt_base
+                pf_lvl = pf_cnt_base
+                P = mask_to_portality(full_mask, cv_lvl, pf_lvl, report_path=None)
+            else:
+                cv_lvl = rescale_full(cv_cnt_base, Hfull_base, Wfull_base, Hdst, Wdst)
+                pf_lvl = rescale_full(pf_cnt_base, Hfull_base, Wfull_base, Hdst, Wdst)
+                P = mask_to_portality(full_mask, cv_lvl, pf_lvl, report_path=None)
+            portality_pyramid[lvl] = P.astype(np.float32)
+
+        # Crop base-level portality to ROI and save fixed-size PNG
+        P_base_full = portality_pyramid[self.base_level]
+        portality_cropped = P_base_full[min_r:max_r, min_c:max_c]
+
+        cmap = plt.get_cmap("magma").copy()
+        cmap.set_bad(alpha=0.0)
+        Pm = np.ma.masked_invalid(portality_cropped).astype(np.float32)
+
+        # write ROI-sized portality.png so size matches other images
+        plt.imsave(str(report_path / "portality.png"), Pm, cmap=cmap, vmin=0.0, vmax=1.0)
+
+        # Preview after portality is available
+        if self.preview:
+            orig_vis = img_stack.mean(axis=2).astype(np.uint8)
+            overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
+
+            # build RGBA from the already-cropped map
+            portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
+            portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
+
+            self._preview_images(
+                [orig_vis, overlay_vis, portality_rgba],
+                titles=["Original", "Segmentation Overlay", "Portality"],
+            )
+
+        # Save mask pyramid
         new_meta = Metadata(
             path_original=report_path,
             path_storage=report_path,
             image_type="mask",
             uid=new_uid,
         )
-
         new_meta.save(report_path)
-        # Pass the full level -> array dict so save_tif writes a tiled, pyramidal TIFF
         save_tif(mask_pyramid, report_path / f"{new_uid}_seg.tiff", metadata=new_meta)
 
-        return new_meta
+        # Save portality pyramid
+        new_port = Metadata(
+            path_original=report_path,
+            path_storage=report_path,
+            image_type="portality",
+            uid=new_uid,
+        )
+        new_port.save(report_path)
+        save_tif(portality_pyramid, report_path / f"{new_uid}_portality.tiff", metadata=new_port)
+
+        console.print("Complete.", style="info")
+
+        # Return both metadata objects
+        return new_meta, new_port
 
 
 if __name__ == "__main__":
@@ -1047,4 +1101,4 @@ if __name__ == "__main__":
                                 region_size=25,
                                 adaptive_histonorm=True)
 
-    metadata_segmentation = Segmentor.apply()
+    metadata_segmentation, metadata_portality = Segmentor.apply()

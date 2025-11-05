@@ -11,6 +11,7 @@ import cv2
 import math
 from collections import defaultdict, deque
 import heapq
+from pathlib import Path
 
 # VISUALIZATION COLORS
 # BGR tuples for debug overlays when writing reports
@@ -814,10 +815,10 @@ def _draw_dashed_polyline(img: np.ndarray, pts_xy: np.ndarray, color: Tuple[int,
 # MAIN API
 # End to end assembly of nodes edges faces and final mask with rule based pruning.
 def process_segments_to_mask(
-        segments: Optional[List[np.ndarray]],
+        segments: List[np.ndarray],
         image_shape: Tuple[int, int],
-        cv_contours: Optional[List[np.ndarray]] = None,
-        report_path: Optional[str] = None,
+        cv_contours: List[np.ndarray] = None,
+        report_path: Path = None,
         min_area_px: int = 50,
         thick_width_px: int = 3,
         snap_eps_px: Optional[float] = None,
