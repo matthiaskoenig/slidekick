@@ -1058,24 +1058,27 @@ class LobuleSegmentor(BaseOperator):
             )
 
         # Save mask pyramid
+        seg_path = report_path / f"{new_uid}_seg.tiff"
+
         new_meta = Metadata(
-            path_original=report_path,
-            path_storage=report_path,
+            path_original=seg_path,
+            path_storage=seg_path,
             image_type="mask",
-            uid=new_uid,
+            uid=new_uid+"_mask",
         )
         new_meta.save(report_path)
-        save_tif(mask_pyramid, report_path / f"{new_uid}_seg.tiff", metadata=new_meta)
+        save_tif(mask_pyramid, seg_path, metadata=new_meta)
 
         # Save portality pyramid
+        portality_path = report_path / f"{new_uid}_portality.tiff"
         new_port = Metadata(
-            path_original=report_path,
-            path_storage=report_path,
+            path_original=portality_path,
+            path_storage=portality_path,
             image_type="portality",
-            uid=new_uid,
+            uid=new_uid+"_portality",
         )
         new_port.save(report_path)
-        save_tif(portality_pyramid, report_path / f"{new_uid}_portality.tiff", metadata=new_port)
+        save_tif(portality_pyramid, portality_path, metadata=new_port)
 
         console.print("Complete.", style="info")
 
