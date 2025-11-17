@@ -112,6 +112,7 @@ class StainSeparator(BaseOperator):
             except Exception as e:
                 console.print(f"Could not determine image modality automatically: {e}", style="warning")
                 mode = "brightfield"
+            del img_example, arr  # Memory Managament
         console.print(f"StainSeparator mode: {mode}", style="info")
         if mode == "brightfield":
             return self._apply_brightfield()
@@ -204,6 +205,7 @@ class StainSeparator(BaseOperator):
             apply_full = Confirm.ask("Apply stain separation to full resolution image(s)?", default=True, console=console)
             if not apply_full:
                 console.print("Stain separation aborted by user.", style="warning")
+                del image, separated_levels  # Memory Management
                 return self.metadata
 
         # Save outputs and create metadata per stain
@@ -235,6 +237,7 @@ class StainSeparator(BaseOperator):
 
             console.print(f"Saved [{stain_name}] to {out_path}", style="success")
             output_metadata.append(new_meta)
+        del image, separated_levels  # Memory Management
         return output_metadata
 
     # profile resolver with no silent defaults
@@ -386,6 +389,7 @@ class StainSeparator(BaseOperator):
             apply_full = Confirm.ask(f"Save {n_ch} separated channel images?", default=True, console=console)
             if not apply_full:
                 console.print("Fluorescence channel separation aborted by user.", style="warning")
+                del image  # Memory Management
                 return self.metadata
 
         # build full-resolution separated levels (no downsampling)
@@ -426,6 +430,8 @@ class StainSeparator(BaseOperator):
 
             console.print(f"Saved channel {ch} -> {out_path}", style="success")
             output_metadata.append(new_meta)
+
+        del image, separated_levels  # Memory Management
 
         return output_metadata
 

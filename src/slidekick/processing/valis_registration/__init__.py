@@ -1,0 +1,1 @@
+from .valis_registration import ValisRegistrator

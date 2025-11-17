@@ -1,1 +1,1 @@
-from stain_normalization import StainNormalizer
+from .stain_normalization import StainNormalizer

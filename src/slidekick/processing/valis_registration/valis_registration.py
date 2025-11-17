@@ -366,6 +366,8 @@ class ValisRegistrator(BaseOperator):
             else:
                 console.print(f"No registered file found for VALIS name '{valis_name}' (meta uid {meta.uid})", style="error")
 
+        del registrar  # Memory Management
+
         return self.metadata
 
 

@@ -1082,6 +1082,11 @@ class LobuleSegmentor(BaseOperator):
 
         console.print("Complete.", style="info")
 
+        # Memory Management
+        del (portality_pyramid, P, P_base_full, Pm, full_mask, img_stack, mask, mask_pyramid, mask_cropped, imgs,
+             line_segments, cv_cnt_base, cv_cnt_roi, cv_lvl, orig_vis, overlay_vis, pf_cnt_base, pf_cnt_roi, pf_lvl,
+             portality_cropped, portality_rgba, thinned, vessel_classes, vessel_contours)
+
         # Return both metadata objects
         return new_meta, new_port
 

@@ -1,1 +1,6 @@
-from .baseoperator import BaseOperator
+from slidekick.processing.stain_separation import StainSeparator
+from slidekick.processing.lobule_segmentation import LobuleSegmentor
+from slidekick.processing.stain_normalization import StainNormalizer
+from slidekick.processing.valis_registration import ValisRegistrator
+from slidekick.processing.roi import RoiDetector
+from slidekick.processing.lobule_statistics import LobuleStatistics

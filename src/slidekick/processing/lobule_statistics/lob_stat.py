@@ -67,7 +67,7 @@ def _slug(s: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in s)
 
 
-class LobuleStatisticsOperator(BaseOperator):
+class LobuleStatistics(BaseOperator):
     """
     Compute stain intensity statistics as a function of portality.
 
@@ -348,13 +348,15 @@ class LobuleStatisticsOperator(BaseOperator):
         raw_df.to_csv(outdir / "lobule_stats_raw.csv", index=False)
         summary_df.to_csv(outdir / "summarized_stats.csv", index=False)
 
+        del portality, stain_list, stain_cube, stain_flat, stain_matrix, stains_clean  # Memory Management
+
         return raw_df, summary_df
 
 
 if __name__ == "__main__":
     # Example usage for manual testing
     from slidekick import DATA_PATH
-    from slidekick.processing.lobule_segmentation.lobule_segmentation import LobuleSegmentor
+    from slidekick.processing.lobule_segmentation import LobuleSegmentor
 
     image_paths = [
         DATA_PATH / "reg_n_sep" / "noise.tiff",
@@ -377,8 +379,8 @@ if __name__ == "__main__":
 
     metadata_segmentation, metadata_portality = segmentor.apply()
 
-    # Run the LobuleStatisticsOperator (pooled across lobules)
-    operator = LobuleStatisticsOperator(metadata_portality, metadata_for_segmentation, num_bins=10)
+    # Run the LobuleStatistics
+    operator = LobuleStatistics(metadata_portality, metadata_for_segmentation, num_bins=10)
     operator.apply()
 
     print(f"Lobule statistics saved in: {OUTPUT_PATH / 'lobule_statistics'}")

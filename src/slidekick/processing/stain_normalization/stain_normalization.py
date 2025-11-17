@@ -112,7 +112,7 @@ class StainNormalizer(BaseOperator):
         # Update the metadata with the normalized image data
         normalized_metadata = self.save_and_update_metadata(normalized_data)
 
-        return normalized_data, normalized_metadata
+        return normalized_metadata
 
 
 if __name__ == "__main__":
