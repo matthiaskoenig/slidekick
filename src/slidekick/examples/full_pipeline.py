@@ -1,3 +1,4 @@
+import slidekick
 from slidekick import DATA_PATH
 from slidekick.io.metadata import Metadata
 from slidekick.processing import ValisRegistrator, StainNormalizer, StainSeparator, LobuleSegmentor, LobuleStatistics
@@ -12,6 +13,8 @@ if __name__ == '__main__':
                    DATA_PATH / "reg" / "Ecad_CYP2E1.czi",
                    ]
 
+    slidekick.OUTPUT_PATH = DATA_PATH / "slidekick"
+
     # Create Metadata
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
@@ -21,21 +24,25 @@ if __name__ == '__main__':
     metadatas_normalized += metadatas[2:]
 
     # Align MetaDatas with VALIS
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600, confirm=False)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600,
+                                   confirm=False)
 
     metadatas_registered = Registrator.apply()
 
     # Separate Stains
-    metadatas_separated = [StainSeparator(metadata, mode="flourescence", confirm=False).apply() for metadata in metadatas if "CYP" in metadata.filename_original]
+    metadatas_separated = [StainSeparator(metadata, mode="flourescence", confirm=False, preview=False).apply()
+                           for metadata in metadatas if "CYP" in metadata.filename_original]
 
     # Choose metadata for segmentation
     # metadatas_registered: [HE1, HE2, Arginase1, KI67, GS_CYP1A2, ECAD_CYP1A2]
     # metadatas_separated: [[GS, CYP1A2, DAPI], [Ecad, CYP2E1, DAPI]]
-    # TODO: Choose segmentations
-    metadatas_for_segmentation = []
+    metadatas_for_segmentation = [metadatas_separated[0][0],  # GS -> PV Marker
+                                  metadatas_separated[1][0],  # Ecad
+                                  ]
 
     # Segment Lobules
-    segmentor = LobuleSegmentor(metadatas_for_segmentation, channels_pp=1, channels_pv=2, base_level=0, region_size=25, adaptive_histonorm=True)
+    segmentor = LobuleSegmentor(metadatas_for_segmentation, channels_pp=None, channels_pv=0, base_level=2,
+                                region_size=200, adaptive_histonorm=True)
 
     metadata_segmentation, metadata_portality = segmentor.apply()
 
