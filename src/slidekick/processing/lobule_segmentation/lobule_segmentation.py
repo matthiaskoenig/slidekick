@@ -11,6 +11,8 @@ import napari
 import matplotlib
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
+from magicgui import magicgui
+from magicgui.widgets import Container, PushButton
 
 from slidekick.processing.baseoperator import BaseOperator
 from slidekick.io.metadata import Metadata
@@ -48,7 +50,8 @@ class LobuleSegmentor(BaseOperator):
                  target_superpixels: int = None,
                  adaptive_histonorm: bool = True,
                  # nonlinear KMeans
-                 nonlinear_kmeans: bool = True,
+                 interactive_weighting: bool = True,
+                 nonlinear_kmeans: bool = False,
                  alpha_pv: float = 2.0,
                  alpha_pp: float = 3.0,
                  pp_gamma: float = 0.65,
@@ -63,11 +66,11 @@ class LobuleSegmentor(BaseOperator):
                  vessel_zone_ratio_thr_pv: float = 0.55,
                  vessel_circularity_min: float = 0.12,
                  # vessel grouping  # TODO. Check if this is necessary after all other stuff is fixed
-                 vessel_merge_enable: bool = True,
+                 vessel_merge_enable: bool = False,
                  vessel_merge_dist_px: int = 12,
                  vessel_merge_intensity_drop_max: float = 12.0,
                  vessel_merge_profile_steps: int = 21,
-                 min_area_px: int = 15000):
+                 min_area_px: int = 5000):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -83,6 +86,7 @@ class LobuleSegmentor(BaseOperator):
         @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         @param adaptive_histonorm: use adaptive histogram norm in filtering
+        @param interactive_weighting: whether to use interactive weighting in a napari preview
         @param nonlinear_kmeans: use a non-linear feature weighting in K_means
         @param alpha_pv: weighting factors for superpixel clustering for pv channels in linear KMeans
         @param alpha_pp: weighting factors for superpixel clustering for pp channels in linear KMeans
@@ -116,6 +120,7 @@ class LobuleSegmentor(BaseOperator):
         self.adaptive_histonorm = adaptive_histonorm
 
         # Kmeans
+        self.interactive_weighting = interactive_weighting
         self.nonlinear_kmeans = nonlinear_kmeans
         self.pp_gamma = pp_gamma
         self.pv_gamma = pv_gamma
@@ -263,6 +268,241 @@ class LobuleSegmentor(BaseOperator):
         # Start the Napari event loop (blocks until all viewer windows are closed)
         napari.run()
 
+    def _preview_channel_weighting(
+            self,
+            image_stack: np.ndarray,
+    ) -> None:
+        """
+        Interactive Napari preview that shows how the KMeans / nonlinear
+        weighting parameters affect the *composite* PP and PV channels
+        BEFORE superpixel generation and KMeans.
+
+        - Uses a downsampled copy of `image_stack` for speed.
+        - Computes one weighted PP image and one weighted PV image
+          (mean over the respective channels after nonlinear+alpha weights).
+        - Updates overlays automatically when a control changes (no 'Update' button).
+        - Provides 'Reset to defaults' and 'Confirm and continue' buttons.
+        """
+        if image_stack.ndim != 3:
+            raise ValueError(f"Expected (H, W, C) stack, got {image_stack.shape}")
+
+        # only show relevant channels (PP + PV)
+        channels_interest: List[int] = []
+        if self.channels_pp is not None:
+            channels_interest.extend(self.channels_pp)
+        if self.channels_pv is not None:
+            channels_interest.extend(self.channels_pv)
+        channels_interest = sorted(set(channels_interest))
+
+        if not channels_interest:
+            console.print(
+                "Interactive weighting requested, but no channels_pp/channels_pv defined.",
+                style="warning",
+            )
+            return
+
+        # downsample whole stack for preview
+        stack_small = downsample_to_max_side(image_stack, 1024)
+        H, W, C = stack_small.shape
+
+        # remember current values as "defaults" for reset
+        defaults = dict(
+            nonlinear_kmeans=self.nonlinear_kmeans,
+            alpha_pp=self.alpha_pp,
+            alpha_pv=self.alpha_pv,
+            pp_gamma=self.pp_gamma,
+            pv_gamma=self.pv_gamma,
+            nl_low_pct=self.nl_low_pct,
+            nl_high_pct=self.nl_high_pct,
+        )
+
+        def compute_pp_pv_images() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+            """
+            Compute composite PP and PV images that mirror the feature
+            transformation used for KMeans:
+
+              - optional nonlinear_channel_weighting (gamma + percentiles)
+              - alpha_pp / alpha_pv linear weighting
+
+            Returns (pp_img, pv_img) as uint8 arrays in [0, 255],
+            or None if the respective channel list is empty.
+            """
+            flat = stack_small.reshape(-1, C).astype(np.float32)
+
+            # Nonlinear weighting (same as in skeletize_kmeans, but on pixels)
+            if self.nonlinear_kmeans:
+                X = nonlinear_channel_weighting(
+                    flat,
+                    self.channels_pp,
+                    self.channels_pv,
+                    self.pp_gamma,
+                    self.pv_gamma,
+                    self.nl_low_pct,
+                    self.nl_high_pct,
+                )
+            else:
+                X = flat
+
+            # Linear weights alpha_pp / alpha_pv per feature
+            w_feat = np.ones(X.shape[1], dtype=np.float32)
+            if self.channels_pp:
+                for idx in self.channels_pp:
+                    if 0 <= idx < w_feat.shape[0]:
+                        w_feat[idx] *= self.alpha_pp
+            if self.channels_pv:
+                for idx in self.channels_pv:
+                    if 0 <= idx < w_feat.shape[0]:
+                        w_feat[idx] *= self.alpha_pv
+
+            Xw = X * w_feat
+            Xw_img = Xw.reshape(H, W, C)
+
+            pp_img: Optional[np.ndarray] = None
+            pv_img: Optional[np.ndarray] = None
+
+            # composite PP: mean over weighted PP channels, then normalize 0–255
+            if self.channels_pp:
+                pp_vals = Xw_img[..., self.channels_pp]
+                if pp_vals.ndim == 2:
+                    pp_float = pp_vals
+                else:
+                    pp_float = pp_vals.mean(axis=2)
+                mn = float(np.nanmin(pp_float))
+                mx = float(np.nanmax(pp_float))
+                if mx > mn:
+                    pp_img = (((pp_float - mn) / (mx - mn)) * 255.0).astype(np.uint8)
+                else:
+                    pp_img = np.zeros((H, W), dtype=np.uint8)
+
+            # composite PV: mean over weighted PV channels, then normalize 0–255
+            if self.channels_pv:
+                pv_vals = Xw_img[..., self.channels_pv]
+                if pv_vals.ndim == 2:
+                    pv_float = pv_vals
+                else:
+                    pv_float = pv_vals.mean(axis=2)
+                mn = float(np.nanmin(pv_float))
+                mx = float(np.nanmax(pv_float))
+                if mx > mn:
+                    pv_img = (((pv_float - mn) / (mx - mn)) * 255.0).astype(np.uint8)
+                else:
+                    pv_img = np.zeros((H, W), dtype=np.uint8)
+
+            return pp_img, pv_img
+
+        pp_img, pv_img = compute_pp_pv_images()
+
+        # Napari viewer
+        viewer = napari.Viewer()
+        # TODO: Integrate with slidekick viewer
+
+        pp_layer = None
+        pv_layer = None
+
+        if pp_img is not None:
+            pp_layer = viewer.add_image(
+                pp_img,
+                name="PP channel (weighted)",
+                colormap="green",
+                blending="additive",
+                opacity=0.5,
+            )
+
+        if pv_img is not None:
+            pv_layer = viewer.add_image(
+                pv_img,
+                name="PV channel (weighted)",
+                colormap="magenta",
+                blending="additive",
+                opacity=0.5,
+            )
+
+        @magicgui(
+            layout="vertical",
+            auto_call=True,  # update on every change
+            nonlinear_kmeans={"widget_type": "CheckBox"},
+            alpha_pp={"min": 0.0, "max": 5.0, "step": 0.1},
+            alpha_pv={"min": 0.0, "max": 5.0, "step": 0.1},
+            pp_gamma={"min": 0.1, "max": 2.0, "step": 0.05},
+            pv_gamma={"min": 0.1, "max": 2.0, "step": 0.05},
+            nl_low_pct={"min": 0.0, "max": 20.0, "step": 1.0},
+            nl_high_pct={"min": 50.0, "max": 100.0, "step": 1.0},
+        )
+        def weighting_controls(
+                nonlinear_kmeans: bool = self.nonlinear_kmeans,
+                alpha_pp: float = self.alpha_pp,
+                alpha_pv: float = self.alpha_pv,
+                pp_gamma: float = self.pp_gamma,
+                pv_gamma: float = self.pv_gamma,
+                nl_low_pct: float = self.nl_low_pct,
+                nl_high_pct: float = self.nl_high_pct,
+        ):
+            """
+            This function is called automatically whenever any control changes.
+            It updates self.*, recomputes weighted PP/PV images and updates layers.
+            """
+            # update object state: these will be used later by skeletize_kmeans
+            self.nonlinear_kmeans = nonlinear_kmeans
+            self.alpha_pp = alpha_pp
+            self.alpha_pv = alpha_pv
+            self.pp_gamma = pp_gamma
+            self.pv_gamma = pv_gamma
+            self.nl_low_pct = nl_low_pct
+            self.nl_high_pct = nl_high_pct
+
+            console.print(
+                f"Updated KMeans weighting params:\n"
+                f"  nonlinear_kmeans={self.nonlinear_kmeans}\n"
+                f"  alpha_pp={self.alpha_pp}, alpha_pv={self.alpha_pv}\n"
+                f"  pp_gamma={self.pp_gamma}, pv_gamma={self.pv_gamma}\n"
+                f"  nl_low_pct={self.nl_low_pct}, nl_high_pct={self.nl_high_pct}",
+                style="info",
+            )
+
+            # recompute composite PP / PV images and update layers
+            new_pp, new_pv = compute_pp_pv_images()
+            nonlocal pp_layer, pv_layer
+            if pp_layer is not None and new_pp is not None:
+                pp_layer.data = new_pp
+            if pv_layer is not None and new_pv is not None:
+                pv_layer.data = new_pv
+
+        # extra buttons: reset to defaults, confirm and continue
+        reset_btn = PushButton(text="Reset to defaults")
+        confirm_btn = PushButton(text="Confirm and continue")
+
+        def on_reset(*args):
+            # restore defaults in the object
+            self.nonlinear_kmeans = defaults["nonlinear_kmeans"]
+            self.alpha_pp = defaults["alpha_pp"]
+            self.alpha_pv = defaults["alpha_pv"]
+            self.pp_gamma = defaults["pp_gamma"]
+            self.pv_gamma = defaults["pv_gamma"]
+            self.nl_low_pct = defaults["nl_low_pct"]
+            self.nl_high_pct = defaults["nl_high_pct"]
+
+            # restore defaults in the GUI; auto_call will recompute overlays
+            weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
+            weighting_controls.alpha_pp.value = defaults["alpha_pp"]
+            weighting_controls.alpha_pv.value = defaults["alpha_pv"]
+            weighting_controls.pp_gamma.value = defaults["pp_gamma"]
+            weighting_controls.pv_gamma.value = defaults["pv_gamma"]
+            weighting_controls.nl_low_pct.value = defaults["nl_low_pct"]
+            weighting_controls.nl_high_pct.value = defaults["nl_high_pct"]
+
+        def on_confirm(*args):
+            # just close the viewer; napari.run() will return and apply() continues
+            viewer.close()
+
+        reset_btn.changed.connect(on_reset)
+        confirm_btn.changed.connect(on_confirm)
+
+        controls = Container(widgets=[weighting_controls, reset_btn, confirm_btn], layout="vertical")
+        viewer.window.add_dock_widget(controls, area="right")
+
+        napari.run()
+
+
     def _load_and_invert_images_from_metadatas(self, report_path: Path = None) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
         Load each image at the pyramid level defined, invert selected channels,
@@ -376,7 +616,7 @@ class LobuleSegmentor(BaseOperator):
         superpixelslic = cv2.ximgproc.createSuperpixelSLIC(
             image_stack, algorithm=cv2.ximgproc.MSLIC, region_size=region_size
         )
-        superpixelslic.iterate(num_iterations=20)
+        superpixelslic.iterate(num_iterations=10)
 
         superpixel_mask = superpixelslic.getLabelContourMask(thick_line=False)
         labels = superpixelslic.getLabels()
@@ -921,32 +1161,32 @@ class LobuleSegmentor(BaseOperator):
         for i in range(img_stack.shape[2]):
             cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
 
-        # Show Preview after loading and filtering
+        # Build per-channel views and titles once
+        if isinstance(img_stack, list):
+            imgs = img_stack
+        elif hasattr(img_stack, "shape"):
+            if img_stack.ndim == 2:
+                imgs = [np.asarray(img_stack)]
+            elif img_stack.ndim == 3:
+                # assume H, W, N and split channels
+                imgs = [np.asarray(img_stack[..., i]) for i in range(img_stack.shape[2])]
+            else:
+                raise ValueError("Unsupported img_stack shape for preview.")
+        else:
+            raise ValueError("Unsupported img_stack type for preview.")
+
+        titles = []
+        for i, md in enumerate(self.metadata):
+            name = getattr(md, "name", None) or getattr(md, "sample_id", None) \
+                   or getattr(md, "path", None)
+            try:
+                name = Path(name).name  # shorten if it's a path
+            except Exception:
+                pass
+            titles.append(str(name) if name is not None else f"image_{i}")
+
+        # Classic preview of all channels
         if self.preview:
-            # Ensure we have a list of arrays to preview
-            # numpy array -> split into list
-            if isinstance(img_stack, list):
-                imgs = img_stack
-            elif hasattr(img_stack, "shape"):
-                if img_stack.ndim == 2:
-                    imgs = [np.asarray(img_stack)]
-                elif img_stack.ndim == 3:
-                    # assume H, W, N and split channels
-                    imgs = [np.asarray(img_stack[..., i]) for i in range(img_stack.shape[2])]
-                else:
-                    raise ValueError("Unsupported img_stack shape for preview.")
-
-            # Optional titles from metadata if available
-            titles = []
-            for i, md in enumerate(self.metadata):
-                name = getattr(md, "name", None) or getattr(md, "sample_id", None) \
-                       or getattr(md, "path", None)
-                try:
-                    name = Path(name).name  # shorten if it's a path
-                except Exception:
-                    pass
-                titles.append(str(name) if name is not None else f"image_{i}")
-
             self._preview_images(imgs, titles)
 
         if self.confirm:
@@ -954,6 +1194,10 @@ class LobuleSegmentor(BaseOperator):
             if not apply:
                 console.print("Aborted by user. No segmentation performed.", style="error")
                 return self.metadata
+
+        # Interactive weighting preview
+        if self.interactive_weighting:
+            self._preview_channel_weighting(img_stack)
 
         # Superpixel algorithm (steps 3–7)
         pad = 10  # adjust if you want a different safety border
