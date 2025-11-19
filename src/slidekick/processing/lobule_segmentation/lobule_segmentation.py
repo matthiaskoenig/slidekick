@@ -761,159 +761,369 @@ class LobuleSegmentor(BaseOperator):
 
         console.print("Complete. Now detecting vessels in detected zonation...", style="info")
 
-        # 4) Vessel detection and superpixel reassignment
-        vessel_classes: List[int] = []
-        vessel_contours: List[np.ndarray] = []
+        # keep a copy of the pure KMeans assignment so we can restart from it
+        assigned_by_sp_kmeans: Dict[int, int] = dict(assigned_by_sp)
 
-        k = max(1, int(self.vessel_annulus_px))
-        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
-
+        # approximate tissue mask from current stack
         tissue_bool = (image_stack.mean(axis=2) > 0)
         bg_bool = ~tissue_bool
 
-        def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
-            Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
+        def run_vessel_dection(
+                min_vessel_area_pp: int,
+                min_vessel_area_pv: int,
+                vessel_annulus_px: int,
+                vessel_zone_ratio_thr_pp: float,
+                vessel_zone_ratio_thr_pv: float,
+                vessel_circularity_min: float,
+        ) -> Tuple[np.ndarray, List[int], List[np.ndarray]]:
             """
-            Returns list of (hole_bool, ring_bool, contour, area, circularity)
-            from BOTH closed holes and edge-truncated arcs synthesized via erosion.
+            Run vessel detection and superpixel reassignment on top of the
+            fixed SLIC + KMeans result.
+
+            This uses the current KMeans based cluster_map, labels, fg_pix_mask,
+            idx_pp / idx_pv / idx_mid etc, but only changes the vessel related
+            parameters.
+
+            Returns
+            -------
+            cluster_map_final : (H, W) int32
+                Final zonation map after vessel based reassignment.
+            vessel_classes : list of int
+                One entry per contour, 0 for PV, 1 for PP.
+            vessel_contours : list of np.ndarray
+                Contours corresponding to detected vessels.
             """
-            out = []
-            contours, hierarchy = cv2.findContours(mask_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-            if contours is None or hierarchy is None:
+            H, W, _ = image_stack.shape
+
+            # start each run from the unmodified KMeans assignment
+            assigned_by_sp_local: Dict[int, int] = dict(assigned_by_sp_kmeans)
+
+            get_lab_local = np.vectorize(lambda sp: assigned_by_sp_local.get(int(sp), -1))
+
+            # 4) Vessel detection and superpixel reassignment
+            vessel_classes: List[int] = []
+            vessel_contours: List[np.ndarray] = []
+
+            k = max(1, int(vessel_annulus_px))
+            se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+
+            def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
+                Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
+                """
+                Returns list of (hole_bool, ring_bool, contour, area, circularity)
+                from BOTH closed holes and edge-truncated arcs synthesized via erosion.
+                """
+                out = []
+                contours, hierarchy = cv2.findContours(mask_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                if contours is None or hierarchy is None:
+                    return out
+                Hh = hierarchy[0]
+
+                # permissive minima for candidate gen (final class later)
+                min_area = min(int(min_vessel_area_pp), int(min_vessel_area_pv))
+                circ_min = float(vessel_circularity_min) * 0.9
+
+                for i, cnt in enumerate(contours):
+                    # A) CLOSED HOLES (child contours)
+                    if Hh[i][3] != -1:
+                        area = cv2.contourArea(cnt)
+                        if area < max(1, min_area):
+                            continue
+                        peri = max(cv2.arcLength(cnt, True), 1e-6)
+                        circ = float(4.0 * np.pi * area / (peri * peri))
+                        if circ < circ_min:
+                            continue
+
+                        hole_mask = np.zeros((H, W), dtype=np.uint8)
+                        cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                        hole_bool = hole_mask > 0
+
+                        dil = cv2.dilate(hole_mask, se)
+                        ero = cv2.erode(hole_mask, se)
+                        ring = cv2.subtract(dil, ero)
+                        ring_bool = ring > 0
+                        if not np.any(ring_bool):
+                            continue
+
+                        out.append((hole_bool, ring_bool, cnt, area, circ))
+                        continue
+
+                    # B) EDGE / TRUNCATED BLOBS (external contours touching border)
+                    x, y, w2, h2 = cv2.boundingRect(cnt)
+                    touches_border = (x == 0) or (y == 0) or (x + w2 == W) or (y + h2 == H)
+                    if not touches_border:
+                        continue
+
+                    area_ext = cv2.contourArea(cnt)
+                    if area_ext < max(1, min_area):
+                        continue
+                    peri_ext = max(cv2.arcLength(cnt, True), 1e-6)
+                    circ_ext = float(4.0 * np.pi * area_ext / (peri_ext * peri_ext))
+                    if circ_ext < circ_min:
+                        continue
+
+                    ext_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.drawContours(ext_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+
+                    # ensure adjacency to background -> “open” ring
+                    border_contact = cv2.dilate((bg_bool.astype(np.uint8) * 255), se)
+                    if float(np.mean((border_contact > 0)[ext_mask > 0])) < 0.10:
+                        continue
+
+                    inner = cv2.erode(ext_mask, se)
+                    synth_hole = cv2.erode(inner, se)
+                    ring_e = cv2.subtract(inner, synth_hole)
+
+                    hole_bool = synth_hole > 0
+                    ring_bool = ring_e > 0
+                    if not np.any(hole_bool) or not np.any(ring_bool):
+                        continue
+
+                    out.append((hole_bool, ring_bool, cnt, area_ext, circ_ext))
+
                 return out
-            Hh = hierarchy[0]
 
-            # permissive minima for candidate gen (final class later)
-            min_area = min(int(self.min_vessel_area_pp), int(self.min_vessel_area_pv))
-            circ_min = float(self.vessel_circularity_min) * 0.9
+            # unified candidate pool from all labeled tissue (avoid PP↔PV bias)
+            mask_all = np.zeros((H, W), dtype=np.uint8)
+            mask_all[(cluster_map >= 0)] = 255
+            candidates = _collect_candidates_from_mask(mask_all)
 
-            for i, cnt in enumerate(contours):
-                # A) CLOSED HOLES (child contours)
-                if Hh[i][3] != -1:
-                    area = cv2.contourArea(cnt)
-                    if area < max(1, min_area):
-                        continue
-                    peri = max(cv2.arcLength(cnt, True), 1e-6)
-                    circ = float(4.0 * np.pi * area / (peri * peri))
-                    if circ < circ_min:
-                        continue
+            # classify by ring-majority; collect (no reassignment yet); then group & reassign
+            candidates.sort(key=lambda t: t[3], reverse=True)  # largest first
 
-                    hole_mask = np.zeros((H, W), dtype=np.uint8)
-                    cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
-                    hole_bool = hole_mask > 0
+            # We'll keep full info so we can merge later:
+            kept_items: List[Tuple[np.ndarray, np.ndarray, int, int, np.ndarray]] = []
 
-                    dil = cv2.dilate(hole_mask, se)
-                    ero = cv2.erode(hole_mask, se)
-                    ring = cv2.subtract(dil, ero)
-                    ring_bool = ring > 0
-                    if not np.any(ring_bool):
-                        continue
-
-                    out.append((hole_bool, ring_bool, cnt, area, circ))
+            for hole_bool, ring_bool, cnt, area_c, circ_c in candidates:
+                # MID-aware classification (exclude MID & BG from denominator)
+                ring_is_mid = np.isin(cluster_map, idx_mid)
+                ring_mid = ring_bool & ring_is_mid
+                ring_bg = ring_bool & (cluster_map < 0)
+                ring_eligible = ring_bool & ~(ring_mid | ring_bg)
+                eligible_n = int(np.count_nonzero(ring_eligible))
+                if eligible_n == 0:
                     continue
 
-                # B) EDGE / TRUNCATED BLOBS (external contours touching border)
-                x, y, w2, h2 = cv2.boundingRect(cnt)
-                touches_border = (x == 0) or (y == 0) or (x + w2 == W) or (y + h2 == H)
-                if not touches_border:
+                pp_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pp)))
+                pv_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pv)))
+                pp_frac = pp_count / float(eligible_n)
+                pv_frac = pv_count / float(eligible_n)
+
+                pp_pass = pp_frac >= float(vessel_zone_ratio_thr_pp)
+                pv_pass = pv_frac >= float(vessel_zone_ratio_thr_pv)
+                if not (pp_pass or pv_pass):
                     continue
 
-                area_ext = cv2.contourArea(cnt)
-                if area_ext < max(1, min_area):
+                if pp_pass and (not pv_pass or pp_frac >= pv_frac):
+                    cls = 1
+                    zone_idx = idx_pp
+                else:
+                    cls = 0
+                    zone_idx = idx_pv
+
+                # No nesting (centroid inside an existing kept contour of ANY class)
+                M = cv2.moments(cnt)
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"]);
+                    cy = int(M["m01"] / M["m00"])
+                else:
+                    x, y, w2, h2 = cv2.boundingRect(cnt)
+                    cx, cy = x + w2 // 2, y + h2 // 2
+
+                nested = False
+                for (_h, prev_cnt, _c, _z, _r) in kept_items:
+                    if cv2.pointPolygonTest(prev_cnt, (float(cx), float(cy)), False) >= 0:
+                        nested = True
+                        break
+                if nested:
                     continue
-                peri_ext = max(cv2.arcLength(cnt, True), 1e-6)
-                circ_ext = float(4.0 * np.pi * area_ext / (peri_ext * peri_ext))
-                if circ_ext < circ_min:
-                    continue
 
-                ext_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(ext_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                kept_items.append((hole_bool, cnt, cls, zone_idx, ring_bool))
 
-                # ensure adjacency to background -> “open” ring
-                border_contact = cv2.dilate((bg_bool.astype(np.uint8) * 255), se)
-                if float(np.mean((border_contact > 0)[ext_mask > 0])) < 0.10:
-                    continue
+            # Commit: reassign SPs for each detected vessel (no grouping)
+            for hole_bool, cnt, cls, zone_idx, _ring_bool in kept_items:
+                sp_inside = np.unique(labels[hole_bool])
+                for sp in sp_inside:
+                    assigned_by_sp_local[int(sp)] = zone_idx
+                vessel_contours.append(cnt)
+                vessel_classes.append(cls)
 
-                inner = cv2.erode(ext_mask, se)
-                synth_hole = cv2.erode(inner, se)
-                ring_e = cv2.subtract(inner, synth_hole)
+            # Rebuild final per-pixel cluster map after reassignment
+            cluster_map_final = get_lab_local(labels).astype(np.int32)
 
-                hole_bool = synth_hole > 0
-                ring_bool = ring_e > 0
-                if not np.any(hole_bool) or not np.any(ring_bool):
-                    continue
+            return cluster_map_final, vessel_classes, vessel_contours
 
-                out.append((hole_bool, ring_bool, cnt, area_ext, circ_ext))
+        # remember current vessel params as defaults for this run
+        defaults = dict(
+            min_vessel_area_pp=self.min_vessel_area_pp,
+            min_vessel_area_pv=self.min_vessel_area_pv,
+            vessel_annulus_px=self.vessel_annulus_px,
+            vessel_zone_ratio_thr_pp=self.vessel_zone_ratio_thr_pp,
+            vessel_zone_ratio_thr_pv=self.vessel_zone_ratio_thr_pv,
+            vessel_circularity_min=self.vessel_circularity_min,
+        )
 
-            return out
+        if self.interactive_vessels:
+            # initial run with current parameters (reuses SLIC + KMeans result)
+            cluster_map_prev, vessel_classes_prev, vessel_contours_prev = run_vessel_dection(
+                self.min_vessel_area_pp,
+                self.min_vessel_area_pv,
+                self.vessel_annulus_px,
+                self.vessel_zone_ratio_thr_pp,
+                self.vessel_zone_ratio_thr_pv,
+                self.vessel_circularity_min,
+            )
 
-        # unified candidate pool from all labeled tissue (avoid PP↔PV bias)
-        mask_all = np.zeros((H, W), dtype=np.uint8)
-        mask_all[(cluster_map >= 0)] = 255
-        candidates = _collect_candidates_from_mask(mask_all)
+            # base image and helper for overlay
+            base_vis = image_stack.mean(axis=2).astype(np.uint8)
+            base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
 
-        # classify by ring-majority; collect (no reassignment yet); then group & reassign
-        candidates.sort(key=lambda t: t[3], reverse=True)  # largest first
+            COLOR_PP = (255, 0, 255)
+            COLOR_MID = (60, 160, 60)
+            COLOR_PV = (0, 165, 255)
 
-        # We'll keep full info so we can merge later:
-        kept_items: List[Tuple[np.ndarray, np.ndarray, int, int, np.ndarray]] = []
+            def make_overlay(cm_local: np.ndarray,
+                             vclasses_local: List[int],
+                             vcontours_local: List[np.ndarray]) -> np.ndarray:
+                """Build zonation + vessel overlay as RGB image."""
+                zon_rgb = np.zeros_like(base_rgb, dtype=np.uint8)
 
-        for hole_bool, ring_bool, cnt, area_c, circ_c in candidates:
-            # MID-aware classification (exclude MID & BG from denominator)
-            ring_is_mid = np.isin(cluster_map, idx_mid)
-            ring_mid = ring_bool & ring_is_mid
-            ring_bg = ring_bool & (cluster_map < 0)
-            ring_eligible = ring_bool & ~(ring_mid | ring_bg)
-            eligible_n = int(np.count_nonzero(ring_eligible))
-            if eligible_n == 0:
-                continue
+                mask_pp = (cm_local == idx_pp) & fg_pix_mask
+                mask_pv = (cm_local == idx_pv) & fg_pix_mask
+                mask_mid = np.zeros_like(mask_pp, dtype=bool)
+                for mid_idx in idx_mid:
+                    mask_mid |= (cm_local == mid_idx)
+                mask_mid &= fg_pix_mask
 
-            pp_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pp)))
-            pv_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pv)))
-            pp_frac = pp_count / float(eligible_n)
-            pv_frac = pv_count / float(eligible_n)
+                zon_rgb[mask_pp] = COLOR_PP
+                zon_rgb[mask_mid] = COLOR_MID
+                zon_rgb[mask_pv] = COLOR_PV
 
-            pp_pass = pp_frac >= float(self.vessel_zone_ratio_thr_pp)
-            pv_pass = pv_frac >= float(self.vessel_zone_ratio_thr_pv)
-            if not (pp_pass or pv_pass):
-                continue
+                ov_bgr = cv2.addWeighted(base_rgb, 0.6, zon_rgb, 0.4, 0.0)
+                for cnt, cls in zip(vcontours_local, vclasses_local):
+                    # central (PV) = yellow, portal (PP) = magenta
+                    color = (255, 255, 0) if cls == 0 else (255, 0, 255)
+                    cv2.drawContours(ov_bgr, [cnt], -1, color, thickness=2)
 
-            if pp_pass and (not pv_pass or pp_frac >= pv_frac):
-                cls = 1
-                zone_idx = idx_pp
-            else:
-                cls = 0
-                zone_idx = idx_pv
+                return cv2.cvtColor(ov_bgr, cv2.COLOR_BGR2RGB)
 
-            # No nesting (centroid inside an existing kept contour of ANY class)
-            M = cv2.moments(cnt)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"]);
-                cy = int(M["m01"] / M["m00"])
-            else:
-                x, y, w2, h2 = cv2.boundingRect(cnt)
-                cx, cy = x + w2 // 2, y + h2 // 2
+            overlay_rgb = make_overlay(cluster_map_prev, vessel_classes_prev, vessel_contours_prev)
 
-            nested = False
-            for (_h, prev_cnt, _c, _z, _r) in kept_items:
-                if cv2.pointPolygonTest(prev_cnt, (float(cx), float(cy)), False) >= 0:
-                    nested = True
-                    break
-            if nested:
-                continue
+            viewer = napari.Viewer()
+            overlay_layer = viewer.add_image(
+                overlay_rgb,
+                name="Zonation + vessels (preview)",
+                rgb=True,
+                blending="translucent",
+            )
 
-            kept_items.append((hole_bool, cnt, cls, zone_idx, ring_bool))
+            # sliders only, no auto recompute
+            @magicgui(
+                layout="vertical",
+                auto_call=False,
+                min_vessel_area_pp={"min": 0, "max": 10000, "step": 50},
+                min_vessel_area_pv={"min": 0, "max": 10000, "step": 50},
+                vessel_annulus_px={"min": 1, "max": 100, "step": 1},
+                vessel_zone_ratio_thr_pp={"min": 0.0, "max": 1.0, "step": 0.01},
+                vessel_zone_ratio_thr_pv={"min": 0.0, "max": 1.0, "step": 0.01},
+                vessel_circularity_min={"min": 0.0, "max": 1.0, "step": 0.01},
+            )
+            def vessel_controls(
+                    min_vessel_area_pp: int = self.min_vessel_area_pp,
+                    min_vessel_area_pv: int = self.min_vessel_area_pv,
+                    vessel_annulus_px: int = self.vessel_annulus_px,
+                    vessel_zone_ratio_thr_pp: float = self.vessel_zone_ratio_thr_pp,
+                    vessel_zone_ratio_thr_pv: float = self.vessel_zone_ratio_thr_pv,
+                    vessel_circularity_min: float = self.vessel_circularity_min,
+            ):
+                # this function body can stay empty, we drive recompute via buttons
+                return
 
-        # Commit: reassign SPs for each detected vessel (no grouping)
-        for hole_bool, cnt, cls, zone_idx, _ring_bool in kept_items:
-            sp_inside = np.unique(labels[hole_bool])
-            for sp in sp_inside:
-                assigned_by_sp[int(sp)] = zone_idx
-            vessel_contours.append(cnt)
-            vessel_classes.append(cls)
+            # three buttons: change (recalc), reset, confirm
+            change_btn = PushButton(text="Change (recalculate vessels)")
+            reset_btn = PushButton(text="Reset vessel params")
+            confirm_btn = PushButton(text="Confirm and continue")
 
-        # Rebuild final per-pixel cluster map after reassignment
-        cluster_map_final = get_lab(labels).astype(np.int32)
+            def _apply_current_slider_values():
+                """Helper to push slider values to self and recompute overlay."""
+                # read from sliders
+                self.min_vessel_area_pp = int(vessel_controls.min_vessel_area_pp.value)
+                self.min_vessel_area_pv = int(vessel_controls.min_vessel_area_pv.value)
+                self.vessel_annulus_px = int(vessel_controls.vessel_annulus_px.value)
+                self.vessel_zone_ratio_thr_pp = float(vessel_controls.vessel_zone_ratio_thr_pp.value)
+                self.vessel_zone_ratio_thr_pv = float(vessel_controls.vessel_zone_ratio_thr_pv.value)
+                self.vessel_circularity_min = float(vessel_controls.vessel_circularity_min.value)
+
+                console.print(
+                    "Updated vessel gating params: "
+                    f"min_pp={self.min_vessel_area_pp}, "
+                    f"min_pv={self.min_vessel_area_pv}, "
+                    f"annulus={self.vessel_annulus_px}, "
+                    f"zone_thr_pp={self.vessel_zone_ratio_thr_pp:.2f}, "
+                    f"zone_thr_pv={self.vessel_zone_ratio_thr_pv:.2f}, "
+                    f"circ_min={self.vessel_circularity_min:.2f}",
+                    style="info",
+                )
+
+                cm_local, vclasses_local, vcontours_local = run_vessel_dection(
+                    self.min_vessel_area_pp,
+                    self.min_vessel_area_pv,
+                    self.vessel_annulus_px,
+                    self.vessel_zone_ratio_thr_pp,
+                    self.vessel_zone_ratio_thr_pv,
+                    self.vessel_circularity_min,
+                )
+                overlay_layer.data = make_overlay(cm_local, vclasses_local, vcontours_local)
+
+            def on_change(*args):
+                _apply_current_slider_values()
+
+            def on_reset(*args):
+                # restore defaults in self
+                self.min_vessel_area_pp = defaults["min_vessel_area_pp"]
+                self.min_vessel_area_pv = defaults["min_vessel_area_pv"]
+                self.vessel_annulus_px = defaults["vessel_annulus_px"]
+                self.vessel_zone_ratio_thr_pp = defaults["vessel_zone_ratio_thr_pp"]
+                self.vessel_zone_ratio_thr_pv = defaults["vessel_zone_ratio_thr_pv"]
+                self.vessel_circularity_min = defaults["vessel_circularity_min"]
+
+                # restore GUI values
+                vessel_controls.min_vessel_area_pp.value = defaults["min_vessel_area_pp"]
+                vessel_controls.min_vessel_area_pv.value = defaults["min_vessel_area_pv"]
+                vessel_controls.vessel_annulus_px.value = defaults["vessel_annulus_px"]
+                vessel_controls.vessel_zone_ratio_thr_pp.value = defaults["vessel_zone_ratio_thr_pp"]
+                vessel_controls.vessel_zone_ratio_thr_pv.value = defaults["vessel_zone_ratio_thr_pv"]
+                vessel_controls.vessel_circularity_min.value = defaults["vessel_circularity_min"]
+
+                # recompute overlay using defaults
+                _apply_current_slider_values()
+
+            def on_confirm(*args):
+                # keep whatever is currently in self.* and close viewer
+                viewer.close()
+
+            change_btn.changed.connect(on_change)
+            reset_btn.changed.connect(on_reset)
+            confirm_btn.changed.connect(on_confirm)
+
+            controls = Container(
+                widgets=[vessel_controls, change_btn, reset_btn, confirm_btn],
+                layout="vertical",
+            )
+            viewer.window.add_dock_widget(controls, area="right")
+
+            napari.run()
+
+
+        # final vessel detection with whatever parameters the user ended up with
+        cluster_map_final, vessel_classes, vessel_contours = run_vessel_dection(
+            self.min_vessel_area_pp,
+            self.min_vessel_area_pv,
+            self.vessel_annulus_px,
+            self.vessel_zone_ratio_thr_pp,
+            self.vessel_zone_ratio_thr_pv,
+            self.vessel_circularity_min,
+        )
 
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
         template[~fg_pix_mask] = 0
