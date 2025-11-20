@@ -156,6 +156,8 @@ def downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
         # clip to [0,255] then cast for stable visualization
         arr = np.clip(arr, 0, 255).astype(np.uint8)
 
+    arr = arr.squeeze()
+
     pil = Image.fromarray(arr)
     pil = pil.resize((new_w, new_h), resample=Image.LANCZOS)
     out = np.asarray(pil)

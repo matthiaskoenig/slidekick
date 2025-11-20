@@ -291,7 +291,11 @@ class LobuleSegmentor(BaseOperator):
 
         # downsample whole stack for preview
         stack_small = downsample_to_max_side(image_stack, 1024)
-        H, W, C = stack_small.shape
+        if stack_small.ndim == 3:
+            H, W, C = stack_small.shape
+        else:
+            H, W = stack_small.shape
+            C = 1
 
         # remember current values as "defaults" for reset
         defaults = dict(
@@ -409,12 +413,12 @@ class LobuleSegmentor(BaseOperator):
             layout="vertical",
             auto_call=True,  # update on every change
             nonlinear_kmeans={"widget_type": "CheckBox"},
-            alpha_pp={"min": 0.0, "max": 5.0, "step": 0.1},
-            alpha_pv={"min": 0.0, "max": 5.0, "step": 0.1},
-            pp_gamma={"min": 0.1, "max": 2.0, "step": 0.05},
-            pv_gamma={"min": 0.1, "max": 2.0, "step": 0.05},
-            nl_low_pct={"min": 0.0, "max": 20.0, "step": 1.0},
-            nl_high_pct={"min": 50.0, "max": 100.0, "step": 1.0},
+            alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
+            alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
+            pp_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
+            pv_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
+            nl_low_pct={"min": 0.0, "max": 50.0, "step": 0.5},
+            nl_high_pct={"min": 50.0, "max": 100.0, "step": 0.5},
         )
         def weighting_controls(
                 nonlinear_kmeans: bool = self.nonlinear_kmeans,
@@ -456,8 +460,8 @@ class LobuleSegmentor(BaseOperator):
                 pv_layer.data = new_pv
 
         # extra buttons: reset to defaults, confirm and continue
-        reset_btn = PushButton(text="Reset to defaults")
         confirm_btn = PushButton(text="Confirm and continue")
+        reset_btn = PushButton(text="Reset to defaults")
 
         def on_reset(*args):
             # restore defaults in the object
@@ -482,10 +486,10 @@ class LobuleSegmentor(BaseOperator):
             # just close the viewer; napari.run() will return and apply() continues
             viewer.close()
 
-        reset_btn.changed.connect(on_reset)
         confirm_btn.changed.connect(on_confirm)
+        reset_btn.changed.connect(on_reset)
 
-        controls = Container(widgets=[weighting_controls, reset_btn, confirm_btn], layout="vertical")
+        controls = Container(widgets=[weighting_controls, confirm_btn, reset_btn], layout="vertical")
         viewer.window.add_dock_widget(controls, area="right")
 
         napari.run()
@@ -1017,10 +1021,11 @@ class LobuleSegmentor(BaseOperator):
                 blending="translucent",
             )
 
-            # sliders only, no auto recompute
+            # sliders + a single "Change" button created by magicgui
             @magicgui(
                 layout="vertical",
                 auto_call=False,
+                call_button="Change (recalculate vessels)",  # rename magicgui's Run button
                 min_vessel_area_pp={"min": 0, "max": 10000, "step": 50},
                 min_vessel_area_pv={"min": 0, "max": 10000, "step": 50},
                 vessel_annulus_px={"min": 1, "max": 100, "step": 1},
@@ -1036,23 +1041,13 @@ class LobuleSegmentor(BaseOperator):
                     vessel_zone_ratio_thr_pv: float = self.vessel_zone_ratio_thr_pv,
                     vessel_circularity_min: float = self.vessel_circularity_min,
             ):
-                # this function body can stay empty, we drive recompute via buttons
-                return
-
-            # three buttons: change (recalc), reset, confirm
-            change_btn = PushButton(text="Change (recalculate vessels)")
-            reset_btn = PushButton(text="Reset vessel params")
-            confirm_btn = PushButton(text="Confirm and continue")
-
-            def _apply_current_slider_values():
-                """Helper to push slider values to self and recompute overlay."""
-                # read from sliders
-                self.min_vessel_area_pp = int(vessel_controls.min_vessel_area_pp.value)
-                self.min_vessel_area_pv = int(vessel_controls.min_vessel_area_pv.value)
-                self.vessel_annulus_px = int(vessel_controls.vessel_annulus_px.value)
-                self.vessel_zone_ratio_thr_pp = float(vessel_controls.vessel_zone_ratio_thr_pp.value)
-                self.vessel_zone_ratio_thr_pv = float(vessel_controls.vessel_zone_ratio_thr_pv.value)
-                self.vessel_circularity_min = float(vessel_controls.vessel_circularity_min.value)
+                # push values from GUI into object state
+                self.min_vessel_area_pp = int(min_vessel_area_pp)
+                self.min_vessel_area_pv = int(min_vessel_area_pv)
+                self.vessel_annulus_px = int(vessel_annulus_px)
+                self.vessel_zone_ratio_thr_pp = float(vessel_zone_ratio_thr_pp)
+                self.vessel_zone_ratio_thr_pv = float(vessel_zone_ratio_thr_pv)
+                self.vessel_circularity_min = float(vessel_circularity_min)
 
                 console.print(
                     "Updated vessel gating params: "
@@ -1065,6 +1060,7 @@ class LobuleSegmentor(BaseOperator):
                     style="info",
                 )
 
+                # recompute vessels only
                 cm_local, vclasses_local, vcontours_local = run_vessel_dection(
                     self.min_vessel_area_pp,
                     self.min_vessel_area_pv,
@@ -1075,8 +1071,9 @@ class LobuleSegmentor(BaseOperator):
                 )
                 overlay_layer.data = make_overlay(cm_local, vclasses_local, vcontours_local)
 
-            def on_change(*args):
-                _apply_current_slider_values()
+            # two extra buttons: Reset and Confirm
+            confirm_btn = PushButton(text="Confirm and continue")
+            reset_btn = PushButton(text="Reset vessel params")
 
             def on_reset(*args):
                 # restore defaults in self
@@ -1095,25 +1092,23 @@ class LobuleSegmentor(BaseOperator):
                 vessel_controls.vessel_zone_ratio_thr_pv.value = defaults["vessel_zone_ratio_thr_pv"]
                 vessel_controls.vessel_circularity_min.value = defaults["vessel_circularity_min"]
 
-                # recompute overlay using defaults
-                _apply_current_slider_values()
+                # re-run with defaults (same as pressing Change)
+                vessel_controls()
 
             def on_confirm(*args):
                 # keep whatever is currently in self.* and close viewer
                 viewer.close()
 
-            change_btn.changed.connect(on_change)
-            reset_btn.changed.connect(on_reset)
             confirm_btn.changed.connect(on_confirm)
+            reset_btn.changed.connect(on_reset)
 
             controls = Container(
-                widgets=[vessel_controls, change_btn, reset_btn, confirm_btn],
+                widgets=[vessel_controls, confirm_btn, reset_btn],
                 layout="vertical",
             )
             viewer.window.add_dock_widget(controls, area="right")
 
             napari.run()
-
 
         # final vessel detection with whatever parameters the user ended up with
         cluster_map_final, vessel_classes, vessel_contours = run_vessel_dection(

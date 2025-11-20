@@ -16,6 +16,7 @@ if __name__ == '__main__':
     slidekick.OUTPUT_PATH = DATA_PATH / "slidekick"
 
     # Create Metadata
+    # TODO: Populate metadata
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     # Normalize HE Stains
@@ -47,5 +48,9 @@ if __name__ == '__main__':
     metadata_segmentation, metadata_portality = segmentor.apply()
 
     # Create Lobule Statistics
-    # TODO: Statistics
-    # TODO: Populate metadata
+    metadata_for_stats = [metadatas_registered[2:4],  # Arginase1, KI67
+                          metadatas_separated[0][:2],  # GS, CYP1A2,
+                          metadatas_separated[1][:2],  # ECad, CYP2E1
+                          ]
+    operator = LobuleStatistics(metadata_portality, metadata_for_stats, num_bins=10)
+    operator.apply()
