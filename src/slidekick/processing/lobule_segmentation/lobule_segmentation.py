@@ -769,10 +769,11 @@ class LobuleSegmentor(BaseOperator):
         assigned_by_sp_kmeans: Dict[int, int] = dict(assigned_by_sp)
 
         # approximate tissue mask from current stack
-        tissue_bool = (image_stack.mean(axis=2) > 0)
+        base_gray = image_stack.mean(axis=2).astype(np.uint8)
+        tissue_bool = base_gray > 0
         bg_bool = ~tissue_bool
 
-        def run_vessel_dection(
+        def run_vessel_detection(
                 min_vessel_area_pp: int,
                 min_vessel_area_pv: int,
                 vessel_annulus_px: int,
@@ -969,7 +970,7 @@ class LobuleSegmentor(BaseOperator):
 
         if self.interactive_vessels:
             # initial run with current parameters (reuses SLIC + KMeans result)
-            cluster_map_prev, vessel_classes_prev, vessel_contours_prev = run_vessel_dection(
+            cluster_map_prev, vessel_classes_prev, vessel_contours_prev = run_vessel_detection(
                 self.min_vessel_area_pp,
                 self.min_vessel_area_pv,
                 self.vessel_annulus_px,
@@ -1061,7 +1062,7 @@ class LobuleSegmentor(BaseOperator):
                 )
 
                 # recompute vessels only
-                cm_local, vclasses_local, vcontours_local = run_vessel_dection(
+                cm_local, vclasses_local, vcontours_local = run_vessel_detection(
                     self.min_vessel_area_pp,
                     self.min_vessel_area_pv,
                     self.vessel_annulus_px,
@@ -1111,7 +1112,7 @@ class LobuleSegmentor(BaseOperator):
             napari.run()
 
         # final vessel detection with whatever parameters the user ended up with
-        cluster_map_final, vessel_classes, vessel_contours = run_vessel_dection(
+        cluster_map_final, vessel_classes, vessel_contours = run_vessel_detection(
             self.min_vessel_area_pp,
             self.min_vessel_area_pv,
             self.vessel_annulus_px,
