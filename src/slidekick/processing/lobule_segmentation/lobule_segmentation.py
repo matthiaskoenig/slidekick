@@ -66,6 +66,8 @@ class LobuleSegmentor(BaseOperator):
                  vessel_zone_ratio_thr_pp: float = 0.35,
                  vessel_zone_ratio_thr_pv: float = 0.55,
                  vessel_circularity_min: float = 0.12,
+                 bg_low_val: float = 5.0,
+                 bg_superpixel_frac: float = 0.7,
                  min_area_px: int = 5000):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
@@ -97,6 +99,8 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_zone_ratio_thr_pp: fraction of ring that must be PP
         @param vessel_zone_ratio_thr_pv: fraction of ring that must be PV
         @param vessel_circularity_min: 4πA/P^2 gate; low keeps elongated vessels
+        @param bg_low_val: Intensity values (0-255) used to define globally dark pixels that are considered background.
+        @param bg_superpixel_frac: Minimal fraction of such dark pixels inside a superpixel for that superpixel to be treated as background and removed from foreground.
         @param min_area_px: Define area threshold to filter out very small polygons (noise)
         """
         self.throw_out_ratio = throw_out_ratio
@@ -128,6 +132,8 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_zone_ratio_thr_pp = vessel_zone_ratio_thr_pp
         self.vessel_zone_ratio_thr_pv = vessel_zone_ratio_thr_pv
         self.vessel_circularity_min = vessel_circularity_min
+        self.bg_low_val = bg_low_val
+        self.bg_superpixel_frac = bg_superpixel_frac
 
         # lobule generation
         self.min_area_px = min_area_px
@@ -634,10 +640,99 @@ class LobuleSegmentor(BaseOperator):
         ]).T
         dark_frac = np.divide(dark_counts, counts[:, None], where=nz[:, None])
 
-        fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
-        fg_labels = np.nonzero(fg_label_mask)[0]
+        base_fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
 
-        fg_pix_mask = np.isin(labels, fg_labels)
+        gray_flat = img_flat.mean(axis=1)
+
+        def compute_fg_masks(lumen_low_pct_val: float, bg_superpixel_frac_val: float):
+            fg_mask_local = base_fg_label_mask.copy()
+            thr_gray = float(lumen_low_pct_val)
+            if thr_gray > 0.0:
+                gray_dark = (gray_flat <= thr_gray).astype(np.float32)
+                gray_dark_counts = np.bincount(
+                    lab_flat, weights=gray_dark, minlength=num_labels
+                )
+                gray_dark_frac = np.divide(gray_dark_counts, counts, where=nz)
+                lumen_labels = gray_dark_frac >= bg_superpixel_frac_val
+                fg_mask_local &= ~lumen_labels
+            fg_labels_local = np.nonzero(fg_mask_local)[0]
+            fg_pix_mask_local = np.isin(labels, fg_labels_local)
+            return fg_mask_local, fg_labels_local, fg_pix_mask_local
+
+        if self.interactive_vessels:
+
+            stored_vals = [self.bg_low_val, self.bg_superpixel_frac]
+
+            fg_label_mask, fg_labels, fg_pix_mask = compute_fg_masks(
+                self.bg_low_val, self.bg_superpixel_frac
+            )
+
+            base_gray = image_stack.mean(axis=2).astype(np.uint8)
+            viewer = napari.Viewer()
+            base_layer = viewer.add_image(
+                base_gray,
+                name="base_gray",
+                colormap="gray",
+                blending="translucent",
+            )
+            removed_pix_mask = np.logical_not(fg_pix_mask)
+
+            removed_layer = viewer.add_image(
+                removed_pix_mask.astype(np.uint8)*255,
+                name="vessel superpixels",
+                colormap="cyan",
+                opacity=1.0,
+                blending="additive",
+            )
+
+            @magicgui(
+                layout="vertical",
+                auto_call=True,
+                bg_low_val={"min": 0.0, "max": 255.0, "step": 1.0},
+                bg_superpixel_frac={"min": 0.0, "max": 1.0, "step": 0.01},
+            )
+            def vessel_controls(
+                    bg_low_val: float = self.bg_low_val,
+                    bg_superpixel_frac: float = self.bg_superpixel_frac,
+            ):
+                self.bg_low_val = float(bg_low_val)
+                self.bg_superpixel_frac = float(bg_superpixel_frac)
+                mask_local, labels_local, pix_mask_local = compute_fg_masks(
+                    self.bg_low_val, self.bg_superpixel_frac
+                )
+                removed_layer.data = (np.logical_not(pix_mask_local).astype(np.uint8) * 255)
+
+            confirm_btn = PushButton(text="Confirm and continue")
+            reset_btn = PushButton(text="Reset vessel (bg/fg) params")
+
+            def on_reset(*args):
+                self.bg_low_val = stored_vals[0]
+                self.bg_superpixel_frac = stored_vals[1]
+                vessel_controls.bg_low_val.value = self.bg_low_val
+                vessel_controls.bg_superpixel_frac.value = self.bg_superpixel_frac
+
+            def on_confirm(*args):
+                viewer.close()
+
+            confirm_btn.changed.connect(on_confirm)
+            reset_btn.changed.connect(on_reset)
+
+            controls = Container(
+                widgets=[vessel_controls, confirm_btn, reset_btn],
+                layout="vertical",
+            )
+            viewer.window.add_dock_widget(controls, area="right")
+
+            napari.run()
+
+            fg_label_mask, fg_labels, fg_pix_mask = compute_fg_masks(
+                self.bg_low_val, self.bg_superpixel_frac
+            )
+        else:
+            fg_label_mask, fg_labels, fg_pix_mask = compute_fg_masks(
+                self.bg_low_val, self.bg_superpixel_frac
+            )
+
 
         sums = np.vstack([
             np.bincount(lab_flat, weights=img_flat[:, c], minlength=num_labels)
@@ -990,7 +1085,7 @@ class LobuleSegmentor(BaseOperator):
             def make_overlay(cm_local: np.ndarray,
                              vclasses_local: List[int],
                              vcontours_local: List[np.ndarray]) -> np.ndarray:
-                """Build zonation + vessel overlay as RGB image."""
+                """""Build zonation + vessel overlay as RGB image."""
                 zon_rgb = np.zeros_like(base_rgb, dtype=np.uint8)
 
                 mask_pp = (cm_local == idx_pp) & fg_pix_mask
