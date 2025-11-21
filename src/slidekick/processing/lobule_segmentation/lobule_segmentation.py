@@ -296,12 +296,9 @@ class LobuleSegmentor(BaseOperator):
             return
 
         # downsample whole stack for preview
-        stack_small = downsample_to_max_side(image_stack, 1024)
-        if stack_small.ndim == 3:
-            H, W, C = stack_small.shape
-        else:
-            H, W = stack_small.shape
-            C = 1
+        frames_small = [downsample_to_max_side(image_stack[..., c], 2048) for c in range(image_stack.shape[2])]
+        stack_small = np.stack(frames_small, axis=-1)
+        H, W, C = stack_small.shape
 
         # remember current values as "defaults" for reset
         defaults = dict(
@@ -327,12 +324,14 @@ class LobuleSegmentor(BaseOperator):
             """
             flat = stack_small.reshape(-1, C).astype(np.float32)
 
-            # Nonlinear weighting (same as in skeletize_kmeans, but on pixels)
+            channels_pp = [c for c in (self.channels_pp or []) if 0 <= c < C]
+            channels_pv = [c for c in (self.channels_pv or []) if 0 <= c < C]
+
             if self.nonlinear_kmeans:
                 X = nonlinear_channel_weighting(
                     flat,
-                    self.channels_pp,
-                    self.channels_pv,
+                    channels_pp,
+                    channels_pv,
                     self.pp_gamma,
                     self.pv_gamma,
                     self.nl_low_pct,
@@ -341,16 +340,11 @@ class LobuleSegmentor(BaseOperator):
             else:
                 X = flat
 
-            # Linear weights alpha_pp / alpha_pv per feature
             w_feat = np.ones(X.shape[1], dtype=np.float32)
-            if self.channels_pp:
-                for idx in self.channels_pp:
-                    if 0 <= idx < w_feat.shape[0]:
-                        w_feat[idx] *= self.alpha_pp
-            if self.channels_pv:
-                for idx in self.channels_pv:
-                    if 0 <= idx < w_feat.shape[0]:
-                        w_feat[idx] *= self.alpha_pv
+            for idx in channels_pp:
+                w_feat[idx] *= self.alpha_pp
+            for idx in channels_pv:
+                w_feat[idx] *= self.alpha_pv
 
             Xw = X * w_feat
             Xw_img = Xw.reshape(H, W, C)
@@ -359,8 +353,8 @@ class LobuleSegmentor(BaseOperator):
             pv_img: Optional[np.ndarray] = None
 
             # composite PP: mean over weighted PP channels, then normalize 0–255
-            if self.channels_pp:
-                pp_vals = Xw_img[..., self.channels_pp]
+            if channels_pp:
+                pp_vals = Xw_img[..., channels_pp]
                 if pp_vals.ndim == 2:
                     pp_float = pp_vals
                 else:
@@ -373,8 +367,8 @@ class LobuleSegmentor(BaseOperator):
                     pp_img = np.zeros((H, W), dtype=np.uint8)
 
             # composite PV: mean over weighted PV channels, then normalize 0–255
-            if self.channels_pv:
-                pv_vals = Xw_img[..., self.channels_pv]
+            if channels_pv:
+                pv_vals = Xw_img[..., channels_pv]
                 if pv_vals.ndim == 2:
                     pv_float = pv_vals
                 else:
