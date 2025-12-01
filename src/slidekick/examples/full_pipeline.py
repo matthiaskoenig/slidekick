@@ -37,12 +37,13 @@ if __name__ == '__main__':
     # Choose metadata for segmentation
     # metadatas_registered: [HE1, HE2, Arginase1, KI67, GS_CYP1A2, ECAD_CYP1A2]
     # metadatas_separated: [[GS, CYP1A2, DAPI], [Ecad, CYP2E1, DAPI]]
-    metadatas_for_segmentation = [metadatas_separated[0][0],  # GS -> PV Marker
-                                  metadatas_separated[1][0],  # Ecad
+    metadatas_for_segmentation = [metadatas_registered[2],  # Arginase1 -> PP
+                                  metadatas_separated[0][0],  # GS -> PV Marker
+                                  metadatas_separated[1][0],  # Ecad -> PP
                                   ]
 
     # Segment Lobules
-    segmentor = LobuleSegmentor(metadatas_for_segmentation, channels_pp=None, channels_pv=0, base_level=2,
+    segmentor = LobuleSegmentor(metadatas_for_segmentation, channels_pp=[0,2], channels_pv=1, base_level=2,
                                 region_size=200, adaptive_histonorm=True)
 
     metadata_segmentation, metadata_portality = segmentor.apply()

@@ -39,12 +39,106 @@ DEFAULT_STAIN_NAMES = {
 }
 
 # helpers
+def _estimate_channel_bg(ch_arr: np.ndarray,
+                         n_bins: int = 512) -> float:
+    """
+    Estimate the background level of a single image channel.
+
+    Parameters
+    ----------
+    ch_arr : np.ndarray
+        2D image array containing the channel intensities.
+    n_bins : int, optional
+        Number of bins to use for the histogram, by default 512.
+
+    Returns
+    -------
+    float
+        Estimated background intensity level.
+    """
+    # Flatten the array and ensure float32 for consistency
+    vals = ch_arr.ravel().astype(np.float32)
+
+    # Remove NaN and inf values, so they do not affect histogram statistics
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+
+    # Lower limit is the minimum observed value
+    lo = float(vals.min())
+
+    # Upper limit is the 99th percentile to avoid extreme bright outliers
+    hi = float(np.percentile(vals, 99.0))
+
+    # Ensure the histogram range is not degenerate
+    if hi <= lo:
+        hi = lo + 1.0
+
+    # Compute histogram over the chosen range
+    hist, edges = np.histogram(vals, bins=n_bins, range=(lo, hi))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    # Peak detection
+    # Interior local maxima:
+    #   hist[i] is a peak if it is strictly greater than the previous bin
+    #   and greater or equal to the next bin.
+    interior_peaks = np.where(
+        (hist[1:-1] > hist[:-2]) &
+        (hist[1:-1] >= hist[2:])
+    )[0] + 1  # shift back to original indices
+
+    # Handle edge bins explicitly, since the expression above never tests
+    # hist[0] or hist[-1]. This is why the original code missed the peak
+    # at zero.
+    peak_indices = list(interior_peaks)
+
+    # Left edge: consider it a peak if it is not lower than its only neighbor
+    if hist.size > 1 and hist[0] >= hist[1]:
+        peak_indices.insert(0, 0)
+
+    # Right edge: consider it a peak if it is not lower than its only neighbor
+    if hist.size > 1 and hist[-1] >= hist[-2]:
+        peak_indices.append(len(hist) - 1)
+
+    peak_idx = np.array(peak_indices, dtype=int)
+
+    # If no peaks are found (highly unlikely but possible for flat histograms),
+    # fall back to a robust statistic.
+    if peak_idx.size == 0:
+        bg_level = float(np.percentile(vals, 5.0))
+    else:
+        # Sort peaks from low to high intensity
+        peak_idx = peak_idx[np.argsort(centers[peak_idx])]
+
+        # Filter out very small peaks: keep only peaks that have at least
+        # a certain fraction of the global maximum height
+        height_thresh = 0.02 * hist.max()
+        peak_idx = [i for i in peak_idx if hist[i] >= height_thresh]
+
+        # If there are still no peaks after thresholding, fall back to median
+        if len(peak_idx) == 0:
+            bg_level = float(np.percentile(vals, 50.0))
+        else:
+            # If we have at least three peaks, we assume:
+            #   peak_idx[0]  big spike at (or near) zero
+            #   peak_idx[1]  background mode
+            # Otherwise we just take the first peak.
+            if len(peak_idx) >= 3:
+                idx_bg = peak_idx[1]
+            else:
+                idx_bg = peak_idx[0]
+
+            bg_level = float(centers[idx_bg])
+
+    return float(bg_level)
+
 def _to_numpy(arr):
     """Coerce zarr NumPy-like arrays to NumPy ndarray."""
     if isinstance(arr, zarr.Array):
         return arr[...]
     else:
         return np.asarray(arr)
+
 
 def _normalize_image_01(img_np: np.ndarray) -> np.ndarray:
     """Return float32 in [0,1] for brightfield math. Handles uint8/uint16/float."""
@@ -57,6 +151,7 @@ def _normalize_image_01(img_np: np.ndarray) -> np.ndarray:
         arr = arr / maxv
     arr = np.clip(arr, 1e-8, 1.0)  # avoid log(0)
     return arr
+
 
 def _first_available_level(level_dicts):
     """Return a level key present across stains, prefer smallest image (highest level index)."""
@@ -71,6 +166,7 @@ def _first_available_level(level_dicts):
         return None
     return max(common)
 
+
 class StainSeparator(BaseOperator):
 
     def __init__(self,
@@ -80,17 +176,20 @@ class StainSeparator(BaseOperator):
                  stain_profile: str = None,
                  custom_matrix: np.ndarray = None,
                  confirm: bool = True,
-                 preview: bool = True):
+                 preview: bool = True,
+                 remove_background: bool = True):
         """
         - mode: "brightfield" or "fluorescence" (auto if None)
         - stain_profile: e.g. "H&E", "H-DAB" (brightfield only)
         - custom_matrix: optional 3xN stain OD matrix (brightfield)
+        - remove_background: remove background in flourescence
         """
         self.mode = mode
         self.stain_profile = stain_profile
         self.custom_matrix = custom_matrix
         self.confirm = confirm
         self.preview = preview
+        self.remove_background = remove_background
         super().__init__(metadata, channel_selection=None)
 
     def apply(self):
@@ -328,6 +427,15 @@ class StainSeparator(BaseOperator):
 
         stain_dict = getattr(self.metadata[0], "stains", {}) or {}
 
+        bg_values = None
+        if self.remove_background:
+            A_bg = A0.astype(np.float32, copy=False)
+            bg_values = []
+            for ch in range(n_ch):
+                bg = _estimate_channel_bg(A_bg[:, :, ch])
+                bg_values.append(bg)
+            bg_values = np.array(bg_values, dtype=np.float32)
+
         # preview (downsampled only)
         if self.preview:
             try:
@@ -395,13 +503,30 @@ class StainSeparator(BaseOperator):
         # build full-resolution separated levels (no downsampling)
         separated_levels = {ch: {} for ch in range(n_ch)}
         for level, arr in image.items():
-            # keep ALL pyramid levels; each ch gets a level→2D array map
-            A = _to_numpy(arr)  # Y×X×C
+            A = _to_numpy(arr)
             if A.ndim != 3 or A.shape[2] != n_ch:
                 console.print(f"Unexpected image format at level {level}, skipping.", style="warning")
                 continue
+
+            # Remove background
+            if not self.remove_background or bg_values is None:
+                for ch in range(n_ch):
+                    separated_levels[ch][level] = np.asarray(A[:, :, ch])
+                continue
+
+            A_float = A.astype(np.float32, copy=False)
+
             for ch in range(n_ch):
-                separated_levels[ch][level] = np.asarray(A[:, :, ch])
+                ch_arr = A_float[:, :, ch] - bg_values[ch]
+                ch_arr[ch_arr < 0] = 0
+
+                if np.issubdtype(A.dtype, np.integer):
+                    info = np.iinfo(A.dtype)
+                    ch_out = np.clip(ch_arr, 0, info.max).astype(A.dtype)
+                else:
+                    ch_out = ch_arr.astype(A.dtype)
+
+                separated_levels[ch][level] = ch_out
 
         # save per channel (grayscale intensity)
         output_metadata = []
@@ -439,7 +564,7 @@ class StainSeparator(BaseOperator):
 if __name__ == "__main__":
     from slidekick import DATA_PATH
     from slidekick.io import read_wsi
-
+    """
     # Brightfield example
     image_path_brightfield = DATA_PATH / "reg" / "HE1.ome.tif"
     metadata_brightfield = Metadata(path_original=image_path_brightfield, path_storage=image_path_brightfield)
@@ -454,7 +579,7 @@ if __name__ == "__main__":
     # Check saved img
     img, _ = read_wsi(metadatas_brightfield[0].path_storage)
     print(img)
-
+    """
     # Fluorescence example
     image_path_fluorescence = DATA_PATH / "reg" / "GS_CYP1A2.czi"
     metadata_fluorescence = Metadata(path_original=image_path_fluorescence, path_storage=image_path_fluorescence)
