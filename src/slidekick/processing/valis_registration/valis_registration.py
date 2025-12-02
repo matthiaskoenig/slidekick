@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import datetime
 import uuid
 from pathlib import Path
@@ -26,85 +26,295 @@ class ValisRegistrator(BaseOperator):
     Registers slides using VALIS. For now: Only highest resolution level is supported.
     """
 
-    def __init__(self, metadata: List[Metadata],
-                 save_img: bool = True,
-                 imgs_ordered: bool = False,
-                 max_processed_image_dim_px: int = 850,
-                 max_non_rigid_registration_dim_px: int = 850,
-                 confirm: bool = True,
-                 preview: bool = True):
+    def __init__(
+        self,
+        metadata: List[Metadata],
+        save_img: bool = True,
+        imgs_ordered: bool = False,
+        max_processed_image_dim_px: int = 850,
+        max_non_rigid_registration_dim_px: int = 850,
+        error_threshold_px: float = 5.0,
+        max_attempts: int = 3,
+        upscale_factor: float = 1.5,
+        confirm: bool = True,
+        preview: bool = True,
+        adaptive_loop: bool = False,
+    ):
         """
         channel_selection is ignored for registration (we register whole images),
         but we keep the argument signature compatible with BaseOperator usage.
+
+        Parameters
+        ----------
+        metadata
+            List of Metadata objects to register.
+        max_processed_image_dim_px
+            Starting processed-image max dimension in pixels.
+        max_non_rigid_registration_dim_px
+            Starting non-rigid registration max dimension in pixels.
+        error_threshold_px
+            Target median feature-distance error in pixels. If the measured
+            error is larger, the registration will be retried with upsampled
+            processed / non-rigid dimensions.
+        max_attempts
+            Maximum number of registration attempts with increasing resolution.
+        upscale_factor
+            Multiplicative factor to increase processed / non-rigid dimensions
+            between attempts.
         """
         self.save_img = save_img
         channel_selection = None
         self.imgs_ordered = imgs_ordered
         self.max_processed_image_dim_px = max_processed_image_dim_px
         self.max_non_rigid_registration_dim_px = max_non_rigid_registration_dim_px
-        self.confirm = confirm  # Confirm if check is applied
-        self.preview = preview  # Preview transformation
+        self.error_threshold_px = error_threshold_px
+        self.max_attempts = max_attempts
+        self.upscale_factor = upscale_factor
+        self.confirm = confirm
+        self.preview = preview
+        self.adaptive_loop = adaptive_loop
+
+        # For inspection / downstream use
+        self.error_df = None
+        self.error_metric_px = None
+        self.results_root_dir: Optional[Path] = None
+
         super().__init__(metadata, channel_selection)
+
+    @staticmethod
+    def _compute_registration_error(error_df) -> float:
+        """
+        Compute a single scalar error metric from VALIS error_df.
+
+        Strategy:
+        - Prefer non-rigid distance-based metrics ("non_rigid_*D").
+        - Fallback to non-rigid TRE, then rigid metrics.
+        - Use the median across all chosen values.
+        - Return +inf if nothing usable is found.
+        """
+        import numpy as np
+
+        if error_df is None or error_df.empty:
+            return float("inf")
+
+        cols = [c for c in error_df.columns if c.startswith("non_rigid") and c.endswith("D")]
+        if not cols:
+            cols = [c for c in error_df.columns if c.startswith("non_rigid") and c.endswith("TRE")]
+        if not cols:
+            cols = [c for c in error_df.columns if c.startswith("rigid") and c.endswith("D")]
+        if not cols:
+            cols = [c for c in error_df.columns if c.startswith("rigid") and c.endswith("TRE")]
+        if not cols:
+            return float("inf")
+
+        vals = []
+        for c in cols:
+            v = np.asarray(error_df[c].values)
+            v = v[np.isfinite(v)]
+            if v.size:
+                vals.append(v)
+        if not vals:
+            return float("inf")
+
+        vals = np.concatenate(vals)
+        if vals.size == 0:
+            return float("inf")
+        return float(np.median(vals))
+
+    def _run_single_registration(
+            self,
+            results_dir: Path,
+            max_processed_dim: int,
+            max_nonrigid_dim: int
+    ):
+        """
+        Run one VALIS registration attempt at a given processed / non-rigid resolution.
+
+        Returns
+        -------
+        registrar: registration.Valis
+        error_df: pd.DataFrame
+        temp_img_dir: Path
+        registered_slide_dst_dir: Path
+        """
+        temp_img_dir = results_dir / "temp_imgs"
+        temp_img_dir.mkdir(parents=True, exist_ok=True)
+
+        for m in self.metadata:
+            shutil.copy(m.path_storage, temp_img_dir)
+
+        registered_slide_dst_dir = results_dir / "registered_slides"
+        registered_slide_dst_dir.mkdir(parents=True, exist_ok=True)
+
+        registrar = registration.Valis(
+            src_dir=str(temp_img_dir),
+            dst_dir=str(results_dir),
+            max_processed_image_dim_px=max_processed_dim,
+            max_non_rigid_registration_dim_px=max_nonrigid_dim,
+            imgs_ordered=self.imgs_ordered,
+            crop="reference",
+        )
+
+        try:
+            rigid_registrar, non_rigid_registrar, error_df = registrar.register()
+
+            registrar.register_micro(
+                max_non_rigid_registration_dim_px=max_nonrigid_dim
+            )
+
+            error_df = registrar.measure_error()
+
+            return registrar, error_df, temp_img_dir, registered_slide_dst_dir
+
+        except Exception as e:
+            console.print(
+                f"[VALIS] registration attempt failed at "
+                f"processed_dim={max_processed_dim}, non_rigid_dim={max_nonrigid_dim}: {e}",
+                style="error",
+            )
+            # clean up temp images for this attempt
+            shutil.rmtree(temp_img_dir, ignore_errors=True)
+            shutil.rmtree(registered_slide_dst_dir, ignore_errors=True)
+            # signal failure to caller
+            return None, None, None, None
 
     def apply(self):
         """
         Run VALIS registration for the slides listed in self.metadata.
 
-        Key behavior:
-        - Loads the slide file paths from the metadata list and gives them to VALIS
-          via img_list (this avoids intermediate array-handling problems and lets
-          VALIS use its internal slide readers and pyramids).
-        - Uses unordered registration (`imgs_ordered=False`) so VALIS can re-order
-          by similarity and pick its own center reference image.
-        - Forces VALIS to use the highest-resolution images for finding transforms
-          by setting a very large `max_processed_image_dim_px` (tune if needed).
-        - Warps/saves the full-resolution slides into a `registered_slides` folder
-          under a temporary results directory (under OUTPUT_PATH).
-        - DOES NOT return anything; instead stores useful results on `self` for
-          downstream processing / saving / metadata-updating.
+        Behavior
+        --------
+        - Uses Metadata objects as the primary interface.
+        - Runs VALIS registration in one or more attempts, starting at
+          max_processed_image_dim_px and max_non_rigid_registration_dim_px.
+        - After each attempt, measures registration error from VALIS' error_df.
+        - If the error is above error_threshold_px and attempts remain, it
+          upsamples the working resolution and repeats.
+        - Warps and saves full-resolution slides only for the best attempt.
+        - Updates each Metadata.path_storage / path_original to point to the
+          registered slides and sets image_type / uid accordingly.
         """
-
-        # Create a results folder for this registration run (under OUTPUT_PATH).
-        # Using a timestamp + short uuid to keep results separate if apply() called multiple times.
+        # Root results folder for all attempts
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         short_id = uuid.uuid4().hex[:8]
         new_uid = f"{timestamp}-{short_id}"
 
-        results_dir = Path(OUTPUT_PATH) / f"valis_registration_{timestamp}_{short_id}"
-        results_dir.mkdir(parents=True, exist_ok=True)
+        results_root_dir = Path(OUTPUT_PATH) / f"valis_registration_{timestamp}_{short_id}"
+        results_root_dir.mkdir(parents=True, exist_ok=True)
+        self.results_root_dir = results_root_dir
 
-        temp_img_dir = results_dir / "temp_imgs"
-        temp_img_dir.mkdir(parents=True, exist_ok=True)
+        if self.adaptive_loop:
 
-        # Copy every image metadata from path_storage to temp_img_dir
-        for m in self.metadata:
-            shutil.copy(m.path_storage, temp_img_dir)
+            # Adaptive resolution loop
+            cur_proc_dim = int(self.max_processed_image_dim_px)
+            cur_nonrigid_dim = int(self.max_non_rigid_registration_dim_px)
 
-        # registered slides destination folder
-        registered_slide_dst_dir = results_dir / "registered_slides"
-        registered_slide_dst_dir.mkdir(parents=True, exist_ok=True)
+            best_metric = None
+            best_registrar = None
+            best_error_df = None
+            best_results_dir = None
+            best_temp_img_dir = None
+            best_registered_slide_dst_dir = None
 
-        # VALIS parameter:
-        # - max_processed_image_dim_px controls the maximum dimension of the images used
-        #   for the 'processed' image (used to find transforms). By setting it very large,
-        #   VALIS will effectively use the highest-resolution level for transform estimation.
+            for attempt in range(1, self.max_attempts + 1):
+                attempt_results_dir = results_root_dir / f"attempt_{attempt}_proc{cur_proc_dim}_nr{cur_nonrigid_dim}"
+                attempt_results_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize VALIS registrar with the list of slide image paths.
-        # imgs_ordered=False lets VALIS reorder the images by similarity (unordered structure).
-        # reference_img_f=None leaves selection of reference image to VALIS (it will pick center).
+                console.print(
+                    f"[VALIS] attempt {attempt}/{self.max_attempts} at "
+                    f"processed_dim={cur_proc_dim}, non_rigid_dim={cur_nonrigid_dim}",
+                    style="info",
+                )
 
-        registrar = registration.Valis(
-            src_dir=str(temp_img_dir),
-            dst_dir=str(results_dir),
-            #img_list=img_paths, Unused for now
-            max_processed_image_dim_px=self.max_processed_image_dim_px,
-            max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px,
-            imgs_ordered=self.imgs_ordered,
-            crop="reference"
-        )
+                registrar, error_df, temp_img_dir, registered_slide_dst_dir = self._run_single_registration(
+                    attempt_results_dir,
+                    cur_proc_dim,
+                    cur_nonrigid_dim
+                )
 
-        # Run registration: returns rigid and non-rigid registrar objects and an error dataframe
-        rigid_registrar, non_rigid_registrar, error_df = registrar.register()
+                if registrar is None:
+                    # attempt failed, try next settings
+                    cur_proc_dim = int(cur_proc_dim * self.upscale_factor)
+                    cur_nonrigid_dim = int(cur_nonrigid_dim * self.upscale_factor)
+                    continue
+
+                metric = self._compute_registration_error(error_df)
+                console.print(
+                    f"[VALIS] attempt {attempt}: median registration error = {metric:.2f} px",
+                    style="info",
+                )
+
+                # Track best attempt
+                if best_metric is None or (np.isfinite(metric) and metric < best_metric):
+                    best_metric = metric
+                    best_registrar = registrar
+                    best_error_df = error_df
+                    best_results_dir = attempt_results_dir
+                    best_temp_img_dir = temp_img_dir
+                    best_registered_slide_dst_dir = registered_slide_dst_dir
+                else:
+                    # Not best, clean temp images for this attempt
+                    shutil.rmtree(temp_img_dir, ignore_errors=True)
+                    del registrar
+
+                # Stop if good enough or last attempt
+                if metric <= self.error_threshold_px or attempt == self.max_attempts:
+                    break
+
+                # Upsample for next attempt
+                cur_proc_dim = int(cur_proc_dim * self.upscale_factor)
+                cur_nonrigid_dim = int(cur_nonrigid_dim * self.upscale_factor)
+
+            # Use best attempt
+            if best_registrar is None:
+                console.print("VALIS registration failed for all attempts.", style="error")
+                return self.metadata
+
+            registrar = best_registrar
+            error_df = best_error_df
+            results_dir = best_results_dir
+            temp_img_dir = best_temp_img_dir
+            registered_slide_dst_dir = best_registered_slide_dst_dir
+
+            self.error_df = error_df
+            self.error_metric_px = best_metric
+
+        else:
+            temp_img_dir = results_root_dir / "temp_imgs"
+            temp_img_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy every image metadata from path_storage to temp_img_dir
+            for m in self.metadata:
+                shutil.copy(m.path_storage, temp_img_dir)
+
+            # registered slides destination folder
+            registered_slide_dst_dir = results_root_dir / "registered_slides"
+            registered_slide_dst_dir.mkdir(parents=True, exist_ok=True)
+
+            # VALIS parameter:
+            # - max_processed_image_dim_px controls the maximum dimension of the images used
+            #   for the 'processed' image (used to find transforms). By setting it very large,
+            #   VALIS will effectively use the highest-resolution level for transform estimation.
+
+            # Initialize VALIS registrar with the list of slide image paths.
+            # imgs_ordered=False lets VALIS reorder the images by similarity (unordered structure).
+            # reference_img_f=None leaves selection of reference image to VALIS (it will pick center).
+
+            registrar = registration.Valis(
+                src_dir=str(temp_img_dir),
+                dst_dir=str(results_root_dir),
+                # img_list=img_paths, Unused for now
+                max_processed_image_dim_px=self.max_processed_image_dim_px,
+                max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px,
+                imgs_ordered=self.imgs_ordered,
+                crop="reference"
+            )
+
+            # Run registration: returns rigid and non-rigid registrar objects and an error dataframe
+            rigid_registrar, non_rigid_registrar, error_df = registrar.register()
+            registrar.register_micro(max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px)
+
+            results_dir = self.results_root_dir
 
         # Preview: rows = [original color, rigid(gray), non-rigid(gray)] x cols = slides
         if self.preview:

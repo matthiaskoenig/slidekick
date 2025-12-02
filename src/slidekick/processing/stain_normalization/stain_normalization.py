@@ -20,7 +20,7 @@ class StainNormalizer(BaseOperator):
             self,
             metadata: Metadata,
             channel_selection: List[int],
-            HERef: np.ndarray = np.array([[0.65, 0.2159], [0.70, 0.8012], [0.29, 0.5581]]),
+            Ref: np.ndarray = np.array([[0.65, 0.2159], [0.70, 0.8012], [0.29, 0.5581]]),
             maxCRef: np.ndarray = np.array([1.9705, 1.0308]),
             save_img: bool = True) -> None:
 
@@ -30,7 +30,7 @@ class StainNormalizer(BaseOperator):
         if not isinstance(channel_selection, list) or len(channel_selection) != 3:
             raise ValueError("Channel selection must be a list of 3 channel indices.")
 
-        self.HERef = HERef
+        self.Ref = Ref
         self.maxCRef = maxCRef
         self.save_img = save_img
 
@@ -52,7 +52,16 @@ class StainNormalizer(BaseOperator):
             s_metadata = self.metadata
 
         if self.save_img:
-            storage_path = s_metadata.path_storage.with_name(s_metadata.path_storage.stem + "_normalized.tiff")
+
+            p = s_metadata.path_storage
+
+            # Strip all suffixes: e.g. "image.ome.tiff" -> "image"
+            base = p
+            while base.suffix:  # as long as there is any suffix
+                base = base.with_suffix("")  # remove one suffix at a time
+
+            # Build the new path with your desired suffix
+            storage_path = base.with_name(base.name + "_normalized.tiff")
         else:
             storage_path = None
 
@@ -104,7 +113,7 @@ class StainNormalizer(BaseOperator):
         normalized_data = {}
         for level, img in image_data.items():
             if img.ndim == 3 and img.shape[2] >= 3:  # Ensure we have at least 3 channels selected
-                normalized_img = normalize_stain(img, self.HERef, self.maxCRef)
+                normalized_img = normalize_stain(img, self.Ref, self.maxCRef)
                 normalized_data[level] = normalized_img
             else:
                 raise ValueError(f"Image at level {level} does not have enough channels for stain normalization.")
