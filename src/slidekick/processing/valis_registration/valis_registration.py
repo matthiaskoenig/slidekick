@@ -33,12 +33,15 @@ class ValisRegistrator(BaseOperator):
         imgs_ordered: bool = False,
         max_processed_image_dim_px: int = 850,
         max_non_rigid_registration_dim_px: int = 850,
+        max_micro_registration_dim_px: int = 1700,
         error_threshold_px: float = 5.0,
         max_attempts: int = 3,
         upscale_factor: float = 1.5,
         confirm: bool = True,
         preview: bool = True,
         adaptive_loop: bool = False,
+        micro_registration: bool = False,
+        crop: str = "overlap"
     ):
         """
         channel_selection is ignored for registration (we register whole images),
@@ -52,6 +55,8 @@ class ValisRegistrator(BaseOperator):
             Starting processed-image max dimension in pixels.
         max_non_rigid_registration_dim_px
             Starting non-rigid registration max dimension in pixels.
+        max_micro_registration_dim_px
+            Micro registration max dimension in pixels.
         error_threshold_px
             Target median feature-distance error in pixels. If the measured
             error is larger, the registration will be retried with upsampled
@@ -61,18 +66,27 @@ class ValisRegistrator(BaseOperator):
         upscale_factor
             Multiplicative factor to increase processed / non-rigid dimensions
             between attempts.
+        adaptive_loop
+            Adaptively upsample based on error metric
+        micro_registration
+            Use micro registration
+        crop
+            Cropping style of VALIS
         """
         self.save_img = save_img
         channel_selection = None
         self.imgs_ordered = imgs_ordered
         self.max_processed_image_dim_px = max_processed_image_dim_px
         self.max_non_rigid_registration_dim_px = max_non_rigid_registration_dim_px
+        self.max_micro_registration_dim_px = max_micro_registration_dim_px
         self.error_threshold_px = error_threshold_px
         self.max_attempts = max_attempts
         self.upscale_factor = upscale_factor
         self.confirm = confirm
         self.preview = preview
         self.adaptive_loop = adaptive_loop
+        self.micro_registration = micro_registration
+        self.crop = crop
 
         # For inspection / downstream use
         self.error_df = None
@@ -125,7 +139,8 @@ class ValisRegistrator(BaseOperator):
             self,
             results_dir: Path,
             max_processed_dim: int,
-            max_nonrigid_dim: int
+            max_nonrigid_dim: int,
+            max_micro_dim: int
     ):
         """
         Run one VALIS registration attempt at a given processed / non-rigid resolution.
@@ -152,15 +167,16 @@ class ValisRegistrator(BaseOperator):
             max_processed_image_dim_px=max_processed_dim,
             max_non_rigid_registration_dim_px=max_nonrigid_dim,
             imgs_ordered=self.imgs_ordered,
-            crop="reference",
+            crop=self.crop,
         )
 
         try:
             rigid_registrar, non_rigid_registrar, error_df = registrar.register()
 
-            registrar.register_micro(
-                max_non_rigid_registration_dim_px=max_nonrigid_dim
-            )
+            if self.micro_registration:
+                registrar.register_micro(
+                    max_non_rigid_registration_dim_px=max_micro_dim
+                )
 
             error_df = registrar.measure_error()
 
@@ -208,6 +224,7 @@ class ValisRegistrator(BaseOperator):
             # Adaptive resolution loop
             cur_proc_dim = int(self.max_processed_image_dim_px)
             cur_nonrigid_dim = int(self.max_non_rigid_registration_dim_px)
+            cur_micro_dim = int(self.max_micro_registration_dim_px)
 
             best_metric = None
             best_registrar = None
@@ -229,13 +246,15 @@ class ValisRegistrator(BaseOperator):
                 registrar, error_df, temp_img_dir, registered_slide_dst_dir = self._run_single_registration(
                     attempt_results_dir,
                     cur_proc_dim,
-                    cur_nonrigid_dim
+                    cur_nonrigid_dim,
+                    cur_micro_dim
                 )
 
                 if registrar is None:
                     # attempt failed, try next settings
                     cur_proc_dim = int(cur_proc_dim * self.upscale_factor)
                     cur_nonrigid_dim = int(cur_nonrigid_dim * self.upscale_factor)
+                    cur_micro_dim = int(cur_micro_dim * self.upscale_factor)
                     continue
 
                 metric = self._compute_registration_error(error_df)
@@ -264,6 +283,7 @@ class ValisRegistrator(BaseOperator):
                 # Upsample for next attempt
                 cur_proc_dim = int(cur_proc_dim * self.upscale_factor)
                 cur_nonrigid_dim = int(cur_nonrigid_dim * self.upscale_factor)
+                cur_micro_dim = int(cur_micro_dim * self.upscale_factor)
 
             # Use best attempt
             if best_registrar is None:
@@ -280,43 +300,38 @@ class ValisRegistrator(BaseOperator):
             self.error_metric_px = best_metric
 
         else:
-            temp_img_dir = results_root_dir / "temp_imgs"
-            temp_img_dir.mkdir(parents=True, exist_ok=True)
+            # Single-shot registration (no adaptive loop) using the same helper
+            proc_dim = int(self.max_processed_image_dim_px)
+            nonrigid_dim = int(self.max_non_rigid_registration_dim_px)
+            micro_dim = int(self.max_micro_registration_dim_px)
 
-            # Copy every image metadata from path_storage to temp_img_dir
-            for m in self.metadata:
-                shutil.copy(m.path_storage, temp_img_dir)
+            # Mirror the attempt_* naming used in the adaptive loop
+            results_dir = results_root_dir / f"attempt_1_proc{proc_dim}_nr{nonrigid_dim}"
+            results_dir.mkdir(parents=True, exist_ok=True)
 
-            # registered slides destination folder
-            registered_slide_dst_dir = results_root_dir / "registered_slides"
-            registered_slide_dst_dir.mkdir(parents=True, exist_ok=True)
-
-            # VALIS parameter:
-            # - max_processed_image_dim_px controls the maximum dimension of the images used
-            #   for the 'processed' image (used to find transforms). By setting it very large,
-            #   VALIS will effectively use the highest-resolution level for transform estimation.
-
-            # Initialize VALIS registrar with the list of slide image paths.
-            # imgs_ordered=False lets VALIS reorder the images by similarity (unordered structure).
-            # reference_img_f=None leaves selection of reference image to VALIS (it will pick center).
-
-            registrar = registration.Valis(
-                src_dir=str(temp_img_dir),
-                dst_dir=str(results_root_dir),
-                # img_list=img_paths, Unused for now
-                max_processed_image_dim_px=self.max_processed_image_dim_px,
-                max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px,
-                imgs_ordered=self.imgs_ordered,
-                crop="reference"
+            console.print(
+                f"[VALIS] single-shot registration at "
+                f"processed_dim={proc_dim}, non_rigid_dim={nonrigid_dim}, micro_dim={micro_dim}",
+                style="info",
             )
 
-            # Run registration: returns rigid and non-rigid registrar objects and an error dataframe
-            rigid_registrar, non_rigid_registrar, error_df = registrar.register()
-            registrar.register_micro(max_non_rigid_registration_dim_px=self.max_non_rigid_registration_dim_px)
+            # Delegate all the work (temp dir, copies, VALIS call, micro-reg, error_df)
+            registrar, error_df, temp_img_dir, registered_slide_dst_dir = self._run_single_registration(
+                results_dir,
+                proc_dim,
+                nonrigid_dim,
+                micro_dim,  # if your helper only takes two dims, drop this argument
+            )
 
-            results_dir = self.results_root_dir
+            if registrar is None:
+                console.print("VALIS registration failed.", style="error")
+                return self.metadata
 
-        # Preview: rows = [original color, rigid(gray), non-rigid(gray)] x cols = slides
+            # Keep the same bookkeeping as in the adaptive branch
+            self.error_df = error_df
+            self.error_metric_px = self._compute_registration_error(error_df)
+
+        # Preview: rows = [original, rigid, non-rigid, (optional micro)] x cols = slides
         if self.preview:
             try:
                 slides = list(registrar.slide_dict.values())
@@ -359,7 +374,7 @@ class ValisRegistrator(BaseOperator):
                 def _rgb_native(a: np.ndarray) -> np.ndarray:
                     """Preserve brightfield colors. Take first 3 channels. No per-channel stretch."""
                     x = np.asarray(a)
-                    if x.ndim == 2:  # rare for BF; make neutral RGB
+                    if x.ndim == 2:
                         x = np.repeat(x[:, :, None], 3, axis=2)
                     else:
                         x = x[..., :3]
@@ -367,7 +382,6 @@ class ValisRegistrator(BaseOperator):
                         return x
                     if x.dtype == np.uint16:
                         return (x / 257.0).clip(0, 255).astype(np.uint8)
-                    # float or other: uniform scale by global max (keeps color balance)
                     x = x.astype(np.float32, copy=False)
                     m = np.nanmax(x)
                     m = 1.0 if (not np.isfinite(m) or m <= 0) else m
@@ -404,9 +418,14 @@ class ValisRegistrator(BaseOperator):
 
                 def _rgb_from_channels_stretched(chs: list[np.ndarray]) -> np.ndarray:
                     """Fluorescence: per-channel percentile stretch to avoid black tiles."""
-                    return np.stack([_stretch99(np.asarray(chs[0])),
-                                     _stretch99(np.asarray(chs[1])),
-                                     _stretch99(np.asarray(chs[2]))], axis=-1)
+                    return np.stack(
+                        [
+                            _stretch99(np.asarray(chs[0])),
+                            _stretch99(np.asarray(chs[1])),
+                            _stretch99(np.asarray(chs[2])),
+                        ],
+                        axis=-1,
+                    )
 
                 # Map VALIS short name -> original file path (for thumbnail fallback)
                 name_to_src = {v: k for k, v in registrar.name_dict.items()}
@@ -417,14 +436,15 @@ class ValisRegistrator(BaseOperator):
                     if src is not None:
                         if _guess_brightfield(src):
                             return _downsample_stride(_rgb_native(src))
-                        # fluorescence or non-uint8 3-channel -> stretch per channel
                         return _downsample_stride(_rgb_from_channels_stretched(_pick_rgb3(src)))
                     # Fallback: thumbnail from original file via pyvips
                     src_fp = name_to_src.get(slide.name, None)
                     if src_fp and Path(src_fp).exists():
                         try:
                             v = pyvips.Image.thumbnail(str(src_fp), MAX_SIDE)
-                            arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(v.height, v.width, v.bands)
+                            arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(
+                                v.height, v.width, v.bands
+                            )
                             if arr.shape[2] == 1:
                                 arr = np.repeat(arr, 3, axis=2)
                             if arr.shape[2] > 3:
@@ -441,69 +461,137 @@ class ValisRegistrator(BaseOperator):
                     name = slide.name
                     proc = slide.processed_img  # registration resolution (2D)
 
-                    # Row 1: original color (BF native, FL stretch), ≤2048
+                    # Row 1: original color (BF native, FL stretch), ≤ MAX_SIDE
                     orig_rgb = _read_original_color(slide)
 
-                    # Rows 2–3: warp processed image to grayscale previews (shape-matched)
+                    # Rigid and micro previews from current displacement fields
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", category=UserWarning)
                         try:
                             rigid_gray = slide.warp_img(img=proc, non_rigid=False, crop=True)
                         except Exception:
                             rigid_gray = None
-                        try:
-                            nonrigid_gray = slide.warp_img(img=proc, non_rigid=True, crop=True)
-                        except Exception:
-                            nonrigid_gray = None
+
+                        if self.micro_registration:
+                            try:
+                                micro_nr_gray = slide.warp_img(img=proc, non_rigid=True, crop=True)
+                            except Exception:
+                                micro_nr_gray = None
+                        else:
+                            micro_nr_gray = None
 
                     rigid_gray = _downsample_stride(_stretch99(rigid_gray)) if rigid_gray is not None else None
-                    nonrigid_gray = _downsample_stride(_stretch99(nonrigid_gray)) if nonrigid_gray is not None else None
+                    micro_nr_gray = (
+                        _downsample_stride(_stretch99(micro_nr_gray)) if micro_nr_gray is not None else None
+                    )
 
-                    per_slide.append((name, orig_rgb, rigid_gray, nonrigid_gray))
+                    # Row 3: coarse non-rigid (pre-micro) from saved VALIS thumbnails if available
+                    coarse_nr_gray = None
+                    nr_path_str = getattr(slide, "nr_rigid_reg_img_f", None)
+                    if nr_path_str is not None:
+                        nr_path = Path(nr_path_str)
+                        if nr_path.exists():
+                            try:
+                                v = pyvips.Image.new_from_file(str(nr_path), access="sequential")
+                                arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(
+                                    v.height, v.width, v.bands
+                                )
+                                if arr.ndim == 2:
+                                    arr_gray = arr
+                                elif arr.ndim == 3:
+                                    if arr.shape[2] == 1:
+                                        arr_gray = arr[..., 0]
+                                    else:
+                                        arr_gray = np.mean(arr[..., :3], axis=2)
+                                else:
+                                    arr_gray = None
+                                if arr_gray is not None:
+                                    coarse_nr_gray = _downsample_stride(
+                                        _stretch99(arr_gray.astype(np.uint8, copy=False))
+                                    )
+                            except Exception:
+                                coarse_nr_gray = None
+
+                    per_slide.append((name, orig_rgb, rigid_gray, coarse_nr_gray, micro_nr_gray))
 
                 if not per_slide:
                     console.print("Nothing to preview.", style="warning")
                     return self.metadata
 
-                # Plot 3 rows x N columns
+                # Decide number of rows: 3 (no micro) or 4 (with micro)
                 n = len(per_slide)
+                n_rows = 4 if self.micro_registration else 3
                 fig_w = max(3.0 * n, 6.0)
-                fig_h = 9.0
-                fig, axes = plt.subplots(3, n, figsize=(fig_w, fig_h), constrained_layout=True)
+                fig_h = 9.0 if n_rows == 3 else 12.0
+                fig, axes = plt.subplots(n_rows, n, figsize=(fig_w, fig_h), constrained_layout=True)
                 if n == 1:
                     axes = np.expand_dims(axes, 1)
 
-                row_titles = ["original color", "rigid", "non-rigid"]
-                for j, (name, orig_p, rigid_p, nonrigid_p) in enumerate(per_slide):
+                row_titles = (
+                    ["original color", "rigid", "non-rigid", "micro"]
+                    if self.micro_registration
+                    else ["original color", "rigid", "non-rigid"]
+                )
+
+                for j, (name, orig_p, rigid_p, coarse_nr_p, micro_nr_p) in enumerate(per_slide):
                     axes[0, j].set_title(name, fontsize=10)
 
                     # row 1: color
                     ax0 = axes[0, j]
-                    ax0.imshow(orig_p) if orig_p is not None else ax0.text(0.5, 0.5, "N/A", ha="center", va="center",
-                                                                           fontsize=9)
-                    ax0.set_ylabel(row_titles[0], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
-                    ax0.set_xticks([]);
-                    ax0.set_yticks([]);
-                    [s.set_visible(False) for s in ax0.spines.values()]
+                    if orig_p is not None:
+                        ax0.imshow(orig_p)
+                    else:
+                        ax0.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
+                    ax0.set_ylabel(
+                        row_titles[0], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
+                    )
+                    ax0.set_xticks([])
+                    ax0.set_yticks([])
+                    for s in ax0.spines.values():
+                        s.set_visible(False)
 
                     # row 2: rigid grayscale
                     ax1 = axes[1, j]
-                    ax1.imshow(rigid_p, cmap="gray") if rigid_p is not None else ax1.text(0.5, 0.5, "N/A", ha="center",
-                                                                                          va="center", fontsize=9)
-                    ax1.set_ylabel(row_titles[1], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
-                    ax1.set_xticks([]);
-                    ax1.set_yticks([]);
-                    [s.set_visible(False) for s in ax1.spines.values()]
+                    if rigid_p is not None:
+                        ax1.imshow(rigid_p, cmap="gray")
+                    else:
+                        ax1.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
+                    ax1.set_ylabel(
+                        row_titles[1], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
+                    )
+                    ax1.set_xticks([])
+                    ax1.set_yticks([])
+                    for s in ax1.spines.values():
+                        s.set_visible(False)
 
-                    # row 3: non-rigid grayscale
+                    # row 3: non-rigid (coarse, pre-micro)
                     ax2 = axes[2, j]
-                    ax2.imshow(nonrigid_p, cmap="gray") if nonrigid_p is not None else ax2.text(0.5, 0.5, "N/A",
-                                                                                                ha="center",
-                                                                                                va="center", fontsize=9)
-                    ax2.set_ylabel(row_titles[2], rotation=90, ha="right", va="center", fontsize=10, labelpad=18)
-                    ax2.set_xticks([]);
-                    ax2.set_yticks([]);
-                    [s.set_visible(False) for s in ax2.spines.values()]
+                    if coarse_nr_p is not None:
+                        ax2.imshow(coarse_nr_p, cmap="gray")
+                    else:
+                        ax2.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
+                    ax2.set_ylabel(
+                        row_titles[2], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
+                    )
+                    ax2.set_xticks([])
+                    ax2.set_yticks([])
+                    for s in ax2.spines.values():
+                        s.set_visible(False)
+
+                    # optional row 4: micro-registered non-rigid (final)
+                    if self.micro_registration:
+                        ax3 = axes[3, j]
+                        if micro_nr_p is not None:
+                            ax3.imshow(micro_nr_p, cmap="gray")
+                        else:
+                            ax3.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
+                        ax3.set_ylabel(
+                            row_titles[3], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
+                        )
+                        ax3.set_xticks([])
+                        ax3.set_yticks([])
+                        for s in ax3.spines.values():
+                            s.set_visible(False)
 
                 plt.show()
 

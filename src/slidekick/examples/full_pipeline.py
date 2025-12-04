@@ -25,14 +25,14 @@ if __name__ == '__main__':
     metadatas_normalized += metadatas[2:]
 
     # Align MetaDatas with VALIS
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600,
+    Registrator = ValisRegistrator(metadatas_normalized, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600,
                                    confirm=False)
 
     metadatas_registered = Registrator.apply()
 
     # Separate Stains
     metadatas_separated = [StainSeparator(metadata, mode="flourescence", confirm=False, preview=False).apply()
-                           for metadata in metadatas if "CYP" in metadata.filename_original]
+                           for metadata in metadatas_registered if "CYP" in metadata.filename_original]
 
     # Choose metadata for segmentation
     # metadatas_registered: [HE1, HE2, Arginase1, KI67, GS_CYP1A2, ECAD_CYP1A2]

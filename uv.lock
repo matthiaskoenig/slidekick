@@ -453,6 +453,20 @@ wheels = [
 ]
 
 [[package]]
+name = "czifile"
+version = "2019.7.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "imagecodecs", marker = "sys_platform == 'win32'" },
+    { name = "numpy" },
+    { name = "tifffile" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/79/73dcbdc3e16f6a828cf7c7b65aaa0bd5f6186f5a41a6d35281fc98e11ed4/czifile-2019.7.2.1.tar.gz", hash = "sha256:6169aa681dd8af0d25e8e731e83393140cb960097d2a641dd145e8349bd2e965", size = 18252, upload-time = "2025-02-19T00:08:23.45Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a2/f9/06355f96114eda12b01dcdc462b8ef6d8458bb0b015c52909310ef65ce89/czifile-2019.7.2.1-py3-none-any.whl", hash = "sha256:41906b5bcce27d089c1c54f366f4f52e93b262d7d8d157622418f096a23b89a1", size = 18461, upload-time = "2025-02-19T00:08:21.395Z" },
+]
+
+[[package]]
 name = "dask"
 version = "2025.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2704,6 +2718,7 @@ dependencies = [
     { name = "comm" },
     { name = "contourpy" },
     { name = "cycler" },
+    { name = "czifile" },
     { name = "dask" },
     { name = "debugpy" },
     { name = "decorator" },
@@ -2894,6 +2909,7 @@ requires-dist = [
     { name = "comm", specifier = "==0.2.3" },
     { name = "contourpy", specifier = "==1.3.3" },
     { name = "cycler", specifier = "==0.12.1" },
+    { name = "czifile", specifier = ">=2019.7.2.1" },
     { name = "dask", specifier = "==2025.7.0" },
     { name = "debugpy", specifier = "==1.8.16" },
     { name = "decorator", specifier = "==5.2.1" },

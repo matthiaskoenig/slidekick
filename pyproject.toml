@@ -191,4 +191,5 @@ dependencies = [
     "xmltodict==0.14.2",
     "xsdata==24.3.1",
     "geojson>=3.2.0",
+    "czifile>=2019.7.2.1",
 ]
