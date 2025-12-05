@@ -35,7 +35,7 @@ def czi2tiff(
     if (ots[0] % 16) or (ots[1] % 16):
         raise ValueError("Tile size must be multiple of 16")
 
-    # --- Probe CZI to distinguish true RGB vs multiplex/grayscale channels ---
+    # Probe CZI to distinguish true RGB vs multiplex/grayscale channels
     with pyczi.open_czi(str(czi_path)) as czi_img:
         xstart, xend, ystart, yend = get_size(czi_img)
         ph = min(32, yend - ystart)
@@ -50,14 +50,15 @@ def czi2tiff(
         is_true_rgb = (probe.ndim == 3 and probe.shape[-1] == 3 and probe.dtype == np.uint8)
 
     if not is_true_rgb:
-        # ---------- Fluorescence/multiplex path: write lossless OME-TIFF (YXC) ----------
-        with pyczi.open_czi(str(czi_path)) as czi_img:
+        # Fluorescence/multiplex path: write lossless OME-TIFF (YXC) using tiles
+        with pyczi.open_czi(str(czi_path)) as czi_img, Progress() as progress:
             xstart, xend, ystart, yend = get_size(czi_img)
             H = yend - ystart
             W = xend - xstart
 
-            # Count channels by probing C until empty/failure
+            # Count channels by probing C until empty or failure
             n_ch = 0
+            ch_dtype = None
             for c in range(256):
                 try:
                     s = czi_img.read(
@@ -70,9 +71,12 @@ def czi2tiff(
                     if a.size == 0:
                         break
                     n_ch += 1
+                    ch_dtype = a.dtype
                 except Exception:
                     break
             n_ch = max(1, n_ch)
+            if ch_dtype is None:
+                ch_dtype = np.uint16
 
             # Pixel size metadata (optional)
             try:
@@ -83,45 +87,48 @@ def czi2tiff(
             except Exception:
                 res, resunit = None, None
 
-            # Read full plane per channel and stack to YXC
-            ch0 = czi_img.read(
-                plane={"TILES": 0, "Z": 0, "C": 0},
-                roi=(xstart, ystart, W, H),
-                background_pixel=(0, 0, 0),
-                zoom=1.0,
+            th, tw = ots
+            x_coords = np.arange(xstart, xend, tw)
+            y_coords = np.arange(ystart, yend, th)
+            n_tiles = len(x_coords) * len(y_coords)
+
+            task = progress.add_task(
+                description=f"[green]Converting {czi_path.name} to ome-tiff (fluorescence)...",
+                total=n_tiles,
             )
-            ch0 = np.asarray(ch0).squeeze()
-            if ch0.ndim == 3 and ch0.shape[-1] == 1:
-                ch0 = ch0[..., 0]
-            data_yxc = np.empty((H, W, n_ch), dtype=ch0.dtype)
-            data_yxc[..., 0] = ch0
+            sub_task = progress.add_task("[cyan]Writing fluorescence data...", total=n_tiles)
 
-            for c in range(1, n_ch):
-                tile = czi_img.read(
-                    plane={"TILES": 0, "Z": 0, "C": c},
-                    roi=(xstart, ystart, W, H),
-                    background_pixel=(0, 0, 0),
-                    zoom=1.0,
+            imw = dict(
+                ome=True,
+                metadata={"axes": "YXC"},
+                tile=ots,  # tiles over YX
+                compression="zlib",  # lossless for fluorescence
+                maxworkers=os.cpu_count(),
+            )
+            if res is not None:
+                imw.update(dict(resolution=res, resolutionunit=resunit))
+
+            with TiffWriter(str(ometiff_path), bigtiff=True) as tif:
+                tif.write(
+                    data=load_image_multichannel(
+                        czi_img,
+                        (x_coords, y_coords),
+                        ots,
+                        progress,
+                        (task, sub_task),
+                        n_ch,
+                        ch_dtype,
+                    ),
+                    tile=ots,
+                    shape=(H, W, n_ch),
+                    dtype=ch_dtype,
+                    **imw,
                 )
-                arr = np.asarray(tile).squeeze()
-                if arr.ndim == 3 and arr.shape[-1] == 1:
-                    arr = arr[..., 0]
-                data_yxc[..., c] = arr
 
-        imw = dict(
-            bigtiff=True,
-            ome=True,
-            metadata={"axes": "YXC"},
-            tile=ots,            # tiles over YX
-            compression="zlib",  # lossless for fluorescence
-            maxworkers=os.cpu_count(),
-        )
-        if res is not None:
-            imw.update(dict(resolution=res, resolutionunit=resunit))
-        tiff.imwrite(str(ometiff_path), data_yxc, **imw)
+            progress.remove_task(sub_task)
         return
 
-    # ---------- Legacy RGB path (tiled JPEG pyramid) ----------
+    # Legacy RGB path (tiled JPEG pyramid)
     with (pyczi.open_czi(str(czi_path)) as czi_img, Progress() as progress):
         xstart, xend, ystart, yend = get_size(czi_img)
         th, tw = ots
@@ -223,6 +230,92 @@ def translate_to_metadata(czi_image: CziReader):
                 meta_data[f"PhysicalSizeUnit{id_}"] = format(quant.units, "~H")
 
     return meta_data
+
+def load_image(
+    czi_img: CziReader,
+     coords: Tuple[np.ndarray, np.ndarray],
+     res_level: int,
+     ts: Tuple[int, int],
+     progress: Progress,
+     tasks: Tuple[TaskID, TaskID],
+ ):
+    """Legacy RGB tile generator. Yields (th, tw, 3) uint8 tiles."""
+    fac = 2 ** res_level
+    task, level_task = tasks
+    th, tw = ts
+    xstart, xend, ystart, yend = get_size(czi_img)
+    x_coords, y_coords = coords
+
+    for y_coord in y_coords:
+        for x_coord in x_coords:
+            progress.update(task, advance=1)
+            progress.update(level_task, advance=1)
+
+            e_w = min(tw, xend - x_coord)
+            e_h = min(th, yend - y_coord)
+
+            yield (
+                czi_img.read(
+                    plane={"TILES": 0, "Z": 0, "C": 0},
+                    roi=(x_coord, y_coord, e_w, e_h),
+                    background_pixel=(255, 255, 255),
+                    zoom=1 / fac,
+                )
+                .squeeze()
+                .astype(np.uint8)
+            )
+
+
+def load_image_multichannel(
+    czi_img: CziReader,
+    coords: Tuple[np.ndarray, np.ndarray],
+    ts: Tuple[int, int],
+    progress: Progress,
+    tasks: Tuple[TaskID, TaskID],
+    n_ch: int,
+    dtype: np.dtype,
+):
+    """Fluorescence/multiplex tile generator. Yields (th, tw, C) tiles."""
+    task, level_task = tasks
+    th, tw = ts
+    xstart, xend, ystart, yend = get_size(czi_img)
+    x_coords, y_coords = coords
+
+    for y_coord in y_coords:
+       for x_coord in x_coords:
+            progress.update(task, advance=1)
+            progress.update(level_task, advance=1)
+
+            e_w = min(tw, xend - x_coord)
+            e_h = min(th, yend - y_coord)
+
+            tile = np.empty((e_h, e_w, n_ch), dtype=dtype)
+            for c in range(n_ch):
+                plane = czi_img.read(
+                    plane={"TILES": 0, "Z": 0, "C": c},
+                    roi=(x_coord, y_coord, e_w, e_h),
+                    background_pixel=(0, 0, 0),
+                    zoom=1.0,
+                )
+                arr = np.asarray(plane).squeeze()
+                if arr.ndim == 3 and arr.shape[-1] == 1:
+                   arr = arr[..., 0]
+                tile[..., c] = arr.astype(dtype, copy=False)
+
+            yield tile
+
+
+def get_size(czi_img):
+    xstart, xend = czi_img.total_bounding_box["X"]
+    ystart, yend = czi_img.total_bounding_box["Y"]
+    return xstart, xend, ystart, yend
+
+
+def get_pixel_size_from_meta(meta_data) -> Tuple[pint.Quantity, pint.Quantity]:
+    ureg = UnitRegistry()
+    x_size = ureg.Quantity(meta_data["PhysicalSizeX"], meta_data["PhysicalSizeUnitX"])
+    y_size = ureg.Quantity(meta_data["PhysicalSizeY"], meta_data["PhysicalSizeUnitY"])
+    return x_size, y_size
 
 
 def load_image(

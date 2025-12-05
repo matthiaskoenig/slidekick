@@ -31,7 +31,7 @@ if __name__ == '__main__':
     metadatas_registered = Registrator.apply()
 
     # Separate Stains
-    metadatas_separated = [StainSeparator(metadata, mode="flourescence", confirm=False, preview=False).apply()
+    metadatas_separated = [StainSeparator(metadata, mode="fluorescence", confirm=False, preview=False).apply()
                            for metadata in metadatas_registered if "CYP" in metadata.filename_original]
 
     # Choose metadata for segmentation

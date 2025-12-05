@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from slidekick.console import console
-import zarr
 
 
 @dataclass
@@ -43,7 +42,7 @@ class Metadata:
         metadata_file = output_path / f"{self.uid}_metadata.json"
         with open(metadata_file, "w") as f:
             f.write(self.to_json())
-        print(f"Metadata saved to {metadata_file}")
+        console.print(f"Metadata saved to {metadata_file}", style="info")
 
     @classmethod
     def from_json(cls, json_path: Path) -> "Metadata":
@@ -60,7 +59,7 @@ class Metadata:
         metadata = cls(**data)
 
         if not metadata.path_storage.exists():
-            print(f"[warning] Missing stored image at {metadata.path_storage}")
+            console.print(f"Missing stored image at {metadata.path_storage}", style="warning")
 
         return metadata
 

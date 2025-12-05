@@ -188,8 +188,9 @@ class LobuleSegmentor(BaseOperator):
 
         H, W, N = image_stack.shape
 
-        # set missing to 0 (any zero across channels -> zero all channels)
-        missing_mask = np.any(image_stack == 0, axis=-1)
+        # Treat a pixel as "missing" only if ALL channels are zero there.
+        # This keeps real tissue pixels where some channels legitimately go to 0.
+        missing_mask = np.all(image_stack == 0, axis=-1)
 
         out = np.empty((H, W, N), dtype=np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
@@ -493,31 +494,33 @@ class LobuleSegmentor(BaseOperator):
 
         napari.run()
 
-
-    def _load_and_invert_images_from_metadatas(self, report_path: Path = None) -> [np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
+    def _load_base_stack(self) -> Tuple[np.ndarray, Dict[int, Any]]:
         """
-        Load each image at the pyramid level defined, invert selected channels,
-        harmonize shapes, and stack along the last axis -> (H, W, N).
+        Load each image at `self.base_level`, convert to 2D grayscale if necessary,
+        harmonize shapes, and stack into a uint8 array of shape (H, W, C).
+        Also returns the dict of original pyramid-level shapes from image 0.
         """
-
-        arrays = []
+        arrays: List[np.ndarray] = []
 
         for i, md in enumerate(self.metadata):
             try:
-                img = self.load_image(i)[self.base_level]  # Load resolution
-            except:
+                img = self.load_image(i)[self.base_level]  # load resolution level
+            except Exception:
                 raise Exception(f"Level {self.base_level} failed for image {i} in stack")
-            # ensure 2D
+
             img = np.asarray(img)
-            if img.ndim == 3 and img.shape[-1] in (3, 4):
-                img = np.mean(img[..., :3], axis=-1).astype(img.dtype)
+            # collapse multi-channel data to a single grayscale plane
+            if img.ndim == 3:
+                if img.shape[-1] == 1:
+                    img = img[..., 0]
+                else:
+                    img = np.mean(img[..., :min(img.shape[-1], 3)], axis=-1).astype(img.dtype)
 
             arrays.append(img)
 
         if not arrays:
             raise RuntimeError("No images loaded after filtering.")
 
-        # stack along the third dimension
         # harmonize shapes before stacking
         h_min = min(a.shape[0] for a in arrays)
         w_min = min(a.shape[1] for a in arrays)
@@ -528,65 +531,336 @@ class LobuleSegmentor(BaseOperator):
         # Get resolutions / image sizes as dict for later back mapping based on metadata object 0
         orig_shapes = {k: v.shape[:2] for k, v in self.load_image(0).items()}
 
-        # ROI detection block
-        console.print("Complete. Detecting ROI...", style="info")
-        stack_grayscale = ensure_grayscale_uint8(stack)
-        if self.multi_otsu:
-            # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
-            # returns tissue_mask
-            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=6, report_path=report_path)
-        else:
-            # just tissue detection
-            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=6)
+        return stack, orig_shapes
 
-        # stack: (H,W,C); tissue_mask: (H,W) True=tissue
+    def _interactive_preprocessing_preview(self, base_stack: np.ndarray) -> None:
+        """
+        Interactive Napari preview for early preprocessing parameters:
+          - multi_otsu (ROI detection)
+          - adaptive_histonorm (filtering)
+          - ksize (median blur)
+          - channels to invert (self.channels)
+
+        Operates on a downsampled copy of `base_stack`. On confirm, the chosen
+        values are stored in self.multi_otsu, self.adaptive_histonorm,
+        self.ksize and self.channels.
+        """
+        if base_stack.ndim != 3:
+            raise ValueError(f"Expected (H, W, C) stack, got {base_stack.shape}")
+
+        # downsample each channel for preview
+        frames_small = [
+            downsample_to_max_side(base_stack[..., c], 2048)
+            for c in range(base_stack.shape[2])
+        ]
+        stack_small = np.stack(frames_small, axis=-1)
+        Hs, Ws, C = stack_small.shape
+
+        # remember current values for reset
+        defaults = dict(
+            multi_otsu=self.multi_otsu,
+            adaptive_histonorm=self.adaptive_histonorm,
+            ksize=self.ksize,
+            channels=list(self.channels or []),
+        )
+        # ensure default invert channels are in range
+        defaults["channels"] = [c for c in defaults["channels"] if 0 <= c < C]
+
+        def compute_preview(
+            multi_otsu_val: bool,
+            adaptive_histonorm_val: bool,
+            ksize_val: int,
+            invert_channels: List[int],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            """
+            Run the same logical steps as the real preprocessing but on the
+            downsampled stack:
+              1) tissue detection with multi_otsu_val
+              2) crop to bbox
+              3) invert selected channels
+              4) filter with given ksize/histonorm
+              5) project back to full preview canvas for display
+            """
+            # store choices in the object, so they are ready when user confirms
+            self.multi_otsu = bool(multi_otsu_val)
+            self.adaptive_histonorm = bool(adaptive_histonorm_val)
+            self.ksize = int(ksize_val)
+            self.channels = list(invert_channels)
+
+            local = stack_small.copy()
+            gray = ensure_grayscale_uint8(local)
+
+            if self.multi_otsu:
+                tissue_mask = detect_tissue_mask_multiotsu(
+                    gray,
+                    morphological_radius=6,
+                    report_path=None,
+                )
+            else:
+                tissue_mask = detect_tissue_mask(
+                    gray,
+                    morphological_radius=6,
+                )
+
+            local[~tissue_mask] = 0
+
+            bbox_small = largest_bbox(tissue_mask.astype(np.uint8))
+            roi = crop_image(local, bbox_small)
+
+            # inversion on ROI
+            if self.channels:
+                for c in range(roi.shape[-1]):
+                    if c in self.channels:
+                        ch = roi[:, :, c]
+                        if np.issubdtype(ch.dtype, np.integer):
+                            info = np.iinfo(ch.dtype)
+                            ch = info.max - ch
+                        else:
+                            ch = 1.0 - ch
+                        roi[:, :, c] = ch
+
+            # reuse filter but it uses current self.ksize / adaptive_histonorm
+            roi_filtered = self._filter(roi)
+            roi_mean = roi_filtered.mean(axis=2).astype(np.uint8)
+
+            # project ROI back into full-size preview canvas
+            mask_vis = np.zeros((Hs, Ws), dtype=np.uint8)
+            filt_vis = np.zeros((Hs, Ws), dtype=np.uint8)
+
+            mask_vis[tissue_mask] = 255
+            r0, c0, r1, c1 = bbox_small
+            filt_vis[r0:r1, c0:c1] = roi_mean
+
+            return mask_vis, filt_vis
+
+        # initial preview with current settings
+        mask_vis, filt_vis = compute_preview(
+            self.multi_otsu,
+            self.adaptive_histonorm,
+            self.ksize,
+            defaults["channels"],
+        )
+
+        # Napari viewer and layers
+        viewer = napari.Viewer()
+        raw_mean = stack_small.mean(axis=2).astype(np.uint8)
+        viewer.add_image(
+            raw_mean,
+            name="Raw (downsampled mean)",
+            colormap="gray",
+        )
+        mask_layer = viewer.add_image(
+            mask_vis,
+            name="Tissue mask (preview)",
+            colormap="gray",
+            blending="additive",
+            opacity=0.4,
+        )
+        filt_layer = viewer.add_image(
+            filt_vis,
+            name="Filtered composite (preview)",
+            colormap="gray",
+            blending="additive",
+            opacity=0.7,
+        )
+
+        channel_choices = list(range(C))
+
+        @magicgui(
+            layout="vertical",
+            auto_call=False,
+            call_button="Update preview",
+            multi_otsu={"widget_type": "CheckBox"},
+            adaptive_histonorm={"widget_type": "CheckBox"},
+            ksize={"min": 3, "max": 21, "step": 2},
+            invert_channels={
+                "widget_type": "Select",
+                "choices": channel_choices,
+                "allow_multiple": True,
+            },
+        )
+        def preprocess_controls(
+            multi_otsu: bool = self.multi_otsu,
+            adaptive_histonorm: bool = self.adaptive_histonorm,
+            ksize: int = self.ksize,
+            invert_channels: List[int] = defaults["channels"],
+        ):
+            """
+            Called when user presses 'Update preview'. Recomputes mask and
+            filtered composite with the chosen parameters and updates layers.
+            """
+            mask_vis_local, filt_vis_local = compute_preview(
+                multi_otsu,
+                adaptive_histonorm,
+                ksize,
+                list(invert_channels),
+            )
+            mask_layer.data = mask_vis_local
+            filt_layer.data = filt_vis_local
+
+        confirm_btn = PushButton(text="Confirm and continue")
+        reset_btn = PushButton(text="Reset preprocessing params")
+
+        def on_reset(*args):
+            # restore defaults in the object
+            self.multi_otsu = defaults["multi_otsu"]
+            self.adaptive_histonorm = defaults["adaptive_histonorm"]
+            self.ksize = defaults["ksize"]
+            self.channels = list(defaults["channels"])
+
+            # restore GUI values
+            preprocess_controls.multi_otsu.value = defaults["multi_otsu"]
+            preprocess_controls.adaptive_histonorm.value = defaults["adaptive_histonorm"]
+            preprocess_controls.ksize.value = defaults["ksize"]
+            preprocess_controls.invert_channels.value = defaults["channels"]
+
+            # recompute preview with defaults
+            mask_vis_local, filt_vis_local = compute_preview(
+                self.multi_otsu,
+                self.adaptive_histonorm,
+                self.ksize,
+                list(self.channels),
+            )
+            mask_layer.data = mask_vis_local
+            filt_layer.data = filt_vis_local
+
+        def on_confirm(*args):
+            # keep whatever is currently stored in self.* and close viewer
+            viewer.close()
+
+        confirm_btn.changed.connect(on_confirm)
+        reset_btn.changed.connect(on_reset)
+
+        controls = Container(
+            widgets=[preprocess_controls, confirm_btn, reset_btn],
+            layout="vertical",
+        )
+        viewer.window.add_dock_widget(controls, area="right")
+
+        napari.run()
+
+    def _prepare_stack_for_segmentation(
+        self,
+        base_stack: np.ndarray,
+        orig_shapes: Dict[int, Any],
+        report_path: Optional[Path] = None,
+    ) -> Tuple[np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
+        """
+        Apply ROI detection (Otsu / multi-Otsu), crop to tissue, per-channel inversion,
+        optional channel discard based on self.throw_out_ratio, and filtering.
+
+        Returns
+        -------
+        img_stack : np.ndarray
+            Preprocessed stack (filtered, cropped) of shape (H_roi, W_roi, C_eff).
+        bbox : tuple (min_row, min_col, max_row, max_col)
+            Bounding box in base_level coordinates.
+        orig_shapes : dict
+            Passed through unchanged.
+        """
+        console.print("Complete. Detecting ROI...", style="info")
+
+        stack = base_stack.copy()
+        stack_gray = ensure_grayscale_uint8(stack)
+
+        if self.multi_otsu:
+            tissue_mask = detect_tissue_mask_multiotsu(
+                stack_gray,
+                morphological_radius=6,
+                report_path=report_path,
+            )
+        else:
+            tissue_mask = detect_tissue_mask(
+                stack_gray,
+                morphological_radius=6,
+            )
+
+        # zero background
         stack[~tissue_mask] = 0
 
         # crop to tissue bbox
         bbox = largest_bbox(tissue_mask.astype(np.uint8))
         stack = crop_image(stack, bbox)
 
-        # Inversion and discard only AFTER cropping:
-        for i in range(stack.shape[-1]):
+        # Inversion and discard only AFTER cropping
+        if self.channels is None:
+            invert_channels: List[int] = []
+        else:
+            invert_channels = list(self.channels)
+
+        c = 0
+        while c < stack.shape[-1]:
+            ch = stack[:, :, c]
 
             # optional inversion
-            if self.channels is not None and i in self.channels:
-                if np.issubdtype(stack[:, :, i].dtype, np.integer):
-                    info = np.iinfo(stack[:, :, i].dtype)
-                    stack[:, :, i] = info.max - stack[:, :, i]
-                else:  # float images assumed in [0,1]
-                    stack[:, :, i] = 1.0 - stack[:, :, i]
+            if c in invert_channels:
+                if np.issubdtype(ch.dtype, np.integer):
+                    info = np.iinfo(ch.dtype)
+                    ch = info.max - ch
+                else:
+                    ch = 1.0 - ch
+                stack[:, :, c] = ch
 
             # optional discard by foreground coverage
             if self.throw_out_ratio is not None:
-                non_bg = np.count_nonzero(img != 255)
-                ratio = non_bg / stack[:, :, i].size
+                non_bg = np.count_nonzero(ch != 255)
+                ratio = non_bg / ch.size
                 if ratio < self.throw_out_ratio:
                     console.print(
-                        f"Discarded {i} with non-background pixel ratio: {ratio:.3f}",
+                        f"Discarded channel {c} with non-background pixel ratio: {ratio:.3f}",
                         style="warning",
                     )
-                    stack = np.delete(stack, i, axis=-1)
-                    if i in self.channels_pp or i in self.channels_pv:
+                    stack = np.delete(stack, c, axis=-1)
+
+                    # keep channels_pp / channels_pv in sync
+                    if self.channels_pp is not None and c in self.channels_pp:
+                        self.channels_pp.remove(c)
+                    if self.channels_pv is not None and c in self.channels_pv:
+                        self.channels_pv.remove(c)
+
+                    if (not self.channels_pp) and (not self.channels_pv):
                         console.print(
-                            f"Channel used for periportal or perivenous detection removed.",
-                            style="warning",
+                            "No remaining channels for perivenous or periportal detection available.",
+                            style="error",
                         )
-                        if i in self.channels_pp:
-                            self.channels_pp.remove(i)
-                        else:
-                            self.channels_pv.remove(i)
+                        raise Exception("No remaining channels for segmentation available.")
 
-                        # Check if channels_pp and channels_pv are not empty lists now
-                        if not self.channels_pp and not self.channels_pv:
-                            console.print("No remaining channels for perivenous or periportal detection available.", style="error")
-                            raise Exception(f"No remaining channels for segmentation available.")
+                    def shift_list(lst: Optional[List[int]]) -> Optional[List[int]]:
+                        if lst is None:
+                            return None
+                        # any index bigger than the removed one shifts by -1
+                        out: List[int] = []
+                        for j in lst:
+                            if j > c:
+                                out.append(j - 1)
+                            elif j < c:
+                                out.append(j)
+                            # j == c already removed
+                        return out
 
-                    # IDs in channels_pp and channels_pv have to be adapted if channel is removed
-                    self.channels_pp = [j-1 for j in self.channels_pp if j >= i]
-                    self.channels_pv = [j-1 for j in self.channels_pv if j >= i]
+                    self.channels_pp = shift_list(self.channels_pp)
+                    self.channels_pv = shift_list(self.channels_pv)
 
-        return stack, bbox, orig_shapes
+                    # also keep inversion channels consistent
+                    invert_channels = [
+                        idx - 1 if idx > c else idx
+                        for idx in invert_channels
+                        if idx != c
+                    ]
+                    continue  # re-check current index after deletion
+
+            c += 1
+
+        console.print("Complete. Now applying filters...", style="info")
+        img_stack = self._filter(stack)
+
+        if report_path is not None:
+            for i in range(img_stack.shape[2]):
+                cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
+
+        return img_stack, bbox, orig_shapes
+
+
 
 
     def skeletize_kmeans(self, image_stack: np.ndarray,
@@ -1360,20 +1634,24 @@ class LobuleSegmentor(BaseOperator):
         report_path.mkdir(parents=True, exist_ok=True)
 
         console.print("Loading images...", style="info")
-        # Load images and invert based on metadata
-        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
+
+        # Step 1: load base stack at requested pyramid level
+        base_stack, orig_shapes = self._load_base_stack()
+
+        # Step 2: interactive preprocessing preview on downsampled stack
+        if self.preview:
+            self._interactive_preprocessing_preview(base_stack)
+
+        # Step 3: apply ROI detection, cropping, inversion, channel discard and filtering
+        img_stack, bbox, orig_shapes = self._prepare_stack_for_segmentation(
+            base_stack,
+            orig_shapes,
+            report_path=report_path,
+        )
 
         img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
-        console.print("Complete. Now applying filters...", style="info")
-
-        # Apply filters
-        img_stack = self._filter(img_stack)
-
-        for i in range(img_stack.shape[2]):
-            cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
-
-        # Build per-channel views and titles once
+        # Optional classic per-channel preview after filtering
         if isinstance(img_stack, list):
             imgs = img_stack
         elif hasattr(img_stack, "shape"):
@@ -1397,7 +1675,7 @@ class LobuleSegmentor(BaseOperator):
                 pass
             titles.append(str(name) if name is not None else f"image_{i}")
 
-        # Classic preview of all channels
+        # Classic preview of all channels after preprocessing
         if self.preview:
             self._preview_images(imgs, titles)
 

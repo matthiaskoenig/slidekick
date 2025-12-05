@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 from rich.prompt import Confirm
 import warnings
-
+import os
 
 from slidekick.io.metadata import Metadata
 from slidekick.console import console
@@ -155,8 +155,56 @@ class ValisRegistrator(BaseOperator):
         temp_img_dir = results_dir / "temp_imgs"
         temp_img_dir.mkdir(parents=True, exist_ok=True)
 
+        # Prefer hardlinks / symlinks to avoid duplicating huge WSIs on disk
         for m in self.metadata:
-            shutil.copy(m.path_storage, temp_img_dir)
+            src = Path(m.path_storage)
+            dst = temp_img_dir / src.name
+
+            if dst.exists():
+                console.print(f"[skip] {dst} already exists", style="info")
+                continue
+
+            try:
+                # 1) try hard link first
+                os.link(src, dst)
+                console.print(f"[hardlink] {dst} -> {src}", style="info")
+
+                # optional safety check: ensure no silent copy happened
+                try:
+                    if not src.samefile(dst):
+                        console.print(
+                            f"[warning] {dst} is not the same file as {src} after hardlink",
+                            style="warning",
+                        )
+                except FileNotFoundError:
+                    console.print(
+                        f"[error] {dst} or {src} missing after hardlink attempt",
+                        style="error",
+                    )
+
+            except OSError:
+                try:
+                    # 2) fallback: symlink if allowed
+                    dst.symlink_to(src)
+                    console.print(f"[symlink] {dst} -> {src}", style="info")
+
+                    # optional safety check
+                    try:
+                        if not src.samefile(dst):
+                            console.print(
+                                f"[warning] {dst} is not the same file as {src} after symlink",
+                                style="warning",
+                            )
+                    except FileNotFoundError:
+                        console.print(
+                            f"[error] {dst} or {src} missing after symlink attempt",
+                            style="error",
+                        )
+
+                except OSError:
+                    # 3) last resort: real copy
+                    shutil.copy2(src, dst)
+                    console.print(f"[copy] {src} -> {dst}", style="warning")
 
         registered_slide_dst_dir = results_dir / "registered_slides"
         registered_slide_dst_dir.mkdir(parents=True, exist_ok=True)
@@ -272,8 +320,10 @@ class ValisRegistrator(BaseOperator):
                     best_temp_img_dir = temp_img_dir
                     best_registered_slide_dst_dir = registered_slide_dst_dir
                 else:
-                    # Not best, clean temp images for this attempt
+                    # Not best, clean temp images and registered slides for this attempt
                     shutil.rmtree(temp_img_dir, ignore_errors=True)
+                    shutil.rmtree(registered_slide_dst_dir, ignore_errors=True)
+                    shutil.rmtree(attempt_results_dir, ignore_errors=True)
                     del registrar
 
                 # Stop if good enough or last attempt
@@ -615,8 +665,7 @@ class ValisRegistrator(BaseOperator):
         # We call that here so the full-resolution registered slides are available on disk.
         #
         # NOTE: API method name in VALIS is `warp_and_save_slides` (per VALIS docs/examples).
-        #       If you want a different cropping method, set crop="reference" or crop="overlap".
-        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop="overlap")
+        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop=self.crop)
 
         console.print(f"Full-resolution registered slides saved to: {registered_slide_dst_dir}", style="info")
 
@@ -695,6 +744,6 @@ if __name__ == "__main__":
 
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600, max_micro_registration_dim_px=1200, micro_registration=True)
 
     metadatas_registered = Registrator.apply()

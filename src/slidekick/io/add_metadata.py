@@ -7,10 +7,7 @@ def add_metadata(image_data, metadata: Metadata) -> None:
     Prompts for image type and stain information.
     """
     # Display image for annotation on visual basis
-    try:
-        suffix = image_data.path.suffix.lower()
-    except Exception:
-        suffix = None
+    suffix = metadata.path_original.suffix.lower()
     if suffix == ".czi":
         console.print("CZI already converted to TIFF", style="warning")
     # TODO: Add visualization
