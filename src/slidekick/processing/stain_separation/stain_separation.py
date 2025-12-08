@@ -243,7 +243,6 @@ class StainSeparator(BaseOperator):
             return self._apply_fluorescence()
 
     # brightfield
-    # brightfield
     def _apply_brightfield(self):
         """
         Brightfield color deconvolution with:
