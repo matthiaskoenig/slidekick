@@ -41,7 +41,7 @@ class ValisRegistrator(BaseOperator):
         preview: bool = True,
         adaptive_loop: bool = False,
         micro_registration: bool = False,
-        crop: str = "overlap"
+        crop: str = "reference"
     ):
         """
         channel_selection is ignored for registration (we register whole images),
@@ -664,7 +664,7 @@ class ValisRegistrator(BaseOperator):
         # The VALIS API provides a method to warp & save the slides in native resolution.
         # We call that here so the full-resolution pyramid registered slides are available on disk.
         # NOTE: API method name in VALIS is `warp_and_save_slides` (per VALIS docs/examples).
-        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop=self.crop, pyramid=True)
+        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop=self.crop, pyramid=True, colormap=None)
 
         console.print(f"Full-resolution registered slides saved to: {registered_slide_dst_dir}", style="info")
 
