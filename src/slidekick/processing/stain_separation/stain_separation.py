@@ -216,98 +216,26 @@ class StainSeparator(BaseOperator):
         super().__init__(metadata, channel_selection=None)
 
     def apply(self):
-        """Execute stain separation on the input metadata.
-
-        Mode detection is robust to CYX vs YXC and to 3-channel fluorescence:
-        - Use metadata hint if available.
-        - Use channel axis heuristics (small dimension up to 16).
-        - Probe 3-channel uint8 data to decide if it is true RGB.
-        """
+        """Execute stain separation on the input metadata."""
         mode = self.mode
         if mode is None:
             try:
                 img_example = self.load_image()
                 sample_level = next(iter(img_example.keys()))
-                arr0 = _to_numpy(img_example[sample_level])
-
+                arr0 = img_example[sample_level]
                 shape = getattr(arr0, "shape", None)
-                ndim = arr0.ndim if shape is not None else 0
-
-                # Hints from metadata
-                itype = str(getattr(self.metadata[0], "image_type", "") or "").lower()
-                hint_fluor = ("fluor" in itype) or ("fluorescence" in itype)
-                hint_bright = any(
-                    k in itype
-                    for k in [
-                        "brightfield",
-                        "immunohistochemistry",
-                        "ihc",
-                        "h&e",
-                        "he",
-                        "dab",
-                    ]
-                )
-
-                nchan = 1
-                is_color_probe = False
-
-                if ndim == 3:
-                    s0, s1, s2 = arr0.shape
-
-                    # Heuristic: channel axis is the smallest dimension (<=16)
-                    if s0 <= 16 and s0 < s1 and s0 < s2:
-                        ch_axis = 0  # C, Y, X
-                    elif s2 <= 16 and s2 < s0 and s2 < s1:
-                        ch_axis = 2  # Y, X, C
-                    else:
-                        # Fall back to channels-last (typical for RGB TIFFs)
-                        ch_axis = 2
-
-                    nchan = int(arr0.shape[ch_axis])
-
-                    # For 3 channels, probe a small patch to see if it "looks RGB"
-                    if nchan == 3:
-                        if ch_axis == 0:
-                            H, W = arr0.shape[1], arr0.shape[2]
-                            ph = min(32, H)
-                            pw = min(32, W)
-                            # (C, H, W) -> (H, W, C)
-                            probe = np.moveaxis(
-                                _to_numpy(arr0[:, :ph, :pw]),
-                                0,
-                                2,
-                            )
-                        else:
-                            H, W = arr0.shape[0], arr0.shape[1]
-                            ph = min(32, H)
-                            pw = min(32, W)
-                            probe = _to_numpy(arr0[:ph, :pw, :])
-
-                        is_color_probe = (
-                                probe.ndim == 3
-                                and probe.shape[-1] == 3
-                                and probe.dtype == np.uint8
-                        )
-
-                # Decision logic
-                if hint_fluor and not (is_color_probe and nchan == 3 and hint_bright):
-                    mode = "fluorescence"
-                elif is_color_probe and nchan == 3:
+                ndim = len(shape) if shape is not None else 0
+                nchan = shape[2] if ndim == 3 else 1
+                itype = str(getattr(self.metadata[0], "image_type", "")).lower()
+                if ndim == 3 and nchan == 3 and itype in {"brightfield", "immunohistochemistry"}:
                     mode = "brightfield"
-                elif hint_bright and (nchan == 1 or ndim < 3):
-                    mode = "brightfield"
-                elif ndim == 3 and nchan > 1:
+                elif ndim == 3 and nchan > 3:
                     mode = "fluorescence"
                 else:
-                    mode = "brightfield"
-
+                    mode = "fluorescence" if ("fluorescence" in itype or "fluor" in itype) else "brightfield"
             except Exception as e:
-                console.print(
-                    f"Could not determine image modality automatically: {e}",
-                    style="warning",
-                )
+                console.print(f"Could not determine image modality automatically: {e}", style="warning")
                 mode = "brightfield"
-
         console.print(f"StainSeparator mode: {mode}", style="info")
         if mode == "brightfield":
             return self._apply_brightfield()
