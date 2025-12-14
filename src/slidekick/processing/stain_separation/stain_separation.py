@@ -18,7 +18,6 @@ PROFILE_ALIASES = {
     "HE": "H&E", "H_E": "H&E", "H-E": "H&E", "H&E": "H&E",
     "HDAB": "H-DAB", "H-DAB": "H-DAB", "H_DAB": "H-DAB",
     "HED": "HED",
-    "Arginase1": "Arginase1", "Arginase": "Arginase1",
 }
 
 # Columns are stain OD vectors (R,G,B)^T
@@ -32,15 +31,11 @@ DEFAULT_VECTORS = {
     "HED": np.array([[0.650, 0.072, 0.268],
                      [0.704, 0.990, 0.570],
                      [0.286, 0.105, 0.776]], dtype=float),
-    "Arginase1": np.array([[-0.762590, 0.548268, 0.343306],
-                           [0.644835, 0.602108, 0.470801],
-                           [0.051418, 0.580404, -0.812704]], dtype=float),
 }
 DEFAULT_STAIN_NAMES = {
     "H&E": ["Hematoxylin", "Eosin"],
     "H-DAB": ["Hematoxylin", "DAB"],
     "HED": ["Hematoxylin", "Eosin", "DAB"],
-    "Arginase1": ["Arginase1", "NuclearFastRed"],
 }
 
 # helpers
@@ -145,6 +140,58 @@ def _to_numpy(arr):
         return np.asarray(arr)
 
 
+def _to_cyx_fluorescence(arr_np: np.ndarray) -> np.ndarray:
+    """
+    Normalize fluorescence arrays to (C, Y, X).
+
+    Supports common layouts:
+      - (C, Y, X)          [CYX]
+      - (Y, X, C)          [YXC]
+      - (T, C, Z, Y, X)    [TCZYX]
+      - (C, Z, Y, X)       [CZYX]
+      - (Z, C, Y, X)       [ZCYX]
+
+    For 4D/5D we assume the last two axes are spatial (Y, X), keep the first
+    plausible channel axis (small dimension <=64), and slice other leading axes at 0.
+    """
+    a = np.asarray(arr_np)
+
+    if a.ndim == 2:
+        return a[None, :, :]  # (1, Y, X)
+
+    if a.ndim == 3:
+        # Already CYX (channel-first)
+        if a.shape[0] <= 64 and a.shape[1] > a.shape[0] and a.shape[2] > a.shape[0]:
+            return a
+        # YXC (channel-last)
+        if a.shape[2] <= 64 and a.shape[0] > a.shape[2] and a.shape[1] > a.shape[2]:
+            return np.moveaxis(a, -1, 0)
+        # Fallback: smallest axis is probably channels
+        cax = int(np.argmin(a.shape))
+        return np.moveaxis(a, cax, 0)
+
+    if a.ndim in (4, 5):
+        lead_axes = list(range(a.ndim - 2))  # everything except Y,X
+
+        cand = [i for i in lead_axes if 2 <= a.shape[i] <= 64]
+        if not cand:
+            cand = [i for i in lead_axes if a.shape[i] > 1]
+        cax = cand[0] if cand else lead_axes[0]
+
+        slicer = []
+        for i in range(a.ndim):
+            if i == cax:
+                slicer.append(slice(None))  # keep C
+            elif i in lead_axes:
+                slicer.append(0)            # take first T/Z/...
+            else:
+                slicer.append(slice(None))  # keep Y,X
+        b = a[tuple(slicer)]
+        return _to_cyx_fluorescence(b)
+
+    return _to_cyx_fluorescence(np.squeeze(a))
+
+
 def _normalize_image_01(img_np: np.ndarray) -> np.ndarray:
     """Return float32 in [0,1] for brightfield math. Handles uint8/uint16/float."""
     src_dtype = img_np.dtype
@@ -170,24 +217,6 @@ def _first_available_level(level_dicts):
                 return max(d.keys())
         return None
     return max(common)
-
-
-def _iter_tiles(arr, tile_size: int = 2048):
-    """
-    Iterate over 2D tiles of an array with shape (H, W) or (H, W, C).
-    Yields pairs of slice objects (ys, xs).
-    """
-    shape = getattr(arr, "shape", None)
-    if shape is None or len(shape) < 2:
-        raise ValueError(f"Unsupported shape for tiling: {shape}")
-    H, W = shape[0], shape[1]
-    for y0 in range(0, H, tile_size):
-        y1 = min(y0 + tile_size, H)
-        ys = slice(y0, y1)
-        for x0 in range(0, W, tile_size):
-            x1 = min(x0 + tile_size, W)
-            xs = slice(x0, x1)
-            yield ys, xs
 
 
 class StainSeparator(BaseOperator):
@@ -216,215 +245,191 @@ class StainSeparator(BaseOperator):
         super().__init__(metadata, channel_selection=None)
 
     def apply(self):
-        """Execute stain separation on the input metadata."""
+        """Execute stain separation on the input metadata.
+
+        Mode detection is robust to CYX vs YXC and to 3-channel fluorescence:
+        - Use metadata hint if available.
+        - Use channel axis heuristics (small dimension up to 16).
+        - Probe 3-channel uint8 data to decide if it is true RGB.
+        """
         mode = self.mode
         if mode is None:
             try:
                 img_example = self.load_image()
                 sample_level = next(iter(img_example.keys()))
-                arr0 = img_example[sample_level]
+                arr0 = _to_numpy(img_example[sample_level])
+
                 shape = getattr(arr0, "shape", None)
-                ndim = len(shape) if shape is not None else 0
-                nchan = shape[2] if ndim == 3 else 1
-                itype = str(getattr(self.metadata[0], "image_type", "")).lower()
-                if ndim == 3 and nchan == 3 and itype in {"brightfield", "immunohistochemistry"}:
+                ndim = arr0.ndim if shape is not None else 0
+
+                # Hints from metadata
+                itype = str(getattr(self.metadata[0], "image_type", "") or "").lower()
+                hint_fluor = ("fluor" in itype) or ("fluorescence" in itype)
+                hint_bright = any(
+                    k in itype
+                    for k in [
+                        "brightfield",
+                        "immunohistochemistry",
+                        "ihc",
+                        "h&e",
+                        "he",
+                        "dab",
+                    ]
+                )
+
+                nchan = 1
+                is_color_probe = False
+
+                if ndim == 3:
+                    s0, s1, s2 = arr0.shape
+
+                    # Heuristic: channel axis is the smallest dimension (<=16)
+                    if s0 <= 16 and s0 < s1 and s0 < s2:
+                        ch_axis = 0  # C, Y, X
+                    elif s2 <= 16 and s2 < s0 and s2 < s1:
+                        ch_axis = 2  # Y, X, C
+                    else:
+                        # Fall back to channels-last (typical for RGB TIFFs)
+                        ch_axis = 2
+
+                    nchan = int(arr0.shape[ch_axis])
+
+                    # For 3 channels, probe a small patch to see if it "looks RGB"
+                    if nchan == 3:
+                        if ch_axis == 0:
+                            H, W = arr0.shape[1], arr0.shape[2]
+                            ph = min(32, H)
+                            pw = min(32, W)
+                            probe = np.moveaxis(arr0[:, :ph, :pw], 0, 2)  # (C,H,W)->(H,W,C)
+                        else:
+                            H, W = arr0.shape[0], arr0.shape[1]
+                            ph = min(32, H)
+                            pw = min(32, W)
+                            probe = arr0[:ph, :pw, :]
+
+                        is_color_probe = (
+                            probe.ndim == 3
+                            and probe.shape[-1] == 3
+                            and probe.dtype == np.uint8
+                        )
+
+                # Decision logic
+                if hint_fluor and not (is_color_probe and nchan == 3 and hint_bright):
+                    mode = "fluorescence"
+                elif is_color_probe and nchan == 3:
                     mode = "brightfield"
-                elif ndim == 3 and nchan > 3:
+                elif hint_bright and (nchan == 1 or ndim < 3):
+                    mode = "brightfield"
+                elif ndim == 3 and nchan > 1:
                     mode = "fluorescence"
                 else:
-                    mode = "fluorescence" if ("fluorescence" in itype or "fluor" in itype) else "brightfield"
+                    mode = "brightfield"
+
             except Exception as e:
-                console.print(f"Could not determine image modality automatically: {e}", style="warning")
+                console.print(
+                    f"Could not determine image modality automatically: {e}",
+                    style="warning",
+                )
                 mode = "brightfield"
+
         console.print(f"StainSeparator mode: {mode}", style="info")
         if mode == "brightfield":
             return self._apply_brightfield()
         else:
             return self._apply_fluorescence()
 
+
     # brightfield
     def _apply_brightfield(self):
-        """
-        Brightfield color deconvolution with:
-        - tiled processing (no huge H*W flatten)
-        - full pyramid preserved (all input levels represented)
-        - level->ndarray dict passed to save_tif, so downstream readers see a proper image stack.
-        """
-        # 1) Resolve profile and normalize stain matrix
         M, stain_names, profile = self._resolve_brightfield_profile()
-
-        # normalize columns and add residual if needed (float32 to reduce memory)
-        M = np.array(
-            [c / (np.linalg.norm(c) + 1e-8) for c in M.T],
-            dtype=np.float32,
-        ).T
+        # normalize columns and add residual if needed
+        M = np.array([c / (np.linalg.norm(c) + 1e-8) for c in M.T], dtype=float).T
         if M.shape[1] == 2:
             v1, v2 = M[:, 0], M[:, 1]
             v3 = np.cross(v1, v2)
             n = np.linalg.norm(v3)
             if n < 1e-6:
-                raise ValueError(
-                    f"Provided stain vectors are nearly collinear for profile {profile}."
-                )
+                raise ValueError(f"Provided stain vectors are nearly collinear for profile {profile}.")
             v3 /= n
-            M = np.column_stack([M, v3.astype(np.float32)])
+            M = np.column_stack([M, v3])
             stain_names = stain_names + ["Residual"]
 
-        # precompute deconvolution matrix once
-        try:
-            M_inv = np.linalg.inv(M)
-        except np.linalg.LinAlgError:
-            M_inv = np.linalg.pinv(M)
-        M_inv = M_inv.astype(np.float32)
+        # READ ALL PYRAMID LEVELS
+        image = self.load_image()   # dict[level] -> array
+        separated_levels = [dict() for _ in range(M.shape[1])]
 
-        # 2) Read all pyramid levels
-        image = self.load_image()  # dict[level] -> array
-        levels = sorted(image.keys())
+        for level, img in image.items():
+            img_np = _to_numpy(img)
+            if img_np.ndim == 3 and img_np.shape[2] >= 3:
+                arr01 = _normalize_image_01(img_np)
+                # Optical density: -log10(I)
+                OD = -np.log10(arr01)
+                H, W, _ = OD.shape
+                OD_2d = OD.reshape(-1, 3)
+                # Invert deconvolution matrix
+                try:
+                    M_inv = np.linalg.inv(M)
+                except np.linalg.LinAlgError:
+                    M_inv = np.linalg.pinv(M)
+                C = OD_2d.dot(M_inv.T).reshape(H, W, -1)
+                # Build RGB per stain (keep brightfield separated outputs as color)
+                for j in range(C.shape[2]):
+                    if stain_names[j].lower() == "residual":
+                        continue
+                    ODj = C[:, :, j]
+                    col = M[:, j]  # (R,G,B)
+                    OD_rgb = ODj[..., None] * col[None, None, :]
+                    I_rgb = np.power(10.0, -np.clip(OD_rgb, 0.0, None))
+                    separated_levels[j][level] = (np.clip(I_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-        # 3) Preview on a downsampled level (optional, safe)
+            else:
+                console.print(f"Level {level} image is not 3-channel, skipping level.", style="warning")
+
+        # Preview (color)
         if self.preview:
             try:
-                preview_level = max(levels)
-                img_prev = _to_numpy(image[preview_level])
-                if img_prev.ndim == 3 and img_prev.shape[2] >= 3:
-                    Hprev, Wprev = img_prev.shape[:2]
-                    stride = max(int(np.ceil(max(Hprev, Wprev) / 2048)), 1)
-                    img_prev_small = img_prev[::stride, ::stride, :]
-
-                    arr01_prev = _normalize_image_01(img_prev_small)
-                    OD_prev = -np.log10(arr01_prev.astype(np.float32, copy=False))
-                    C_prev = OD_prev @ M_inv.T  # (h, w, n_stains)
-
-                    color_panels = []
-                    names_for_preview = []
-
-                    n_preview = min(C_prev.shape[2], len(stain_names))
-                    for j in range(n_preview):
-                        name_j = stain_names[j]
-                        if name_j.lower() == "residual":
-                            continue
-                        ODj = C_prev[:, :, j]
-                        col = M[:, j]  # (3,)
-                        OD_rgb = ODj[..., None] * col[None, None, :]
-                        I_rgb = np.power(10.0, -np.clip(OD_rgb, 0.0, None))
-                        rgb = (np.clip(I_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-                        color_panels.append(rgb)
-                        names_for_preview.append(name_j)
-
+                preview_level = _first_available_level(separated_levels)
+                if preview_level is not None:
+                    orig = _to_numpy(image.get(preview_level, next(iter(image.values()))))
+                    color_panels = [
+                        separated_levels[j][preview_level]
+                        for j, n in enumerate(stain_names)
+                        if n.lower() != "residual" and preview_level in separated_levels[j]
+                    ]
+                    names_for_preview = [n for n in stain_names if n.lower() != "residual"]
                     total = 1 + len(color_panels)
                     cols = min(total, 3)
                     rows = int(np.ceil(total / cols))
-                    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
-                    axes = np.atleast_1d(axes).ravel()
-
-                    axes[0].imshow(
-                        img_prev_small
-                        if img_prev_small.shape[-1] == 3
-                        else img_prev_small[..., :3]
-                    )
-                    axes[0].set_title("Original")
-                    axes[0].axis("off")
-
-                    for ax, panel, name in zip(axes[1:], color_panels, names_for_preview):
-                        ax.imshow(panel)
-                        ax.set_title(name)
-                        ax.axis("off")
-
-                    for ax in axes[1 + len(color_panels):]:
-                        ax.axis("off")
-
-                    plt.tight_layout()
-                    plt.show()
+                    fig, axes = plt.subplots(rows, cols, figsize=(3*cols, 3*rows))
+                    axes = np.array(axes).reshape(-1)
+                    axes[0].imshow(orig if orig.shape[-1] == 3 else orig[..., :3])
+                    axes[0].set_title("Original"); axes[0].axis('off')
+                    for k, panel in enumerate(color_panels, start=1):
+                        axes[k].imshow(panel)
+                        axes[k].set_title(names_for_preview[k-1]); axes[k].axis('off')
+                    for ax in axes[1+len(color_panels):]:
+                        ax.axis('off')
+                    plt.tight_layout(); plt.show()
             except Exception as e:
                 console.print(f"Preview generation failed: {e}", style="error")
 
-        # 4) Confirm before heavy work
+        # Confirm
         if self.confirm:
-            apply_full = Confirm.ask(
-                "Apply stain separation to full resolution image(s)?",
-                default=True,
-                console=console,
-            )
+            apply_full = Confirm.ask("Apply stain separation to full resolution image(s)?", default=True, console=console)
             if not apply_full:
                 console.print("Stain separation aborted by user.", style="warning")
+                del image, separated_levels  # Memory Management
                 return self.metadata
 
-        # 5) Prepare output paths and temporary disk-backed storage
+        # Save outputs and create metadata per stain
+        output_metadata = []
         base_path = Path(self.metadata[0].path_storage)
-        base_stem = (
-            base_path.name[:-len("".join(base_path.suffixes))]
-            if base_path.suffixes
-            else base_path.stem
-        )
+        # safe multi-suffix trimming (e.g., .ome.tif)
+        base_stem = base_path.name[:-len(''.join(base_path.suffixes))] if base_path.suffixes else base_path.stem
 
         dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
         dest_dir.mkdir(parents=True, exist_ok=True)
-        tmp_dir = dest_dir / "_tmp_mm_brightfield"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        n_stains = M.shape[1]
-        separated_levels = [dict() for _ in range(n_stains)]
-        dtype_out = np.uint8
-        tile_size = 2048
-
-        # 6) Full-resolution, tiled processing for each level
-        for level in levels:
-            img_np = _to_numpy(image[level])
-
-            # if level is not 3-channel, we mark placeholders and fill later
-            if img_np.ndim != 3 or img_np.shape[2] < 3:
-                console.print(
-                    f"Level {level} image is not 3-channel, "
-                    f"will reuse nearest separated level as placeholder.",
-                    style="warning",
-                )
-                for j in range(n_stains):
-                    # mark as None, will be filled after processing all levels
-                    if level not in separated_levels[j]:
-                        separated_levels[j][level] = None
-                continue
-
-            H, W, _ = img_np.shape
-
-            # allocate one memmap per stain for this level
-            mmaps = []
-            for j in range(n_stains):
-                mm_path = tmp_dir / f"{base_stem}_L{level}_stain{j}.dat"
-                mm = np.memmap(mm_path, mode="w+", dtype=dtype_out, shape=(H, W))
-                separated_levels[j][level] = mm
-                mmaps.append(mm)
-
-            # tiled processing
-            for ys, xs in _iter_tiles(img_np, tile_size=tile_size):
-                tile = img_np[ys, xs, :].astype(np.float32, copy=False)
-                arr01 = _normalize_image_01(tile)
-                OD_tile = -np.log10(arr01)
-                C_tile = OD_tile @ M_inv.T  # (tile_h, tile_w, n_stains)
-
-                for j, mm in enumerate(mmaps):
-                    ODj = C_tile[:, :, j]
-                    Ij = np.power(10.0, -ODj)
-                    out_tile = (np.clip(Ij, 0.0, 1.0) * 255.0).astype(dtype_out)
-                    mm[ys, xs] = out_tile
-
-        # 7) Fill placeholder levels (non-3-channel) by copying nearest real level
-        for j in range(n_stains):
-            stain_levels = separated_levels[j]
-            if not stain_levels:
-                continue
-
-            real_levels = [lvl for lvl, arr in stain_levels.items() if arr is not None]
-            if not real_levels:
-                continue
-
-            for lvl in levels:
-                if stain_levels.get(lvl) is None:
-                    nearest = min(real_levels, key=lambda L: abs(L - lvl))
-                    ref = stain_levels[nearest]
-                    stain_levels[lvl] = np.array(ref, copy=True)
-
-        # 8) Save outputs and create metadata per stain
-        output_metadata = []
         for j, stain_name in enumerate(stain_names):
             if stain_name.lower() == "residual":
                 continue
@@ -436,24 +441,24 @@ class StainSeparator(BaseOperator):
                 path_original=self.metadata[0].path_original,
                 path_storage=out_path,
                 image_type=self.metadata[0].image_type,
-                uid=f"{self.metadata[0].uid}-{stain_name.replace(' ', '_')}",
+                uid=f"{self.metadata[0].uid}-{stain_name.replace(' ', '_')}"
             )
             new_meta.set_stains({0: stain_name})
-            new_meta.save(dest_dir)
+            new_meta.save(dest_dir)  # save metadata into the same folder
 
-            # ensure we pass a clean level->ndarray dict, with sorted levels
-            level_dict = separated_levels[j]
-            clean_levels = {
-                lvl: np.asarray(level_dict[lvl])
-                for lvl in sorted(level_dict.keys())
+            # Minimal OME metadata for an RGB YXS pyramid
+            ome_meta = {
+                "axes": "YXS",  # per-level arrays are H×W×3 (RGB samples)
+                "Channel": {"Name": [stain_name]},  # one logical channel, RGB stored as samples
             }
 
-            # Passing a level→array dict => save_tif writes tiled, pyramidal TIFF
-            save_tif(clean_levels, out_path, metadata=new_meta)
+            # Passing a level→array dict + ome_metadata => pyramidal OME-TIFF
+            # `metadata=new_meta` is kept for API compatibility but ignored by save_tif
+            # when it is not a dict.
+            save_tif(separated_levels[j], out_path, metadata=new_meta, ome_metadata=ome_meta)
 
             console.print(f"Saved [{stain_name}] to {out_path}", style="success")
             output_metadata.append(new_meta)
-
         del image, separated_levels  # Memory Management
         return output_metadata
 
@@ -509,7 +514,6 @@ class StainSeparator(BaseOperator):
         """
         # helpers
         MAX_PREVIEW_SIDE = 2048  # preview-only cap
-        MAX_BG_SIDE = 2048  # cap for background estimation
 
         PALETTE = np.array([
             [1.0, 0.0, 0.0],  # red
@@ -537,44 +541,46 @@ class StainSeparator(BaseOperator):
         # READ ALL PYRAMID LEVELS
         image = self.load_image()  # dict[level] -> array
 
-        sample_level = min(image.keys())
-        arr0 = image[sample_level]
-        if arr0.ndim < 3 or arr0.shape[2] < 1:
+        # Probe a small pyramid level to avoid reading full-res just to infer channel axes
+        probe_level = max(image.keys())
+        A0 = _to_cyx_fluorescence(_to_numpy(image[probe_level]))
+
+        if A0.ndim != 3 or A0.shape[0] < 1:
             console.print("No multiple channels found in image; fluorescence separation not applicable.", style="error")
             return self.metadata
-        n_ch = int(arr0.shape[2])
+        n_ch = int(A0.shape[0])
 
         stain_dict = getattr(self.metadata[0], "stains", {}) or {}
 
         bg_values = None
         if self.remove_background:
-            H0, W0 = arr0.shape[0], arr0.shape[1]
-            stride = max(int(np.ceil(max(H0, W0) / MAX_BG_SIDE)), 1)
-            A0_sample = np.asarray(arr0[::stride, ::stride, :])
-            A_bg = A0_sample.astype(np.float32, copy=False)
-            bg_values = np.array(
-                [_estimate_channel_bg(A_bg[:, :, ch]) for ch in range(n_ch)],
-                dtype=np.float32,
-            )
+            A_bg = A0.astype(np.float32, copy=False)  # (C, Y, X)
+            bg_values = []
+            for ch in range(n_ch):
+                bg = _estimate_channel_bg(A_bg[ch, :, :])
+                bg_values.append(bg)
+            bg_values = np.array(bg_values, dtype=np.float32)
 
         # preview (downsampled only)
         if self.preview:
             try:
                 # choose a small level for preview if pyramidal
                 preview_level = max(image.keys())
-                arr_prev = image[preview_level]
-                Hprev, Wprev = arr_prev.shape[0], arr_prev.shape[1]
-                stride = max(int(np.ceil(max(Hprev, Wprev) / MAX_PREVIEW_SIDE)), 1)
-                Aprev = np.asarray(arr_prev[::stride, ::stride, :])
+                Aprev = _to_cyx_fluorescence(_to_numpy(image[preview_level]))  # (C, Y, X)
+
+                # cap preview longest side (over Y,X)
+                stride = max(int(np.ceil(max(Aprev.shape[1], Aprev.shape[2]) / MAX_PREVIEW_SIDE)), 1)
+                if stride > 1:
+                    Aprev = Aprev[:, ::stride, ::stride]
 
                 # Original panel
                 if n_ch == 3:
                     # true color using the image's own channels
-                    rgb = np.stack([_stretch99(Aprev[..., i]) for i in range(3)], axis=-1)
+                    rgb = np.stack([_stretch99(Aprev[i, :, :]) for i in range(3)], axis=-1)  # (Y, X, 3)
                     original_panel = (rgb * 255.0).astype(np.uint8)
                 else:
                     # grayscale maximum projection for "original"
-                    mip = np.max(Aprev.astype(np.float32), axis=2)
+                    mip = np.max(Aprev.astype(np.float32), axis=0)  # (Y, X)
                     mip = (_stretch99(mip) * 255.0).astype(np.uint8)
                     original_panel = np.stack([mip, mip, mip], axis=-1)
 
@@ -588,7 +594,7 @@ class StainSeparator(BaseOperator):
                         rgb_vec[ch] = 1.0
                     else:
                         rgb_vec = PALETTE[ch % len(PALETTE)]
-                    colored.append(_colorize(Aprev[..., ch], rgb_vec))
+                    colored.append(_colorize(Aprev[ch, :, :], rgb_vec))
 
                 # Layout: Original + colored channels in one row
                 total = 1 + len(colored)
@@ -619,62 +625,44 @@ class StainSeparator(BaseOperator):
                 del image  # Memory Management
                 return self.metadata
 
-        # prepare output paths and temporary memmap storage
-        base_path = Path(self.metadata[0].path_storage)
-        base_stem = base_path.name[:-len(''.join(base_path.suffixes))] if base_path.suffixes else base_path.stem
-        dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        tmp_dir = dest_dir / "_tmp_mm"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        # build full-resolution separated levels (disk backed, no downsampling)
+        # build full-resolution separated levels (no downsampling)
         separated_levels = {ch: {} for ch in range(n_ch)}
         for level, arr in image.items():
-            if arr.ndim != 3 or arr.shape[2] != n_ch:
-                console.print(
-                    f"Unexpected image format at level {level}, skipping.",
-                    style="warning",
-                )
+            A = _to_cyx_fluorescence(_to_numpy(arr))  # (C, Y, X)
+            if A.ndim != 3 or A.shape[0] != n_ch:
+                console.print(f"Unexpected image format at level {level}, skipping.", style="warning")
                 continue
 
-            H, W = arr.shape[0], arr.shape[1]
-            dtype = arr.dtype
-            is_int = np.issubdtype(dtype, np.integer)
-            if is_int:
-                info = np.iinfo(dtype)
+            # Remove background
+            if not self.remove_background or bg_values is None:
+                for ch in range(n_ch):
+                    separated_levels[ch][level] = np.asarray(A[ch, :, :])
+                continue
 
-            # allocate one memmap per channel for this level
-            mmaps = []
+            A_float = A.astype(np.float32, copy=False)
+
             for ch in range(n_ch):
-                mm_path = tmp_dir / f"{base_stem}_L{level}_ch{ch}.dat"
-                mm = np.memmap(mm_path, mode="w+", dtype=dtype, shape=(H, W))
-                separated_levels[ch][level] = mm
-                mmaps.append(mm)
+                ch_arr = A_float[ch, :, :] - bg_values[ch]
+                ch_arr[ch_arr < 0] = 0
 
-            need_bg = self.remove_background and (bg_values is not None)
+                if np.issubdtype(A.dtype, np.integer):
+                    info = np.iinfo(A.dtype)
+                    ch_out = np.clip(ch_arr, 0, info.max).astype(A.dtype)
+                else:
+                    ch_out = ch_arr.astype(A.dtype)
 
-            # process this level tile by tile
-            for ys, xs in _iter_tiles(arr, tile_size=2048):
-                tile = np.asarray(arr[ys, xs, :], dtype=np.float32)
-
-                if need_bg:
-                    # subtract background from all channels at once
-                    tile -= bg_values[None, None, :]
-                    # clamp at 0 in place
-                    np.maximum(tile, 0.0, out=tile)
-                    if is_int:
-                        # clamp to dtype max once for all channels
-                        np.clip(tile, 0.0, float(info.max), out=tile)
-
-                # write to channel-specific memmaps
-                for ch, mm in enumerate(mmaps):
-                    mm[ys, xs] = tile[:, :, ch].astype(dtype)
+                separated_levels[ch][level] = ch_out
 
         # save per channel (grayscale intensity)
         output_metadata = []
+        base_path = Path(self.metadata[0].path_storage)
+        # safe multi-suffix trimming (e.g., .ome.tif)
+        base_stem = base_path.name[:-len(''.join(base_path.suffixes))] if base_path.suffixes else base_path.stem
+        dest_dir = Path(OUTPUT_PATH) / self.metadata[0].uid
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
         for ch in range(n_ch):
-            # per-channel naming plus metadata
+            # per-channel naming + metadata
             stain_name = stain_dict.get(ch, f"ch{ch}")
             out_name = f"{base_stem}_{stain_name.replace(' ', '_')}.tiff"
             out_path = dest_dir / out_name
@@ -687,8 +675,16 @@ class StainSeparator(BaseOperator):
             )
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)
-            # Pass the full level to array dict so save_tif writes a tiled, pyramidal TIFF
-            save_tif(separated_levels[ch], out_path, metadata=new_meta)
+
+            # Minimal OME metadata for a single-channel YX pyramid
+            ome_meta = {
+                "axes": "YX",  # per-level arrays are H×W
+                "Channel": {"Name": [stain_name]},  # OME <Channel Name=...>
+            }
+
+            # Pass the full level→array dict so save_tif writes a tiled, pyramidal OME-TIFF
+            # `metadata=new_meta` is kept for API compatibility but ignored as it is not a dict.
+            save_tif(separated_levels[ch], out_path, metadata=new_meta, ome_metadata=ome_meta)
 
             console.print(f"Saved channel {ch} -> {out_path}", style="success")
             output_metadata.append(new_meta)
@@ -701,7 +697,7 @@ class StainSeparator(BaseOperator):
 if __name__ == "__main__":
     from slidekick import DATA_PATH
     from slidekick.io import read_wsi
-    """
+
     # Brightfield example
     image_path_brightfield = DATA_PATH / "reg" / "HE1.ome.tif"
     metadata_brightfield = Metadata(path_original=image_path_brightfield, path_storage=image_path_brightfield)
@@ -716,7 +712,7 @@ if __name__ == "__main__":
     # Check saved img
     img, _ = read_wsi(metadatas_brightfield[0].path_storage)
     print(img)
-    """
+
     # Fluorescence example
     image_path_fluorescence = DATA_PATH / "reg" / "GS_CYP1A2.czi"
     metadata_fluorescence = Metadata(path_original=image_path_fluorescence, path_storage=image_path_fluorescence)

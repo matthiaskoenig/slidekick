@@ -5,7 +5,12 @@ from tifffile import TiffWriter
 import numpy as np
 import os
 
-def save_tif(image: Dict[int, np.ndarray], path: Path, metadata: Optional[Dict] = None) -> None:
+def save_tif(
+    image: Dict[int, np.ndarray],
+    path: Path,
+    metadata: Optional[Dict] = None,
+    ome_metadata: Optional[Dict] = None,
+) -> None:
     """
     Save a multi-resolution pyramid to a tiled, pyramidal TIFF.
 
@@ -20,6 +25,9 @@ def save_tif(image: Dict[int, np.ndarray], path: Path, metadata: Optional[Dict] 
     metadata : Optional[Dict]
         Optional JSON-serializable dict stored in ImageDescription for the *base* IFD.
         (Do NOT pass Slidekick's Metadata object here.)
+    ome_metadata : Optional[Dict]
+        Optional OME metadata dict. If provided, the file is written as OME-TIFF
+        (using tifffile's `ome=True`) and this dict is passed to tifffile.
     """
     # ---- Prep path & inputs
     path = Path(path)
@@ -63,12 +71,21 @@ def save_tif(image: Dict[int, np.ndarray], path: Path, metadata: Optional[Dict] 
 
     n_subifds = max(len(arrays) - 1, 0)
 
+    # Decide which metadata to pass to tifffile
+    if ome_metadata is not None:
+        base_metadata = ome_metadata
+        ome_flag = True
+    else:
+        base_metadata = metadata if isinstance(metadata, dict) else None
+        ome_flag = False
+
     # ---- Write pyramid: base IFD + SubIFDs
     with Progress() as progress:
         task = progress.add_task(f"[green]Saving image to {path.name}...", total=(n_subifds + 1))
         sub = progress.add_task("[cyan]Writing resolution level 0...", total=1)
 
-        with TiffWriter(str(path), bigtiff=True) as tif:
+        # If ome_metadata is provided, enable OME mode.
+        with TiffWriter(str(path), bigtiff=True, ome=ome_flag) as tif:
             # Base (reserves space for subIFDs)
             tif.write(
                 arrays[0],
@@ -77,7 +94,7 @@ def save_tif(image: Dict[int, np.ndarray], path: Path, metadata: Optional[Dict] 
                 photometric=photometric,
                 planarconfig="contig",
                 subifds=n_subifds,
-                metadata=(metadata if isinstance(metadata, dict) else None),
+                metadata=base_metadata,
                 maxworkers=os.cpu_count(),
             )
             progress.advance(sub, 1)
@@ -93,7 +110,7 @@ def save_tif(image: Dict[int, np.ndarray], path: Path, metadata: Optional[Dict] 
                     photometric=photometric,
                     planarconfig="contig",
                     subfiletype=1,      # reduced-resolution
-                    metadata=None,      # no per-subIFD JSON
+                    metadata=None,      # no per-subIFD JSON/OME metadata
                     maxworkers=os.cpu_count(),
                 )
                 progress.advance(sub, 1)
