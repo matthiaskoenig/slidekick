@@ -26,6 +26,10 @@ def import_wsi(image_path: Path, annotate: bool = False) -> Tuple[dict[int, zarr
         path_storage=stored_path,
     )
 
+    # Pull channel names/colors from transformed OME-TIFF metadata if available
+    if hasattr(metadata, "enrich_from_storage"):
+        metadata.enrich_from_storage(overwrite=False)
+
     if annotate:
         add_metadata(image_data, metadata)
 

@@ -1,9 +1,13 @@
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import uuid
 from datetime import datetime
 from pathlib import Path
+import xml.etree.ElementTree as ET
+
+import tifffile
+
 from slidekick.console import console
 
 
@@ -21,6 +25,8 @@ class Metadata:
     uid: str = field(default=None)
     image_type: Optional[str] = None
     stains: Dict[int, str] = field(default_factory=dict)
+    # OME Channel Color values as signed 32-bit ARGB ints (0xAARRGGBB), one per channel index.
+    channel_colors: Dict[int, int] = field(default_factory=dict)
     annotations: Dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -52,9 +58,12 @@ class Metadata:
         data["path_original"] = Path(data["path_original"])
         data["path_storage"] = Path(data["path_storage"])
 
-        # Convert string keys back to integers in the 'stains' dictionary
+        # Convert string keys back to integers in dict fields
         if "stains" in data:
             data["stains"] = {int(k): v for k, v in data["stains"].items()}
+
+        if "channel_colors" in data:
+            data["channel_colors"] = {int(k): int(v) for k, v in data["channel_colors"].items()}
 
         metadata = cls(**data)
 
@@ -72,6 +81,167 @@ class Metadata:
     def set_annotations(self, annotations: Dict) -> None:
         self.annotations = annotations
 
+    def set_channel_colors(self, channel_colors: Dict[int, int]) -> None:
+        self.channel_colors = channel_colors
+
+    def _ome_source_path(self) -> Optional[Path]:
+        """
+        Return the best path to read OME-XML from.
+
+        If path_storage is a .czi and a sibling .tiff exists (from CZI -> TIFF conversion),
+        use the .tiff for OME extraction.
+        """
+        p = Path(self.path_storage)
+        if p.suffix.lower() == ".czi":
+            t = p.with_suffix(".tiff")
+            if t.exists():
+                p = t
+
+        if p.exists() and p.suffix.lower() in {".tif", ".tiff"}:
+            return p
+        return None
+
+    @staticmethod
+    def _ome_rgba_int(r: int, g: int, b: int, a: int = 255) -> int:
+        """
+        Signed 32-bit RGBA integer (0xRRGGBBAA) as used by OME Channel Color.
+
+        Note: OME Color is RGBA (byte order), stored as a signed 32-bit integer.
+        Using ARGB here will lead to channel color swaps in readers that assume RGBA.
+        """
+        v = ((r & 255) << 24) | ((g & 255) << 16) | ((b & 255) << 8) | (a & 255)
+        if v >= 2 ** 31:
+            v -= 2 ** 32
+        return int(v)
+
+    @staticmethod
+    def _default_palette_rgb(i: int) -> Tuple[int, int, int]:
+        # Deterministic palette with RGB as the first three channels
+        palette: List[Tuple[int, int, int]] = [
+            (255, 0, 0),  # red
+            (0, 255, 0),  # green
+            (0, 0, 255),  # blue
+            (255, 0, 255),  # magenta
+            (0, 255, 255),  # cyan
+            (255, 255, 0),  # yellow
+            (255, 128, 0),  # orange
+            (153, 0, 255),  # violet
+            (0, 179, 77),  # teal
+            (255, 153, 153),  # pink
+        ]
+        return palette[i % len(palette)]
+
+    @staticmethod
+    def _guess_rgb_from_name(name: str, fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        """
+        Best-effort heuristic mapping when OME Channel Color is missing.
+        This is intentionally centralized in Metadata (not stain separation).
+        """
+        n = (name or "").lower()
+
+        if any(k in n for k in ("dapi", "hoechst")):
+            return (0, 0, 255)
+        if any(k in n for k in ("fitc", "gfp", "alexa 488", "af488", "cy2")):
+            return (0, 255, 0)
+        if any(k in n for k in ("tritc", "cy3", "alexa 555", "alexa 568", "af555", "af568",
+                                "texas red", "tdtomato", "mcherry")):
+            return (255, 0, 0)
+        if any(k in n for k in ("cy5", "alexa 647", "af647", "far red", "far-red")):
+            return (255, 0, 255)
+
+        return fallback
+
+    def enrich_from_storage(self, overwrite: bool = False) -> None:
+        """
+        Populate stains and channel_colors from OME-XML in the transformed TIFF, if available.
+
+        - Does not require reading pixel data.
+        - Does not override user-provided stains/colors unless overwrite=True.
+        """
+        src = self._ome_source_path()
+        if src is None:
+            return
+
+        try:
+            with tifffile.TiffFile(str(src)) as tf:
+                ome_xml = tf.ome_metadata
+        except Exception:
+            return
+
+        if not ome_xml:
+            return
+
+        try:
+            root = ET.fromstring(ome_xml)
+        except Exception:
+            return
+
+        channels = root.findall(".//{*}Pixels/{*}Channel")
+        if not channels:
+            return
+
+        names: List[str] = []
+        colors: List[Optional[int]] = []
+
+        for ch in channels:
+            names.append(ch.get("Name") or "")
+            c = ch.get("Color")
+            if c is None:
+                colors.append(None)
+            else:
+                try:
+                    colors.append(int(c))
+                except Exception:
+                    colors.append(None)
+
+        # stains (names)
+        if overwrite or not self.stains:
+            self.stains = {i: (names[i] if names[i] else f"ch{i}") for i in range(len(names))}
+        else:
+            for i, nm in enumerate(names):
+                if i not in self.stains or not self.stains[i]:
+                    self.stains[i] = nm if nm else f"ch{i}"
+
+        # channel_colors (OME Color if present)
+        if any(c is not None for c in colors):
+            if overwrite or not self.channel_colors:
+                self.channel_colors = {i: int(colors[i]) for i in range(len(colors)) if colors[i] is not None}
+            else:
+                for i, col in enumerate(colors):
+                    if col is None:
+                        continue
+                    if i not in self.channel_colors:
+                        self.channel_colors[i] = int(col)
+
+    def ensure_channel_metadata(self, n_channels: int) -> None:
+        """
+        Ensure stains and channel_colors exist for channel indices [0..n_channels-1].
+
+        - First tries to enrich from transformed OME-TIFF metadata.
+        - Fills any missing names as ch0, ch1, ...
+        - Fills any missing colors from name heuristics, else deterministic palette.
+        """
+        if n_channels is None or n_channels < 1:
+            return
+
+        # Try to pull from OME if available (no-op if already filled)
+        self.enrich_from_storage(overwrite=False)
+
+        if self.stains is None:
+            self.stains = {}
+        for i in range(n_channels):
+            if i not in self.stains or not self.stains[i]:
+                self.stains[i] = f"ch{i}"
+
+        if self.channel_colors is None:
+            self.channel_colors = {}
+        for i in range(n_channels):
+            if i in self.channel_colors and self.channel_colors[i] is not None:
+                continue
+            fallback_rgb = self._default_palette_rgb(i)
+            name_i = self.stains.get(i, "")
+            r, g, b = self._guess_rgb_from_name(name_i, fallback_rgb)
+            self.channel_colors[i] = self._ome_rgba_int(r, g, b)
 
 @dataclass
 class FileList:

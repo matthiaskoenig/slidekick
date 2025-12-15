@@ -41,32 +41,53 @@ def save_tif(
     # Normalize levels: 0 (full res), 1, 2, ...
     levels = sorted(int(k) for k in image.keys())
     arrays = []
+    layout = None  # "YX" (2D), "YXS" (RGB/RGBA), or "CYX" (channel-first stack)
     for lvl in levels:
         arr = image[lvl]
         if arr is None:
             raise ValueError(f"save_tif: image[{lvl}] is None.")
         arr = np.asarray(arr, order="C")  # ensure contiguous, keep dtype
+
         if arr.ndim == 2:
-            pass  # grayscale OK
+            cur_layout = "YX"
         elif arr.ndim == 3 and arr.shape[2] in (3, 4):
-            pass  # RGB/RGBA OK
+            cur_layout = "YXS"  # samples-last RGB/RGBA
+        elif arr.ndim == 3:
+            cur_layout = "CYX"  # channel-first (C, Y, X), used for OME channel stacks (including C=1)
         else:
             raise ValueError(f"save_tif: unsupported shape at level {lvl}: {arr.shape}")
+
+        if layout is None:
+            layout = cur_layout
+        elif cur_layout != layout:
+            raise ValueError(f"save_tif: layout mismatch across levels: {layout} vs {cur_layout}")
+
         arrays.append(arr)
 
     # Validate channels & dtype across levels
-    nchan = [(a.shape[2] if a.ndim == 3 else 1) for a in arrays]
+    if layout == "YXS":
+        nchan = [a.shape[2] for a in arrays]
+    elif layout == "CYX":
+        nchan = [a.shape[0] for a in arrays]
+    else:
+        nchan = [1 for _ in arrays]
+
     if any(c != nchan[0] for c in nchan):
         raise ValueError(f"save_tif: channel count mismatch across levels: {nchan}")
-    C = nchan[0]
+
+    C = int(nchan[0])
     dtype = arrays[0].dtype
     if any(a.dtype != dtype for a in arrays):
         raise ValueError("save_tif: dtype differs across levels.")
 
     # Photometric & compression
-    photometric = "minisblack" if C == 1 else "rgb"
-    # JPEG for uint8 (fast & compact), else zlib (safer for uint16 etc.)
-    compression = "jpeg" if dtype == np.uint8 and C in (1, 3) else "zlib"
+    is_rgb = (layout == "YXS")
+    photometric = "rgb" if is_rgb else "minisblack"
+
+    # Be conservative: keep fluorescence/channel stacks lossless.
+    # JPEG only for true RGB uint8.
+    compression = "jpeg" if (is_rgb and dtype == np.uint8 and C in (3, 4)) else "zlib"
+
     tile = (1024, 1024)  # Slidekick default
 
     n_subifds = max(len(arrays) - 1, 0)
@@ -87,32 +108,38 @@ def save_tif(
         # If ome_metadata is provided, enable OME mode.
         with TiffWriter(str(path), bigtiff=True, ome=ome_flag) as tif:
             # Base (reserves space for subIFDs)
-            tif.write(
-                arrays[0],
+            base_kwargs = dict(
                 tile=tile,
                 compression=compression,
                 photometric=photometric,
-                planarconfig="contig",
                 subifds=n_subifds,
                 metadata=base_metadata,
                 maxworkers=os.cpu_count(),
             )
+            if layout == "YXS":
+                base_kwargs["planarconfig"] = "contig"
+
+            tif.write(arrays[0], **base_kwargs)
+
             progress.advance(sub, 1)
             progress.advance(task, 1)
 
             # SubIFDs (reduced-resolution images)
             for i, arr in enumerate(arrays[1:], start=1):
                 progress.reset(sub, total=1, description=f"[cyan]Writing resolution level {i}...")
-                tif.write(
-                    arr,
+                sub_kwargs = dict(
                     tile=tile,
                     compression=compression,
                     photometric=photometric,
-                    planarconfig="contig",
-                    subfiletype=1,      # reduced-resolution
-                    metadata=None,      # no per-subIFD JSON/OME metadata
+                    subfiletype=1,  # reduced-resolution
+                    metadata=None,  # no per-subIFD JSON/OME metadata
                     maxworkers=os.cpu_count(),
                 )
+                if layout == "YXS":
+                    sub_kwargs["planarconfig"] = "contig"
+
+                tif.write(arr, **sub_kwargs)
+
                 progress.advance(sub, 1)
                 progress.advance(task, 1)
 

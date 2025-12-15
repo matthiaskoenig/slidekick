@@ -550,7 +550,12 @@ class StainSeparator(BaseOperator):
             return self.metadata
         n_ch = int(A0.shape[0])
 
-        stain_dict = getattr(self.metadata[0], "stains", {}) or {}
+        meta0 = self.metadata[0]
+        if hasattr(meta0, "ensure_channel_metadata"):
+            meta0.ensure_channel_metadata(n_ch)
+
+        stain_dict = getattr(meta0, "stains", {}) or {i: f"ch{i}" for i in range(n_ch)}
+        channel_colors_ome = getattr(meta0, "channel_colors", {}) or {}
 
         bg_values = None
         if self.remove_background:
@@ -664,8 +669,18 @@ class StainSeparator(BaseOperator):
         for ch in range(n_ch):
             # per-channel naming + metadata
             stain_name = stain_dict.get(ch, f"ch{ch}")
-            out_name = f"{base_stem}_{stain_name.replace(' ', '_')}.tiff"
+
+            # Include original channel index in the output filename
+            stain_safe = stain_name.replace(" ", "_")
+            out_name = f"{base_stem}_ch{ch}_{stain_safe}.tiff"
             out_path = dest_dir / out_name
+
+            # Get intended display color (OME packed int). This is produced by Metadata.ensure_channel_metadata().
+            col = channel_colors_ome.get(ch, None)
+            try:
+                col = int(col) if col is not None else None
+            except Exception:
+                col = None
 
             new_meta = Metadata(
                 path_original=self.metadata[0].path_original,
@@ -674,17 +689,26 @@ class StainSeparator(BaseOperator):
                 uid=f"{self.metadata[0].uid}-ch{ch}",
             )
             new_meta.set_stains({0: stain_name})
+
+            # Store the color in Slidekick metadata JSON as well (useful for downstream tools)
+            if col is not None and hasattr(new_meta, "set_channel_colors"):
+                new_meta.set_channel_colors({0: col})
+
             new_meta.save(dest_dir)
 
-            # Minimal OME metadata for a single-channel YX pyramid
+            # Convert pyramid data from (Y, X) to (1, Y, X) so we can write a true OME channel axis (C=1).
+            out_levels = {lvl: np.asarray(arr)[None, :, :] for lvl, arr in separated_levels[ch].items()}
+
+            # OME metadata for a single-channel CYX pyramid, with Name + Color.
             ome_meta = {
-                "axes": "YX",  # per-level arrays are H×W
-                "Channel": {"Name": [stain_name]},  # OME <Channel Name=...>
+                "axes": "CYX",
+                "Channel": {
+                    "Name": [stain_name],
+                    **({"Color": [col]} if col is not None else {}),
+                },
             }
 
-            # Pass the full level→array dict so save_tif writes a tiled, pyramidal OME-TIFF
-            # `metadata=new_meta` is kept for API compatibility but ignored as it is not a dict.
-            save_tif(separated_levels[ch], out_path, metadata=new_meta, ome_metadata=ome_meta)
+            save_tif(out_levels, out_path, metadata=new_meta, ome_metadata=ome_meta)
 
             console.print(f"Saved channel {ch} -> {out_path}", style="success")
             output_metadata.append(new_meta)
@@ -697,7 +721,7 @@ class StainSeparator(BaseOperator):
 if __name__ == "__main__":
     from slidekick import DATA_PATH
     from slidekick.io import read_wsi
-
+    """
     # Brightfield example
     image_path_brightfield = DATA_PATH / "reg" / "HE1.ome.tif"
     metadata_brightfield = Metadata(path_original=image_path_brightfield, path_storage=image_path_brightfield)
@@ -708,11 +732,11 @@ if __name__ == "__main__":
 
     bright = StainSeparator(metadata=metadata_brightfield, mode="brightfield", confirm=True, preview=True)
     metadatas_brightfield = bright.apply()
-
+    
     # Check saved img
     img, _ = read_wsi(metadatas_brightfield[0].path_storage)
     print(img)
-
+    """
     # Fluorescence example
     image_path_fluorescence = DATA_PATH / "reg" / "GS_CYP1A2.czi"
     metadata_fluorescence = Metadata(path_original=image_path_fluorescence, path_storage=image_path_fluorescence)
