@@ -11,6 +11,7 @@ from slidekick.io.metadata import Metadata
 from slidekick.console import console
 from slidekick import OUTPUT_PATH
 from slidekick.processing.baseoperator import BaseOperator
+from slidekick.io.czi import czi2tiff
 
 # VALIS imports
 from valis import registration, slide_io
@@ -41,8 +42,10 @@ class ValisRegistrator(BaseOperator):
         preview: bool = True,
         adaptive_loop: bool = False,
         micro_registration: bool = False,
-        crop: str = "reference"
+        crop: str = "reference",
+        transform_czi: Optional[List[int]] = None,
     ):
+
         """
         channel_selection is ignored for registration (we register whole images),
         but we keep the argument signature compatible with BaseOperator usage.
@@ -87,6 +90,12 @@ class ValisRegistrator(BaseOperator):
         self.adaptive_loop = adaptive_loop
         self.micro_registration = micro_registration
         self.crop = crop
+
+        # CZI conversion control:
+        # - [] or None: convert nothing
+        # - [-1]: convert all CZIs
+        # - [i, j, ...]: convert only those indices (0-based; 1-based accepted if no 0 present)
+        self.transform_czi = list(transform_czi) if transform_czi is not None else []
 
         # For inspection / downstream use
         self.error_df = None
@@ -242,6 +251,90 @@ class ValisRegistrator(BaseOperator):
             # signal failure to caller
             return None, None, None, None
 
+    def _ensure_ome_tiff_inputs(self, transform_czi: Optional[List[int]] = None) -> None:
+        """
+        Conditionally convert .czi inputs to OME-TIFF (written as sibling .tiff) and
+        update Metadata.path_storage to point to the converted TIFF.
+
+        Rules
+        -----
+        - If transform_czi is empty or None: convert nothing
+        - If transform_czi contains -1: convert all CZIs
+        - Else: treat entries as indices into self.metadata
+          - default is 0-based
+          - 1-based is accepted if there is no 0 in the list and all indices >= 1
+
+        Keeps the original .czi on disk and keeps Metadata.path_original unchanged.
+        """
+        indices = list(transform_czi) if transform_czi is not None else []
+        if not indices:
+            console.print("[CZI→OME-TIFF] transform_czi is empty; skipping CZI conversion", style="info")
+            return
+
+        convert_all = (-1 in indices)
+
+        # Determine target indices
+        if convert_all:
+            target_indices = list(range(len(self.metadata)))
+            console.print("[CZI→OME-TIFF] -1 provided; converting all CZIs", style="info")
+        else:
+            raw = [int(i) for i in indices if i is not None]
+            # Accept 1-based indexing if user did not include 0 and all are >= 1
+            if raw and (0 not in raw) and min(raw) >= 1:
+                raw = [i - 1 for i in raw]
+            target_indices = sorted(set(raw))
+
+        # Match Slidekick's standard CZI -> TIFF conversion parameters
+        czi_kwargs = dict(tile_size=(2048, 2048), subresolution_levels=[1, 2, 4], res_unit="µm")
+
+        for idx in target_indices:
+            if idx < 0 or idx >= len(self.metadata):
+                console.print(f"[CZI→OME-TIFF] index out of range: {idx} (n={len(self.metadata)})", style="warning")
+                continue
+
+            meta = self.metadata[idx]
+            src = Path(meta.path_storage)
+
+            if src.suffix.lower() != ".czi":
+                console.print(f"[CZI→OME-TIFF] idx={idx} is not .czi ({src.name}); skipping", style="info")
+                continue
+
+
+            if not src.exists():
+                console.print(f"[CZI→OME-TIFF] missing source file: {src}", style="error")
+                continue
+
+            # Store alongside the original CZI (same folder, same stem, .tiff)
+            tiff_path = src.with_suffix(".tiff")
+
+            if not tiff_path.exists():
+                console.print(
+                    f"[CZI→OME-TIFF] converting {src.name} -> {tiff_path.name}",
+                    style="info",
+                )
+                try:
+                    czi2tiff(src, tiff_path, **czi_kwargs)
+                except Exception as e:
+                    console.print(f"[CZI→OME-TIFF] conversion failed for {src.name}: {e}", style="error")
+                    continue
+            else:
+                console.print(
+                    f"[CZI→OME-TIFF] using existing {tiff_path.name} for {src.name}",
+                    style="warning",
+                )
+
+            # Use the OME-TIFF for all downstream processing
+            meta.path_storage = tiff_path
+            meta.filename_stored = tiff_path.name
+            meta.raw_format_stored = tiff_path.suffix
+
+            # Optional: if metadata supports it, pull channel names/colors/calibration from OME-XML
+            if hasattr(meta, "enrich_from_storage"):
+                try:
+                    meta.enrich_from_storage(overwrite=False)
+                except Exception:
+                    pass
+
     def apply(self):
         """
         Run VALIS registration for the slides listed in self.metadata.
@@ -257,9 +350,13 @@ class ValisRegistrator(BaseOperator):
         - Warps and saves full-resolution slides only for the best attempt.
         - Updates each Metadata.path_storage / path_original to point to the
           registered slides and sets image_type / uid accordingly.
-        """
+                """
+        # Optionally convert selected CZIs (controlled by transform_czi)
+        self._ensure_ome_tiff_inputs(self.transform_czi)
+
         # Root results folder for all attempts
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
         short_id = uuid.uuid4().hex[:8]
         new_uid = f"{timestamp}-{short_id}"
 
@@ -743,6 +840,6 @@ if __name__ == "__main__":
 
     metadatas = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
-    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600, max_micro_registration_dim_px=1200, micro_registration=True)
+    Registrator = ValisRegistrator(metadatas, max_processed_image_dim_px=600, max_non_rigid_registration_dim_px=600, max_micro_registration_dim_px=1200, micro_registration=True, transform_czi=[-1])
 
     metadatas_registered = Registrator.apply()
