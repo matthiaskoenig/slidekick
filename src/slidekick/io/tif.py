@@ -1,14 +1,86 @@
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, Tuple
 from rich.progress import Progress
 from tifffile import TiffWriter
 import numpy as np
 import os
 
+
+def _normalize_ome_length_unit(unit: Optional[str]) -> Optional[str]:
+    if unit is None:
+        return None
+    u = str(unit).strip()
+    if not u:
+        return None
+    if u.lower() in {"um", "micron", "microns", "micrometer", "micrometers"}:
+        return "µm"
+    if u in {"μm", "µm"}:
+        return "µm"
+    return u
+
+
+def _extract_physical_pixel_size(meta: Any) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Extract (x,y,unit) from Slidekick Metadata object or dict-like metadata."""
+    if meta is None:
+        return None, None, None
+
+    # Slidekick Metadata object
+    if hasattr(meta, "get_physical_pixel_size"):
+        try:
+            x, y, unit = meta.get_physical_pixel_size()
+            return x, y, _normalize_ome_length_unit(unit)
+        except Exception:
+            pass
+
+    # Dict-like
+    if isinstance(meta, dict):
+        res = meta.get("resolution")
+        unit = meta.get("resolution_unit")
+        x = y = None
+        if isinstance(res, dict):
+            try:
+                x = float(res.get("x")) if res.get("x") is not None else None
+            except Exception:
+                x = None
+            try:
+                y = float(res.get("y")) if res.get("y") is not None else None
+            except Exception:
+                y = None
+        return x, y, _normalize_ome_length_unit(unit)
+
+    return None, None, None
+
+
+def _inject_physical_size_into_ome_metadata(ome_meta: Dict, meta_source: Any) -> Dict:
+    """Add PhysicalSizeX/Y (+ unit) to ome_meta if missing. Returns a shallow-copied dict."""
+    if not isinstance(ome_meta, dict):
+        return ome_meta
+
+    # Do not override if caller already provided calibration explicitly
+    if "PhysicalSizeX" in ome_meta or "PhysicalSizeY" in ome_meta:
+        return ome_meta
+
+    x, y, unit = _extract_physical_pixel_size(meta_source)
+    if x is None and y is None:
+        return ome_meta
+
+    out = dict(ome_meta)  # shallow copy
+    if x is not None:
+        out["PhysicalSizeX"] = float(x)
+        if unit is not None:
+            out["PhysicalSizeXUnit"] = unit
+    if y is not None:
+        out["PhysicalSizeY"] = float(y)
+        if unit is not None:
+            out["PhysicalSizeYUnit"] = unit
+
+    return out
+
+
 def save_tif(
     image: Dict[int, np.ndarray],
     path: Path,
-    metadata: Optional[Dict] = None,
+    metadata: Optional[Any] = None,
     ome_metadata: Optional[Dict] = None,
 ) -> None:
     """
@@ -22,9 +94,10 @@ def save_tif(
         All levels must share the same channel count & dtype.
     path : Path
         Output file. '.tiff' will be enforced.
-    metadata : Optional[Dict]
-        Optional JSON-serializable dict stored in ImageDescription for the *base* IFD.
-        (Do NOT pass Slidekick's Metadata object here.)
+    metadata : Optional[Any]
+        Optional metadata. If this is a dict, it may be stored in ImageDescription (when ome_metadata is None).
+        If this is a Slidekick Metadata object and ome_metadata is provided, physical pixel size calibration
+        will be injected into OME metadata.
     ome_metadata : Optional[Dict]
         Optional OME metadata dict. If provided, the file is written as OME-TIFF
         (using tifffile's `ome=True`) and this dict is passed to tifffile.
@@ -94,6 +167,8 @@ def save_tif(
 
     # Decide which metadata to pass to tifffile
     if ome_metadata is not None:
+        # Ensure OME-XML contains PhysicalSizeX/Y so QuPath shows µm/px.
+        ome_metadata = _inject_physical_size_into_ome_metadata(ome_metadata, metadata)
         base_metadata = ome_metadata
         ome_flag = True
     else:

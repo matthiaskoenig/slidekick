@@ -555,6 +555,10 @@ class StainSeparator(BaseOperator):
                 mm.flush()
 
         # Save outputs and create metadata per stain
+        # Ensure source calibration is available even if this operator is run without import_wsi().
+        if hasattr(self.metadata[0], "enrich_from_storage"):
+            self.metadata[0].enrich_from_storage(overwrite=False)
+
         output_metadata = []
         base_path = Path(self.metadata[0].path_storage)
         # safe multi-suffix trimming (e.g., .ome.tif)
@@ -576,6 +580,11 @@ class StainSeparator(BaseOperator):
                 image_type=self.metadata[0].image_type,
                 uid=f"{self.metadata[0].uid}-{stain_name.replace(' ', '_')}"
             )
+
+            # Copy calibration into the output metadata (save_tif will inject into OME-XML).
+            if hasattr(new_meta, "inherit_calibration_from"):
+                new_meta.inherit_calibration_from(self.metadata[0], overwrite=False)
+
             new_meta.set_stains({0: stain_name})
             new_meta.save(dest_dir)  # save metadata into the same folder
 
@@ -840,6 +849,10 @@ class StainSeparator(BaseOperator):
                 mm.flush()
 
         # save per channel (grayscale intensity)
+        # Ensure source calibration is available even if this operator is run without import_wsi().
+        if hasattr(self.metadata[0], "enrich_from_storage"):
+            self.metadata[0].enrich_from_storage(overwrite=False)
+
         output_metadata = []
         base_path = Path(self.metadata[0].path_storage)
         # safe multi-suffix trimming (e.g., .ome.tif)
@@ -869,6 +882,11 @@ class StainSeparator(BaseOperator):
                 image_type=self.metadata[0].image_type or "fluorescence",
                 uid=f"{self.metadata[0].uid}-ch{ch}",
             )
+
+            # Copy calibration into the output metadata (save_tif will inject into OME-XML).
+            if hasattr(new_meta, "inherit_calibration_from"):
+                new_meta.inherit_calibration_from(self.metadata[0], overwrite=False)
+
             new_meta.set_stains({0: stain_name})
 
             # Store the color in Slidekick metadata JSON as well (useful for downstream tools)

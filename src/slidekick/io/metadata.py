@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,7 @@ class Metadata:
     filename_stored: str = None
     raw_format_original: str = None
     raw_format_stored: str = None
-    resolution: Dict[float, float] = field(default_factory=dict)
+    resolution: Dict[str, float] = field(default_factory=dict)
     resolution_unit: str = None
     uid: str = field(default=None)
     image_type: Optional[str] = None
@@ -83,6 +83,67 @@ class Metadata:
 
     def set_channel_colors(self, channel_colors: Dict[int, int]) -> None:
         self.channel_colors = channel_colors
+
+    @staticmethod
+    def _normalize_ome_length_unit(unit: Optional[str]) -> Optional[str]:
+        """Normalize common micrometer spellings to OME-compatible units."""
+        if unit is None:
+            return None
+        u = str(unit).strip()
+        if not u:
+            return None
+        if u.lower() in {"um", "micron", "microns", "micrometer", "micrometers"}:
+            return "µm"
+        if u in {"μm", "µm"}:
+            return "µm"
+        return u
+
+    def set_physical_pixel_size(
+            self,
+            physical_size_x: Optional[float],
+            physical_size_y: Optional[float],
+            unit: Optional[str],
+            *,
+            overwrite: bool = False,
+    ) -> None:
+        """Store physical pixel size (µm/px) into resolution + resolution_unit."""
+        unit_n = self._normalize_ome_length_unit(unit)
+
+        if self.resolution is None or overwrite:
+            self.resolution = {}
+
+        if physical_size_x is not None and (overwrite or "x" not in self.resolution):
+            self.resolution["x"] = float(physical_size_x)
+        if physical_size_y is not None and (overwrite or "y" not in self.resolution):
+            self.resolution["y"] = float(physical_size_y)
+
+        if unit_n is not None and (overwrite or self.resolution_unit is None):
+            self.resolution_unit = unit_n
+
+    def get_physical_pixel_size(self) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        """Return (PhysicalSizeX, PhysicalSizeY, unit) from stored fields."""
+        x = None
+        y = None
+        if isinstance(self.resolution, dict):
+            try:
+                x = float(self.resolution.get("x")) if self.resolution.get("x") is not None else None
+            except Exception:
+                x = None
+            try:
+                y = float(self.resolution.get("y")) if self.resolution.get("y") is not None else None
+            except Exception:
+                y = None
+        unit = self._normalize_ome_length_unit(self.resolution_unit)
+        return x, y, unit
+
+    def inherit_calibration_from(self, other: "Metadata", *, overwrite: bool = False) -> None:
+        """Copy physical pixel size calibration from another Metadata object."""
+        if other is None or not hasattr(other, "get_physical_pixel_size"):
+            return
+        x, y, unit = other.get_physical_pixel_size()
+        if x is None and y is None:
+            return
+        self.set_physical_pixel_size(x, y, unit, overwrite=overwrite)
 
     def _ome_source_path(self) -> Optional[Path]:
         """
@@ -153,10 +214,11 @@ class Metadata:
 
     def enrich_from_storage(self, overwrite: bool = False) -> None:
         """
-        Populate stains and channel_colors from OME-XML in the transformed TIFF, if available.
+        Populate physical pixel size calibration plus stains and channel_colors from OME-XML
+        in the transformed TIFF, if available.
 
         - Does not require reading pixel data.
-        - Does not override user-provided stains/colors unless overwrite=True.
+        - Does not override user-provided values unless overwrite=True.
         """
         src = self._ome_source_path()
         if src is None:
@@ -176,6 +238,27 @@ class Metadata:
         except Exception:
             return
 
+        # ---- Physical pixel size (QuPath reads µm/px from these)
+        pixels = root.find(".//{*}Pixels")
+        if pixels is not None:
+            def _to_float(v: Optional[str]) -> Optional[float]:
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+
+            psx = _to_float(pixels.get("PhysicalSizeX"))
+            psy = _to_float(pixels.get("PhysicalSizeY"))
+            unit_x = pixels.get("PhysicalSizeXUnit")
+            unit_y = pixels.get("PhysicalSizeYUnit")
+            unit = unit_x or unit_y
+
+            if psx is not None or psy is not None or unit is not None:
+                self.set_physical_pixel_size(psx, psy, unit, overwrite=overwrite)
+
+        # ---- Channels (names + colors)
         channels = root.findall(".//{*}Pixels/{*}Channel")
         if not channels:
             return
