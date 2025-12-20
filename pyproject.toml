@@ -136,7 +136,6 @@ dependencies = [
     "python-dateutil==2.9.0.post0",
     "python-utils==3.9.1",
     "pytz==2025.2",
-    "pyvips==3.0.0",
     "pywin32==311",
     "pyyaml==6.0.2",
     "pyzmq==27.0.2",
@@ -192,4 +191,5 @@ dependencies = [
     "xsdata==24.3.1",
     "geojson>=3.2.0",
     "czifile>=2019.7.2.1",
+    "pyvips[binary]>=3.0.0",
 ]

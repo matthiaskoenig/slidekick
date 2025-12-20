@@ -628,8 +628,32 @@ class LobuleSegmentor(BaseOperator):
             filt_vis = np.zeros((Hs, Ws), dtype=np.uint8)
 
             mask_vis[tissue_mask] = 255
-            r0, c0, r1, c1 = bbox_small
-            filt_vis[r0:r1, c0:c1] = roi_mean
+            # NOTE: `largest_bbox` may return either:
+            #   - (r0, c0, r1, c1)  [corner coords]
+            #   - (x0, y0, w, h)    [OpenCV-style xywh]
+            # `crop_image(local, bbox_small)` already interpreted bbox_small consistently,
+            # so we use `roi_mean.shape` to disambiguate and paste back safely.
+            bbox = tuple(int(v) for v in bbox_small)
+
+            # First assume corner-coordinates (r0,c0,r1,c1)
+            r0, c0, r1, c1 = bbox
+            if (r1 - r0, c1 - c0) != roi_mean.shape:
+                # Fallback: assume xywh (x0,y0,w,h)
+                x0, y0, w, h = bbox
+                r0, c0 = y0, x0
+                r1, c1 = y0 + h, x0 + w
+
+            # Clamp to canvas (defensive against out-of-bounds bboxes)
+            r0 = max(0, min(r0, Hs))
+            c0 = max(0, min(c0, Ws))
+            r1 = max(r0, min(r1, Hs))
+            c1 = max(c0, min(c1, Ws))
+
+            hp = r1 - r0
+            wp = c1 - c0
+            if hp > 0 and wp > 0:
+                # If clamping reduced the slice, crop the ROI accordingly
+                filt_vis[r0:r1, c0:c1] = roi_mean[:hp, :wp]
 
             return mask_vis, filt_vis
 
