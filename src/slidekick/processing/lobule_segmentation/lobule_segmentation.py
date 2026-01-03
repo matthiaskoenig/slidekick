@@ -42,6 +42,9 @@ class LobuleSegmentor(BaseOperator):
                  throw_out_ratio: float = None,
                  preview: bool = True,
                  confirm: bool = True,
+                 # preview rendering (Napari)
+                 preview_max_side: int = 4096,
+                 preview_max_downsample: int = 2,
                  base_level: int = 0,
                  region_size: int = 20,
                  multi_otsu: bool = True,
@@ -49,6 +52,12 @@ class LobuleSegmentor(BaseOperator):
                  n_clusters: int = 3,
                  target_superpixels: int = None,
                  adaptive_histonorm: bool = True,
+
+                 # ROI + background handling (important for fluorescence)
+                 roi_projection: str = "max",
+                 bg_low_val: int = 0,
+                 clahe_bg_suppress: int = 10,
+
                  # nonlinear KMeans
                  interactive_weighting: bool = True,
                  nonlinear_kmeans: bool = True,
@@ -77,6 +86,8 @@ class LobuleSegmentor(BaseOperator):
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
+        @param preview_max_side: target maximum side length (px) for Napari previews (higher = more detail, slower)
+        @param preview_max_downsample: hard cap on preview downsampling factor (e.g. 4 => never downsample more than 4x)
         @param base_level: Pyramid level to load
         @param multi_otsu: whether to use multi-otsu to filter out microscopy background, otherwise classic otsu
         @param region_size: average size of superpixels for SLIC in pixels
@@ -105,6 +116,10 @@ class LobuleSegmentor(BaseOperator):
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
+
+        # preview downsampling policy (used in all Napari previews)
+        self.preview_max_side = int(preview_max_side)
+        self.preview_max_downsample = int(preview_max_downsample)
         self.base_level = base_level
         self.multi_otsu = multi_otsu
         self.region_size = region_size
@@ -114,6 +129,11 @@ class LobuleSegmentor(BaseOperator):
         self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
         self.adaptive_histonorm = adaptive_histonorm
+
+        # ROI + background handling (used in preview + real segmentation)
+        self.roi_projection = str(roi_projection)
+        self.bg_low_val = int(bg_low_val)
+        self.clahe_bg_suppress = int(clahe_bg_suppress)
 
         # Kmeans
         self.interactive_weighting = interactive_weighting
@@ -177,6 +197,58 @@ class LobuleSegmentor(BaseOperator):
         self.channels_pp = channels_pp
         self.channels_pv = channels_pv
 
+    def _downsample_for_preview(self, img: np.ndarray) -> np.ndarray:
+        """
+        Downsample for Napari previews using ONLY the max downsample factor,
+        but never reduce the preview below 2048 px on the longest side.
+
+        Policy:
+          - Let max_factor = self.preview_max_downsample (e.g. 2 => at most 2x downsample)
+          - If applying 1/max_factor would yield max_dim < 2048, downsample less so that
+            max_dim becomes ~2048.
+          - Never upsample (if max_dim <= 2048, return original).
+        """
+        if img is None:
+            raise ValueError("preview downsample received None")
+
+        arr = np.asarray(img)
+        if arr.ndim not in (2, 3):
+            raise ValueError(f"Expected 2D/3D image for preview, got shape={arr.shape}")
+
+        # OpenCV does not like bool
+        if arr.dtype == bool:
+            arr = arr.astype(np.uint8) * 255
+
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        max_dim = max(h, w)
+
+        min_preview_side = 2048
+        max_factor = max(1, int(self.preview_max_downsample))
+
+        # Never upsample small images
+        if max_dim <= min_preview_side:
+            return arr
+
+        # Desired downsample scale from factor cap
+        scale_floor = 1.0 / float(max_factor)
+
+        # Ensure we don't downsample below 2048 on the longest side
+        scale_min = float(min_preview_side) / float(max_dim)
+
+        # Choose the larger scale (less downsampling) to satisfy both constraints
+        scale = max(scale_floor, scale_min)
+
+        # Clamp to 1.0 (no upsampling)
+        if scale >= 1.0:
+            return arr
+
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+
+        # INTER_AREA is best for downsampling
+        interp = cv2.INTER_AREA
+        return cv2.resize(arr, (new_w, new_h), interpolation=interp)
+
     def _filter(self, image_stack: np.ndarray) -> np.ndarray:
         """
         Channel-wise version of zia's filtering. Works for N >= 1 channels.
@@ -188,15 +260,17 @@ class LobuleSegmentor(BaseOperator):
 
         H, W, N = image_stack.shape
 
-        # Treat a pixel as "missing" only if ALL channels are zero there.
-        # This keeps real tissue pixels where some channels legitimately go to 0.
-        missing_mask = np.all(image_stack == 0, axis=-1)
+        # Treat a pixel as "missing" only if ALL channels are <= bg_low_val.
+        # Fluorescence backgrounds are often small nonzero values, so ==0 is too strict.
+        bg_low_val = int(getattr(self, "bg_low_val", 0))
+        missing_mask = np.all(image_stack <= bg_low_val, axis=-1)
 
         out = np.empty((H, W, N), dtype=np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
 
         for c in range(N):
-            ch = image_stack[..., c]
+            # copy to avoid in-place modification of `image_stack`
+            ch = np.asarray(image_stack[..., c]).copy()
 
             # ensure uint8 for OpenCV ops
             if ch.dtype != np.uint8:
@@ -211,7 +285,11 @@ class LobuleSegmentor(BaseOperator):
             # adaptive histogram norm (2D only)
             if self.adaptive_histonorm:
                 ch = clahe.apply(ch)
-                ch[ch < 10] = 0  # suppress background altered by CLAHE
+
+                # Suppress low values post-CLAHE (make configurable; fluorescence often needs 0..3, not 10)
+                thr = int(getattr(self, "clahe_bg_suppress", 10))
+                if thr > 0:
+                    ch[ch < thr] = 0
 
             # blur
             ch = cv2.medianBlur(ch, ksize=3)
@@ -238,8 +316,8 @@ class LobuleSegmentor(BaseOperator):
             console.print("No images to preview.", style="warning")
             return
 
-        # Downsample each image for preview to a reasonable size (max 2048 px on longest side)
-        thumbs = [downsample_to_max_side(im, 2048) for im in images]
+        # Downsample each image for preview (higher detail, but never more than Nx downsample)
+        thumbs = [self._downsample_for_preview(im) for im in images]
 
         # Import Napari and create a viewer for layered display
         # TODO: Use viewer from slidekick
@@ -296,7 +374,7 @@ class LobuleSegmentor(BaseOperator):
             return
 
         # downsample whole stack for preview
-        frames_small = [downsample_to_max_side(image_stack[..., c], 2048) for c in range(image_stack.shape[2])]
+        frames_small = [self._downsample_for_preview(image_stack[..., c]) for c in range(image_stack.shape[2])]
         stack_small = np.stack(frames_small, axis=-1)
         H, W, C = stack_small.shape
 
@@ -498,11 +576,45 @@ class LobuleSegmentor(BaseOperator):
         """
         Load each image at `self.base_level`, convert to 2D grayscale if necessary,
         harmonize shapes, and stack into a uint8 array of shape (H, W, C).
-        Also returns the dict of original pyramid-level shapes from image 0.
+
+        Also returns `orig_shapes`, a dict {level: (H, W)} for pyramid levels that are
+        available in *all* images (intersection of levels). This is used to drive the
+        interactive load-level selector.
         """
         arrays: List[np.ndarray] = []
 
-        for i, md in enumerate(self.metadata):
+        # Determine pyramid levels available in ALL images (robust against mixed pyramids)
+        level_sets: List[set] = []
+        for i, _md in enumerate(self.metadata):
+            try:
+                level_sets.append(set(self.load_image(i).keys()))
+            except Exception:
+                level_sets.append(set())
+
+        common_levels: set = set.intersection(*level_sets) if level_sets else set()
+        if not common_levels and len(self.metadata) > 0:
+            # fallback: take whatever image 0 provides (better than empty)
+            common_levels = set(self.load_image(0).keys())
+
+        # Ensure current base_level exists in ALL images; otherwise choose a valid fallback.
+        # Policy:
+        #   - prefer the largest common level <= requested (e.g. requested=2, common={0,1} -> 1)
+        #   - if none are <= requested, fall back to the smallest available level.
+        if common_levels and int(self.base_level) not in common_levels:
+            requested = int(self.base_level)
+            common_int = sorted(int(l) for l in common_levels)
+
+            lower_or_equal = [l for l in common_int if l <= requested]
+            fallback = max(lower_or_equal) if lower_or_equal else min(common_int)
+
+            console.print(
+                f"Requested base_level={requested} not available in all images; "
+                f"falling back to base_level={fallback}.",
+                style="warning",
+            )
+            self.base_level = fallback
+
+        for i, _md in enumerate(self.metadata):
             try:
                 img = self.load_image(i)[self.base_level]  # load resolution level
             except Exception:
@@ -526,42 +638,123 @@ class LobuleSegmentor(BaseOperator):
         w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
 
-        stack = np.dstack(arrays).astype(np.uint8)
+        # Robust uint8 conversion:
+        # DO NOT use .astype(np.uint8) on uint16/float images: it wraps/clips and breaks ROI detection.
+        arrays_u8: List[np.ndarray] = []
+        for a in arrays:
+            if a.dtype == np.uint8:
+                a_u8 = a
+            else:
+                a_u8 = ensure_grayscale_uint8(a)
+            arrays_u8.append(np.ascontiguousarray(a_u8))
 
-        # Get resolutions / image sizes as dict for later back mapping based on metadata object 0
-        orig_shapes = {k: v.shape[:2] for k, v in self.load_image(0).items()}
+        stack = np.dstack(arrays_u8)
+
+        # Pyramid-level shapes from image 0, restricted to common levels
+        if len(self.metadata) > 0:
+            img0 = self.load_image(0)
+            orig_shapes = {int(k): tuple(img0[k].shape[:2]) for k in sorted(common_levels)}
+        else:
+            orig_shapes = {}
 
         return stack, orig_shapes
 
-    def _interactive_preprocessing_preview(self, base_stack: np.ndarray) -> None:
+    def _interactive_preprocessing_preview(
+        self,
+        base_stack: np.ndarray,
+        orig_shapes: Dict[int, Any],
+    ) -> Tuple[np.ndarray, Dict[int, Any]]:
         """
         Interactive Napari preview for early preprocessing parameters:
+          - base_level (pyramid level used for subsequent processing)
           - multi_otsu (ROI detection)
           - adaptive_histonorm (filtering)
           - ksize (median blur)
           - channels to invert (self.channels)
 
         Operates on a downsampled copy of `base_stack`. On confirm, the chosen
-        values are stored in self.multi_otsu, self.adaptive_histonorm,
+        values are stored in self.base_level, self.multi_otsu, self.adaptive_histonorm,
         self.ksize and self.channels.
+
+        Returns
+        -------
+        base_stack_current, orig_shapes_current
+            The (possibly reloaded) base stack and pyramid shapes consistent with the
+            selected base_level.
         """
         if base_stack.ndim != 3:
             raise ValueError(f"Expected (H, W, C) stack, got {base_stack.shape}")
 
-        # downsample each channel for preview
-        frames_small = [
-            downsample_to_max_side(base_stack[..., c], 2048)
-            for c in range(base_stack.shape[2])
-        ]
-        stack_small = np.stack(frames_small, axis=-1)
+        # keep track of what is currently displayed and what apply() should continue with
+        base_stack_current: np.ndarray = base_stack
+        orig_shapes_current: Dict[int, Any] = orig_shapes
+
+        # Available pyramid levels (intersection across images is enforced in _load_base_stack)
+        available_levels: List[int] = sorted(int(k) for k in orig_shapes_current.keys())
+        if not available_levels:
+            available_levels = [int(self.base_level)]
+
+        # Ensure current base_level is valid; if not, fall back intelligently and reload.
+        # Prefer the largest available level <= requested; otherwise take the smallest available.
+        if int(self.base_level) not in available_levels:
+            requested = int(self.base_level)
+            lower_or_equal = [l for l in available_levels if l <= requested]
+            self.base_level = int(max(lower_or_equal) if lower_or_equal else min(available_levels))
+
+            base_stack_current, orig_shapes_current = self._load_base_stack()
+            available_levels = sorted(int(k) for k in orig_shapes_current.keys()) or [int(self.base_level)]
+
+        def _build_stack_small(bs: np.ndarray) -> np.ndarray:
+            """
+            Downsample each channel for interactive preview.
+            Uses self.preview_max_side, but never downsamples more than self.preview_max_downsample.
+            Returns (Hs, Ws, C).
+            """
+            frames = [self._downsample_for_preview(bs[..., c]) for c in range(bs.shape[2])]
+            return np.stack(frames, axis=-1)
+
+        def _reload_level(level: int) -> None:
+            """Reload the base stack at a different pyramid level and rebuild preview arrays."""
+            nonlocal base_stack_current, orig_shapes_current, available_levels, stack_small, Hs, Ws, C
+            level = int(level)
+            if level == int(self.base_level):
+                return
+
+            prev_level = int(self.base_level)
+            self.base_level = level
+            try:
+                base_stack_current, orig_shapes_current = self._load_base_stack()
+            except Exception as e:
+                console.print(
+                    f"Failed to load base_level={level}; keeping base_level={prev_level}. Error: {e}",
+                    style="error",
+                )
+                self.base_level = prev_level
+                return
+
+            available_levels = sorted(int(k) for k in orig_shapes_current.keys()) or [int(self.base_level)]
+            stack_small = _build_stack_small(base_stack_current)
+            Hs, Ws, C = stack_small.shape
+
+            # keep inversion channels in range
+            self.channels = [c for c in (self.channels or []) if 0 <= c < C]
+
+        # downsample each channel for preview (initial)
+        stack_small = _build_stack_small(base_stack_current)
         Hs, Ws, C = stack_small.shape
 
         # remember current values for reset
         defaults = dict(
+            base_level=int(self.base_level),
             multi_otsu=self.multi_otsu,
             adaptive_histonorm=self.adaptive_histonorm,
             ksize=self.ksize,
             channels=list(self.channels or []),
+
+            # ROI + background control defaults
+            roi_projection=getattr(self, "roi_projection", "max"),
+            bg_low_val=int(getattr(self, "bg_low_val", 0)),
+            clahe_bg_suppress=int(getattr(self, "clahe_bg_suppress", 10)),
         )
         # ensure default invert channels are in range
         defaults["channels"] = [c for c in defaults["channels"] if 0 <= c < C]
@@ -582,30 +775,69 @@ class LobuleSegmentor(BaseOperator):
               5) project back to full preview canvas for display
             """
             # store choices in the object, so they are ready when user confirms
-            self.multi_otsu = bool(multi_otsu_val)
-            self.adaptive_histonorm = bool(adaptive_histonorm_val)
+            self.multi_otsu = multi_otsu_val
+            self.adaptive_histonorm = adaptive_histonorm_val
             self.ksize = int(ksize_val)
             self.channels = list(invert_channels)
 
             local = stack_small.copy()
-            gray = ensure_grayscale_uint8(local)
 
-            if self.multi_otsu:
+            # tissue detection
+            # For fluorescence, mean-projection is often too weak; max-projection is typically better.
+            proj_mode = str(getattr(self, "roi_projection", "max")).lower()
+
+            if proj_mode == "mean":
+                proj = local.mean(axis=2)
+            elif proj_mode == "sum":
+                proj = local.sum(axis=2)
+            else:
+                proj = local.max(axis=2)  # default
+
+            # optional background floor BEFORE Otsu (important for dim fluorescence)
+            bg_low_val = int(getattr(self, "bg_low_val", 0))
+            if bg_low_val > 0:
+                proj = np.where(proj <= bg_low_val, 0, proj)
+
+            # ensure uint8 grayscale for mask detection (avoid uint16->uint8 wrap + projection clipping)
+            proj_u8 = ensure_grayscale_uint8(proj)
+
+            if multi_otsu_val:
                 tissue_mask = detect_tissue_mask_multiotsu(
-                    gray,
+                    proj_u8,
                     morphological_radius=6,
                     report_path=None,
                 )
             else:
                 tissue_mask = detect_tissue_mask(
-                    gray,
+                    proj_u8,
                     morphological_radius=6,
                 )
 
             local[~tissue_mask] = 0
 
-            bbox_small = largest_bbox(tissue_mask.astype(np.uint8))
-            roi = crop_image(local, bbox_small)
+            # bbox in (min_row, min_col, max_row, max_col), optionally padded to compensate for conservative masks
+            Hm, Wm = tissue_mask.shape[:2]
+            ys, xs = np.nonzero(tissue_mask)
+            if ys.size == 0 or xs.size == 0:
+                bbox_small = (0, 0, Hm, Wm)
+            else:
+                r0 = int(ys.min())
+                r1 = int(ys.max()) + 1
+                c0 = int(xs.min())
+                c1 = int(xs.max()) + 1
+
+                pad_frac = float(getattr(self, "roi_bbox_pad_frac", 0.02))
+                pad_r = int(round(pad_frac * Hm))
+                pad_c = int(round(pad_frac * Wm))
+
+                r0 = max(0, r0 - pad_r)
+                c0 = max(0, c0 - pad_c)
+                r1 = min(Hm, r1 + pad_r)
+                c1 = min(Wm, c1 + pad_c)
+
+                bbox_small = (r0, c0, r1, c1)
+
+            roi = local[bbox_small[0]:bbox_small[2], bbox_small[1]:bbox_small[3], :]
 
             # inversion on ROI
             if self.channels:
@@ -614,36 +846,28 @@ class LobuleSegmentor(BaseOperator):
                         ch = roi[:, :, c]
                         if np.issubdtype(ch.dtype, np.integer):
                             info = np.iinfo(ch.dtype)
-                            ch = info.max - ch
+                            roi[:, :, c] = info.max - ch
                         else:
-                            ch = 1.0 - ch
-                        roi[:, :, c] = ch
+                            roi[:, :, c] = 1.0 - ch
 
-            # reuse filter but it uses current self.ksize / adaptive_histonorm
+            # filtering on ROI
             roi_filtered = self._filter(roi)
             roi_mean = roi_filtered.mean(axis=2).astype(np.uint8)
 
-            # project ROI back into full-size preview canvas
+            # visualize
             mask_vis = np.zeros((Hs, Ws), dtype=np.uint8)
             filt_vis = np.zeros((Hs, Ws), dtype=np.uint8)
 
             mask_vis[tissue_mask] = 255
-            # NOTE: `largest_bbox` may return either:
-            #   - (r0, c0, r1, c1)  [corner coords]
-            #   - (x0, y0, w, h)    [OpenCV-style xywh]
-            # `crop_image(local, bbox_small)` already interpreted bbox_small consistently,
-            # so we use `roi_mean.shape` to disambiguate and paste back safely.
-            bbox = tuple(int(v) for v in bbox_small)
 
-            # First assume corner-coordinates (r0,c0,r1,c1)
+            # bbox handling + safe paste-back (already in your attached file)
+            bbox = tuple(int(v) for v in bbox_small)
             r0, c0, r1, c1 = bbox
             if (r1 - r0, c1 - c0) != roi_mean.shape:
-                # Fallback: assume xywh (x0,y0,w,h)
                 x0, y0, w, h = bbox
                 r0, c0 = y0, x0
                 r1, c1 = y0 + h, x0 + w
 
-            # Clamp to canvas (defensive against out-of-bounds bboxes)
             r0 = max(0, min(r0, Hs))
             c0 = max(0, min(c0, Ws))
             r1 = max(r0, min(r1, Hs))
@@ -652,10 +876,14 @@ class LobuleSegmentor(BaseOperator):
             hp = r1 - r0
             wp = c1 - c0
             if hp > 0 and wp > 0:
-                # If clamping reduced the slice, crop the ROI accordingly
                 filt_vis[r0:r1, c0:c1] = roi_mean[:hp, :wp]
 
             return mask_vis, filt_vis
+
+        # Apply ROI/background defaults before first preview render
+        self.roi_projection = str(defaults["roi_projection"])
+        self.bg_low_val = int(defaults["bg_low_val"])
+        self.clahe_bg_suppress = int(defaults["clahe_bg_suppress"])
 
         # initial preview with current settings
         mask_vis, filt_vis = compute_preview(
@@ -668,10 +896,11 @@ class LobuleSegmentor(BaseOperator):
         # Napari viewer and layers
         viewer = napari.Viewer()
         raw_mean = stack_small.mean(axis=2).astype(np.uint8)
-        viewer.add_image(
+        raw_layer = viewer.add_image(
             raw_mean,
-            name="Raw (downsampled mean)",
+            name=f"Raw (downsampled mean) [base_level={int(self.base_level)}]",
             colormap="gray",
+            visible=False,
         )
         mask_layer = viewer.add_image(
             mask_vis,
@@ -679,6 +908,7 @@ class LobuleSegmentor(BaseOperator):
             colormap="gray",
             blending="additive",
             opacity=0.4,
+            visible=False,
         )
         filt_layer = viewer.add_image(
             filt_vis,
@@ -694,9 +924,16 @@ class LobuleSegmentor(BaseOperator):
             layout="vertical",
             auto_call=False,
             call_button="Update preview",
+            base_level={"widget_type": "ComboBox", "choices": available_levels},
             multi_otsu={"widget_type": "CheckBox"},
             adaptive_histonorm={"widget_type": "CheckBox"},
             ksize={"min": 3, "max": 21, "step": 2},
+
+            # ROI + background control
+            roi_projection={"widget_type": "ComboBox", "choices": ["max", "mean", "sum"]},
+            bg_low_val={"min": 0, "max": 50, "step": 1},
+            clahe_bg_suppress={"min": 0, "max": 50, "step": 1},
+
             invert_channels={
                 "widget_type": "Select",
                 "choices": channel_choices,
@@ -704,15 +941,41 @@ class LobuleSegmentor(BaseOperator):
             },
         )
         def preprocess_controls(
-            multi_otsu: bool = self.multi_otsu,
-            adaptive_histonorm: bool = self.adaptive_histonorm,
-            ksize: int = self.ksize,
-            invert_channels: List[int] = defaults["channels"],
+                base_level: int = int(self.base_level),
+                multi_otsu: bool = self.multi_otsu,
+                adaptive_histonorm: bool = self.adaptive_histonorm,
+                ksize: int = self.ksize,
+
+                # ROI + background values
+                roi_projection: str = defaults["roi_projection"],
+                bg_low_val: int = defaults["bg_low_val"],
+                clahe_bg_suppress: int = defaults["clahe_bg_suppress"],
+
+                invert_channels: List[int] = defaults["channels"],
         ):
+            # Persist ROI/background params into the object so compute_preview() and _filter() use them
+            self.roi_projection = str(roi_projection)
+            self.bg_low_val = int(bg_low_val)
+            self.clahe_bg_suppress = int(clahe_bg_suppress)
+
             """
             Called when user presses 'Update preview'. Recomputes mask and
             filtered composite with the chosen parameters and updates layers.
             """
+            # Reload stack if base_level changed
+            if int(base_level) != int(self.base_level):
+                _reload_level(int(base_level))
+                # sync GUI back to the effective base_level (may revert on load failure)
+                preprocess_controls.base_level.value = int(self.base_level)
+
+                # update raw view to the newly loaded stack
+                raw_layer.data = stack_small.mean(axis=2).astype(np.uint8)
+                raw_layer.name = f"Raw (downsampled mean) [base_level={int(self.base_level)}]"
+
+                # ensure invert_channels is valid after reload
+                invert_channels = [c for c in list(invert_channels) if 0 <= c < stack_small.shape[2]]
+                preprocess_controls.invert_channels.value = invert_channels
+
             mask_vis_local, filt_vis_local = compute_preview(
                 multi_otsu,
                 adaptive_histonorm,
@@ -727,16 +990,32 @@ class LobuleSegmentor(BaseOperator):
 
         def on_reset(*args):
             # restore defaults in the object
+            _reload_level(int(defaults["base_level"]))
             self.multi_otsu = defaults["multi_otsu"]
             self.adaptive_histonorm = defaults["adaptive_histonorm"]
             self.ksize = defaults["ksize"]
             self.channels = list(defaults["channels"])
 
+            # restore ROI/background params
+            self.roi_projection = str(defaults["roi_projection"])
+            self.bg_low_val = int(defaults["bg_low_val"])
+            self.clahe_bg_suppress = int(defaults["clahe_bg_suppress"])
+
             # restore GUI values
+            preprocess_controls.base_level.value = int(self.base_level)
             preprocess_controls.multi_otsu.value = defaults["multi_otsu"]
             preprocess_controls.adaptive_histonorm.value = defaults["adaptive_histonorm"]
             preprocess_controls.ksize.value = defaults["ksize"]
+
+            preprocess_controls.roi_projection.value = defaults["roi_projection"]
+            preprocess_controls.bg_low_val.value = defaults["bg_low_val"]
+            preprocess_controls.clahe_bg_suppress.value = defaults["clahe_bg_suppress"]
+
             preprocess_controls.invert_channels.value = defaults["channels"]
+
+            # update raw layer
+            raw_layer.data = stack_small.mean(axis=2).astype(np.uint8)
+            raw_layer.name = f"Raw (downsampled mean) [base_level={int(self.base_level)}]"
 
             # recompute preview with defaults
             mask_vis_local, filt_vis_local = compute_preview(
@@ -749,7 +1028,6 @@ class LobuleSegmentor(BaseOperator):
             filt_layer.data = filt_vis_local
 
         def on_confirm(*args):
-            # keep whatever is currently stored in self.* and close viewer
             viewer.close()
 
         confirm_btn.changed.connect(on_confirm)
@@ -762,6 +1040,8 @@ class LobuleSegmentor(BaseOperator):
         viewer.window.add_dock_widget(controls, area="right")
 
         napari.run()
+
+        return base_stack_current, orig_shapes_current
 
     def _prepare_stack_for_segmentation(
         self,
@@ -785,7 +1065,22 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete. Detecting ROI...", style="info")
 
         stack = base_stack.copy()
-        stack_gray = ensure_grayscale_uint8(stack)
+
+        # Build grayscale projection for ROI detection (must match preview)
+        proj_mode = str(getattr(self, "roi_projection", "max")).lower()
+        if proj_mode == "mean":
+            proj = stack.mean(axis=2)
+        elif proj_mode == "sum":
+            proj = stack.sum(axis=2)
+        else:
+            proj = stack.max(axis=2)  # default
+
+        bg_low_val = int(getattr(self, "bg_low_val", 0))
+        if bg_low_val > 0:
+            proj = np.where(proj <= bg_low_val, 0, proj)
+
+        # Robust uint8 conversion for ROI detection (avoid uint16->uint8 wrap + sum-projection clipping artifacts)
+        stack_gray = ensure_grayscale_uint8(proj)
 
         if self.multi_otsu:
             tissue_mask = detect_tissue_mask_multiotsu(
@@ -802,9 +1097,29 @@ class LobuleSegmentor(BaseOperator):
         # zero background
         stack[~tissue_mask] = 0
 
-        # crop to tissue bbox
-        bbox = largest_bbox(tissue_mask.astype(np.uint8))
-        stack = crop_image(stack, bbox)
+        # crop to tissue bbox (min/max in row/col, optionally padded)
+        Hm, Wm = tissue_mask.shape[:2]
+        ys, xs = np.nonzero(tissue_mask)
+        if ys.size == 0 or xs.size == 0:
+            bbox = (0, 0, Hm, Wm)
+        else:
+            r0 = int(ys.min())
+            r1 = int(ys.max()) + 1
+            c0 = int(xs.min())
+            c1 = int(xs.max()) + 1
+
+            pad_frac = float(getattr(self, "roi_bbox_pad_frac", 0.02))
+            pad_r = int(round(pad_frac * Hm))
+            pad_c = int(round(pad_frac * Wm))
+
+            r0 = max(0, r0 - pad_r)
+            c0 = max(0, c0 - pad_c)
+            r1 = min(Hm, r1 + pad_r)
+            c1 = min(Wm, c1 + pad_c)
+
+            bbox = (r0, c0, r1, c1)
+
+        stack = stack[bbox[0]:bbox[2], bbox[1]:bbox[3], :]
 
         # Inversion and discard only AFTER cropping
         if self.channels is None:
@@ -883,8 +1198,6 @@ class LobuleSegmentor(BaseOperator):
                 cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
 
         return img_stack, bbox, orig_shapes
-
-
 
 
     def skeletize_kmeans(self, image_stack: np.ndarray,
@@ -1664,7 +1977,7 @@ class LobuleSegmentor(BaseOperator):
 
         # Step 2: interactive preprocessing preview on downsampled stack
         if self.preview:
-            self._interactive_preprocessing_preview(base_stack)
+            base_stack, orig_shapes = self._interactive_preprocessing_preview(base_stack, orig_shapes)
 
         # Step 3: apply ROI detection, cropping, inversion, channel discard and filtering
         img_stack, bbox, orig_shapes = self._prepare_stack_for_segmentation(
