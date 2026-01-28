@@ -3,7 +3,8 @@ import cv2
 from skimage.filters import threshold_multiotsu
 from skimage.morphology import closing, disk
 from skimage.color import label2rgb
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Any, Sequence, Callable
+from collections.abc import Mapping
 from pathlib import Path
 from PIL import Image
 
@@ -72,6 +73,66 @@ def overlay_mask(image_stack: np.ndarray, mask: np.ndarray, alpha: float = 0.5) 
 
     over = label2rgb(lbl, image=base, bg_label=0, alpha=alpha, image_alpha=1.0)
     return (over * 255).astype(np.uint8)
+
+
+def bool_mask_to_uint8(mask: np.ndarray, on_val: int = 255) -> np.ndarray:
+    """Convert a boolean/0-1 mask to uint8, using `on_val` for True pixels."""
+    if mask.dtype == np.uint8:
+        m = mask
+        if m.max() <= 1:
+            return (m * np.uint8(on_val)).astype(np.uint8)
+        return m
+    return (mask.astype(np.uint8) * np.uint8(on_val)).astype(np.uint8)
+
+
+def minmax_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Min-max normalize an array to uint8 [0,255]. Robust to constant/NaN arrays."""
+    x = img.astype(np.float32)
+    mn = float(np.nanmin(x))
+    mx = float(np.nanmax(x))
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+        return np.zeros(img.shape, dtype=np.uint8)
+    y = (x - mn) / (mx - mn)
+    return np.clip(y * 255.0, 0, 255).astype(np.uint8)
+
+
+def border_connected_mask(binary: np.ndarray, connectivity: int = 8) -> np.ndarray:
+    """
+    Return a boolean mask of connected components in `binary` that touch the image border.
+    """
+    b = binary.astype(bool)
+    if not np.any(b):
+        return np.zeros(b.shape, dtype=bool)
+
+    num, lab = cv2.connectedComponents(b.astype(np.uint8), connectivity=int(connectivity))
+    if num <= 1:
+        return np.zeros(b.shape, dtype=bool)
+
+    border_ids = np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]]))
+    border_ids = border_ids[border_ids != 0]
+    if border_ids.size == 0:
+        return np.zeros(b.shape, dtype=bool)
+    return np.isin(lab, border_ids)
+
+
+def holes_from_fg_mask(fg_pix_mask: np.ndarray, border_exclude: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    holes = fill(largest_external_contour(fg)) - fg
+    """
+    fg = fg_pix_mask.astype(bool)
+    fg_u8 = bool_mask_to_uint8(fg, 255)
+
+    cnts, _ = cv2.findContours(fg_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(fg_u8)
+    if cnts:
+        cv2.drawContours(filled, [max(cnts, key=cv2.contourArea)], -1, 255, thickness=cv2.FILLED)
+    else:
+        filled[:] = fg_u8
+
+    holes = (filled > 0) & (~fg)
+    if border_exclude is not None:
+        holes &= ~border_exclude.astype(bool)
+    return holes
 
 
 def build_mask_pyramid_from_processed(
@@ -163,6 +224,22 @@ def downsample_to_max_side(img: np.ndarray, max_side: int = 2048) -> np.ndarray:
     out = np.asarray(pil)
 
     return out
+
+
+def downsample_stack_to_max_side(stack: np.ndarray, max_side: int = 2048) -> np.ndarray:
+    """
+    Downsample each channel of an (H, W, C) stack so max(H, W) == max_side,
+    preserving aspect ratio.
+
+    Intended for interactive napari previews (fast + responsive).
+    """
+    if not isinstance(stack, np.ndarray) or stack.ndim != 3:
+        raise ValueError(
+            f"Expected an ndarray stack of shape (H, W, C), got {type(stack)} {getattr(stack, 'shape', None)}"
+        )
+
+    frames = [downsample_to_max_side(stack[..., c], max_side) for c in range(stack.shape[2])]
+    return np.stack(frames, axis=-1)
 
 
 def gray_for_cluster(cid: int, sorted_label_idx: np.ndarray, n_clusters: int) -> int:
@@ -266,3 +343,210 @@ def rescale_full(contours_xy: List[np.ndarray],
         pts[:, 1] *= sy
         out.append(pts.reshape(-1, 1, 2).astype(np.int32))
     return out
+
+
+def discover_pyramid_levels(multiscale: Any) -> List[int]:
+    """
+    Best-effort discovery of available pyramid levels for a stain/multiscale object.
+
+    Supported inputs (best effort):
+      - Mapping[int|str -> array] (e.g. dict-like pyramids)
+      - Sequence[array] (list/tuple multiscales)
+      - Single array-like (treated as level [0])
+
+    If levels cannot be determined, this returns [0] (required fallback).
+    """
+    try:
+        if isinstance(multiscale, Mapping):
+            levels: List[int] = []
+            for k in multiscale.keys():
+                try:
+                    levels.append(int(k))
+                except Exception:
+                    continue
+            return sorted(set(levels)) if levels else [0]
+
+        if isinstance(multiscale, (list, tuple)):
+            return list(range(len(multiscale))) if len(multiscale) else [0]
+
+        # zarr-like groups often provide .keys() without being a Mapping
+        if hasattr(multiscale, "keys") and callable(multiscale.keys):
+            levels = []
+            for k in multiscale.keys():
+                try:
+                    levels.append(int(k))
+                except Exception:
+                    continue
+            return sorted(set(levels)) if levels else [0]
+    except Exception:
+        pass
+
+    # Unknown / single-scale object.
+    return [0]
+
+
+def common_pyramid_levels(multiscales: Sequence[Any]) -> List[int]:
+    """
+    Return sorted intersection of available pyramid levels across all stains.
+
+    If the intersection is empty (rare; inconsistent pyramids), this falls back to [0].
+    """
+    common: Optional[set] = None
+    for ms in multiscales:
+        lvls = set(discover_pyramid_levels(ms))
+        common = lvls if common is None else (common & lvls)
+
+    out = sorted(common) if common else []
+    return out if out else [0]
+
+
+def choose_default_preview_level(common_levels: Sequence[int]) -> int:
+    """
+    Default preview level: 0 if available, otherwise the lowest common level.
+    """
+    lvls = sorted(int(x) for x in common_levels) if common_levels else [0]
+    return 0 if 0 in lvls else lvls[0]
+
+
+def load_level_from_multiscale(multiscale: Any, level: int) -> Any:
+    """
+    Load a specific pyramid level from a multiscale object.
+
+    - Mapping: tries int(level) then str(level)
+    - Sequence: uses indexing
+    - Otherwise: returns the object itself (assumed single-scale)
+    """
+    lvl = int(level)
+
+    if isinstance(multiscale, Mapping):
+        if lvl in multiscale:
+            return multiscale[lvl]
+        if str(lvl) in multiscale:
+            return multiscale[str(lvl)]
+        # best-effort: sort numeric keys and index
+        keys = []
+        for k in multiscale.keys():
+            try:
+                keys.append(int(k))
+            except Exception:
+                continue
+        keys = sorted(set(keys))
+        if keys and lvl < len(keys):
+            return multiscale[keys[lvl]]
+        raise KeyError(f"Level {lvl} not present in multiscale mapping.")
+
+    if isinstance(multiscale, (list, tuple)):
+        return multiscale[lvl]
+
+    # Single-scale array/dask/zarr array etc.
+    return multiscale
+
+
+def discover_pyramid_shapes(multiscale: Any) -> Dict[int, Tuple[int, int]]:
+    """
+    Best-effort discovery of (H, W) per pyramid level.
+
+    If a level fails to load, it is skipped.
+    """
+    out: Dict[int, Tuple[int, int]] = {}
+    for lvl in discover_pyramid_levels(multiscale):
+        try:
+            arr = np.asarray(load_level_from_multiscale(multiscale, lvl))
+            if arr.ndim >= 2:
+                out[int(lvl)] = (int(arr.shape[0]), int(arr.shape[1]))
+        except Exception:
+            continue
+    return out
+
+
+def add_napari_controls_dock(
+    viewer: Any,
+    controls_widget: Any,
+    *,
+    on_update: Optional[Callable[[], None]] = None,
+    on_confirm: Optional[Callable[[], None]] = None,
+    on_reset: Optional[Callable[[], None]] = None,
+    update_text: str = "Preview / Update",
+    confirm_text: str = "Confirm and continue",
+    reset_text: str = "Reset to defaults",
+    include_update: bool = True,
+    include_confirm: bool = True,
+    include_reset: bool = False,
+    dock_area: str = "right",
+) -> Dict[str, Any]:
+    """
+    Unify napari preview UI wiring across the codebase.
+
+    Parameters
+    ----------
+    viewer:
+        napari.Viewer instance.
+    controls_widget:
+        A magicgui widget (or any QWidget) containing parameter controls.
+    on_update / on_confirm / on_reset:
+        Callbacks invoked by the respective buttons.
+    include_*:
+        Toggle which buttons appear.
+    dock_area:
+        napari dock area; usually "right".
+
+    Returns
+    -------
+    Dict[str, Any]
+        Mapping of button names to PushButton widgets for optional external wiring.
+    """
+    from magicgui.widgets import Container, PushButton
+
+    widgets = [controls_widget]
+    out: Dict[str, Any] = {}
+
+    if include_update:
+        update_btn = PushButton(text=str(update_text))
+        if on_update is not None:
+            update_btn.changed.connect(lambda *_: on_update())
+        widgets.append(update_btn)
+        out["update"] = update_btn
+
+    if include_confirm:
+        confirm_btn = PushButton(text=str(confirm_text))
+        if on_confirm is not None:
+            confirm_btn.changed.connect(lambda *_: on_confirm())
+        widgets.append(confirm_btn)
+        out["confirm"] = confirm_btn
+
+    if include_reset:
+        reset_btn = PushButton(text=str(reset_text))
+        if on_reset is not None:
+            reset_btn.changed.connect(lambda *_: on_reset())
+        widgets.append(reset_btn)
+        out["reset"] = reset_btn
+
+    dock = Container(widgets=widgets, layout="vertical")
+    viewer.window.add_dock_widget(dock, area=str(dock_area))
+    return out
+
+
+def preview_images_napari(images: Sequence[np.ndarray], titles: Optional[Sequence[str]] = None) -> None:
+    """
+    Small helper to preview one or more images in napari.
+
+    Images are downsampled (max side 2048 px) for responsiveness.
+    """
+    if not images:
+        return
+
+    import napari
+
+    thumbs = [downsample_to_max_side(np.asarray(im), 2048) for im in images]
+    viewer = napari.Viewer()
+
+    for idx, im in enumerate(thumbs):
+        name = str(titles[idx]) if titles and idx < len(titles) else f"Layer_{idx}"
+        if im.ndim == 2:
+            viewer.add_image(im, name=name, colormap="gray")
+        elif im.ndim == 3 and im.shape[-1] in (3, 4):
+            viewer.add_image(im, name=name, rgb=True)
+        else:
+            viewer.add_image(im, name=name)
+
+    napari.run()

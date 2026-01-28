@@ -8,11 +8,8 @@ import uuid
 from sklearn.cluster import KMeans
 import napari
 
-import matplotlib
-matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 from magicgui import magicgui
-from magicgui.widgets import Container, PushButton
 
 from slidekick.processing.baseoperator import BaseOperator
 from slidekick.io.metadata import Metadata
@@ -26,8 +23,13 @@ from slidekick.processing.lobule_segmentation.segments_to_mask import process_se
 from slidekick.processing.lobule_segmentation.portality import mask_to_portality
 from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
-    downsample_to_max_side, render_cluster_gray, nonlinear_channel_weighting, to_base_full, rescale_full
+    downsample_stack_to_max_side, holes_from_fg_mask,
+    bool_mask_to_uint8, minmax_to_uint8, border_connected_mask,
+    render_cluster_gray, nonlinear_channel_weighting, to_base_full, rescale_full,
+    common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
+    discover_pyramid_shapes, preview_images_napari, add_napari_controls_dock,
 )
+
 
 class LobuleSegmentor(BaseOperator):
     """
@@ -42,9 +44,6 @@ class LobuleSegmentor(BaseOperator):
                  throw_out_ratio: float = None,
                  preview: bool = True,
                  confirm: bool = True,
-                 # preview rendering (Napari)
-                 preview_max_side: int = 4096,
-                 preview_max_downsample: int = 2,
                  base_level: int = 0,
                  region_size: int = 20,
                  multi_otsu: bool = True,
@@ -52,12 +51,8 @@ class LobuleSegmentor(BaseOperator):
                  n_clusters: int = 3,
                  target_superpixels: int = None,
                  adaptive_histonorm: bool = True,
-
-                 # ROI + background handling (important for fluorescence)
-                 roi_projection: str = "max",
                  bg_low_val: int = 0,
                  clahe_bg_suppress: int = 10,
-
                  # nonlinear KMeans
                  interactive_weighting: bool = True,
                  nonlinear_kmeans: bool = True,
@@ -86,8 +81,6 @@ class LobuleSegmentor(BaseOperator):
         @param throw_out_ratio: the min percentage of non_background pixel for the slide to have to not be discarded
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
-        @param preview_max_side: target maximum side length (px) for Napari previews (higher = more detail, slower)
-        @param preview_max_downsample: hard cap on preview downsampling factor (e.g. 4 => never downsample more than 4x)
         @param base_level: Pyramid level to load
         @param multi_otsu: whether to use multi-otsu to filter out microscopy background, otherwise classic otsu
         @param region_size: average size of superpixels for SLIC in pixels
@@ -109,17 +102,13 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_annulus_px: thickness (px) of ring-consistency check
         @param vessel_zone_ratio_thr_pv: fraction of ring that must be PV
         @param vessel_circularity_min: 4πA/P^2 gate; low keeps elongated vessels
-        @param vessel_pct_low: global intensity percentile (0–100) of the per pixel channel mean used as a relative darkness threshold for vessel candidates
-        @param vessel_pct_superpixel_frac: minimal fraction of pixels below the percentile threshold inside a superpixel to mark it as vessel candidate
+        @param vessel_pct_low: global intensity threshold (0–255) on the per-pixel channel mean used to mark background/holes for vessel detection
+        @param vessel_pct_superpixel_frac: minimal fraction of pixels below the intensity threshold inside a superpixel to mark it as background/hole
         @param min_area_px: define area threshold to filter out very small polygons (noise)
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
         self.confirm = confirm
-
-        # preview downsampling policy (used in all Napari previews)
-        self.preview_max_side = int(preview_max_side)
-        self.preview_max_downsample = int(preview_max_downsample)
         self.base_level = base_level
         self.multi_otsu = multi_otsu
         self.region_size = region_size
@@ -129,9 +118,6 @@ class LobuleSegmentor(BaseOperator):
         self.alpha_pp = alpha_pp
         self.target_superpixels = target_superpixels
         self.adaptive_histonorm = adaptive_histonorm
-
-        # ROI + background handling (used in preview + real segmentation)
-        self.roi_projection = str(roi_projection)
         self.bg_low_val = int(bg_low_val)
         self.clahe_bg_suppress = int(clahe_bg_suppress)
 
@@ -197,58 +183,6 @@ class LobuleSegmentor(BaseOperator):
         self.channels_pp = channels_pp
         self.channels_pv = channels_pv
 
-    def _downsample_for_preview(self, img: np.ndarray) -> np.ndarray:
-        """
-        Downsample for Napari previews using ONLY the max downsample factor,
-        but never reduce the preview below 2048 px on the longest side.
-
-        Policy:
-          - Let max_factor = self.preview_max_downsample (e.g. 2 => at most 2x downsample)
-          - If applying 1/max_factor would yield max_dim < 2048, downsample less so that
-            max_dim becomes ~2048.
-          - Never upsample (if max_dim <= 2048, return original).
-        """
-        if img is None:
-            raise ValueError("preview downsample received None")
-
-        arr = np.asarray(img)
-        if arr.ndim not in (2, 3):
-            raise ValueError(f"Expected 2D/3D image for preview, got shape={arr.shape}")
-
-        # OpenCV does not like bool
-        if arr.dtype == bool:
-            arr = arr.astype(np.uint8) * 255
-
-        h, w = int(arr.shape[0]), int(arr.shape[1])
-        max_dim = max(h, w)
-
-        min_preview_side = 2048
-        max_factor = max(1, int(self.preview_max_downsample))
-
-        # Never upsample small images
-        if max_dim <= min_preview_side:
-            return arr
-
-        # Desired downsample scale from factor cap
-        scale_floor = 1.0 / float(max_factor)
-
-        # Ensure we don't downsample below 2048 on the longest side
-        scale_min = float(min_preview_side) / float(max_dim)
-
-        # Choose the larger scale (less downsampling) to satisfy both constraints
-        scale = max(scale_floor, scale_min)
-
-        # Clamp to 1.0 (no upsampling)
-        if scale >= 1.0:
-            return arr
-
-        new_h = max(1, int(round(h * scale)))
-        new_w = max(1, int(round(w * scale)))
-
-        # INTER_AREA is best for downsampling
-        interp = cv2.INTER_AREA
-        return cv2.resize(arr, (new_w, new_h), interpolation=interp)
-
     def _filter(self, image_stack: np.ndarray) -> np.ndarray:
         """
         Channel-wise version of zia's filtering. Works for N >= 1 channels.
@@ -260,17 +194,16 @@ class LobuleSegmentor(BaseOperator):
 
         H, W, N = image_stack.shape
 
-        # Treat a pixel as "missing" only if ALL channels are <= bg_low_val.
-        # Fluorescence backgrounds are often small nonzero values, so ==0 is too strict.
-        bg_low_val = int(getattr(self, "bg_low_val", 0))
-        missing_mask = np.all(image_stack <= bg_low_val, axis=-1)
+        # set missing to 0 (any low-value across channels -> zero all channels)
+        # bg_low_val defaults to 0 to preserve previous behavior.
+        missing_mask = np.any(image_stack <= int(self.bg_low_val), axis=-1)
 
         out = np.empty((H, W, N), dtype=np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
 
         for c in range(N):
-            # copy to avoid in-place modification of `image_stack`
-            ch = np.asarray(image_stack[..., c]).copy()
+            # copy to avoid mutating the input stack (important for preview caching)
+            ch = image_stack[..., c].copy()
 
             # ensure uint8 for OpenCV ops
             if ch.dtype != np.uint8:
@@ -285,11 +218,7 @@ class LobuleSegmentor(BaseOperator):
             # adaptive histogram norm (2D only)
             if self.adaptive_histonorm:
                 ch = clahe.apply(ch)
-
-                # Suppress low values post-CLAHE (make configurable; fluorescence often needs 0..3, not 10)
-                thr = int(getattr(self, "clahe_bg_suppress", 10))
-                if thr > 0:
-                    ch[ch < thr] = 0
+                ch[ch < int(self.clahe_bg_suppress)] = 0  # suppress background altered by CLAHE
 
             # blur
             ch = cv2.medianBlur(ch, ksize=3)
@@ -306,39 +235,190 @@ class LobuleSegmentor(BaseOperator):
 
         return out
 
-    def _preview_images(self, images: List[np.ndarray], titles: Optional[List[str]] = None) -> None:
+    def _interactive_preprocessing_preview(
+            self,
+            report_path: Optional[Path] = None,
+            *,
+            require_confirm: bool = False,
+    ) -> bool:
         """
-        Display the provided images in a Napari viewer as separate layers.
-        Each image will be added as a grayscale or RGBA layer (with appropriate naming).
-        Napari is launched only if preview is True.
+        Interactive napari preview for preprocessing (ROI crop + filter) before segmentation.
+
+        Controls:
+          - preview_level: pyramid level used for preview computations (common to all stains).
+          - bg_low_val: values <= bg_low_val are treated as background.
+          - clahe_bg_suppress: after CLAHE, values below this are zeroed.
+
+        Notes:
+          - Level choices are the intersection of levels across stains.
+          - If levels cannot be determined for a stain, it is treated as [0].
+          - Processing runs on a downsampled copy (max side 2048) for responsiveness.
+
+        Returns
+        -------
+        bool
+            True if confirmed (or if require_confirm=False), False if the viewer was closed
+            without pressing Confirm.
         """
-        if not images:
-            console.print("No images to preview.", style="warning")
-            return
+        from qtpy.QtCore import QTimer
 
-        # Downsample each image for preview (higher detail, but never more than Nx downsample)
-        thumbs = [self._downsample_for_preview(im) for im in images]
+        # Load multiscale handles once; discover common levels from these handles.
+        multiscales = [self.load_image(i) for i in range(len(self.metadata))]
+        common_levels = common_pyramid_levels(multiscales)
+        default_level = choose_default_preview_level(common_levels)
 
-        # Import Napari and create a viewer for layered display
-        # TODO: Use viewer from slidekick
+        def _title_for_md(md: Metadata, idx: int) -> str:
+            p = getattr(md, "path_original", None) or getattr(md, "path", None) or getattr(md, "name", None)
+            if isinstance(p, tuple) and p:
+                p = p[0]
+            if p is not None:
+                try:
+                    return Path(p).stem
+                except Exception:
+                    return str(p)
+            return f"image_{idx}"
+
+        titles = [_title_for_md(md, i) for i, md in enumerate(self.metadata)]
+
+        # Cache raw (downsampled) stacks per level; filtered stacks per (level, bg_low_val, clahe_bg_suppress).
+        raw_cache: Dict[int, np.ndarray] = {}
+        filt_cache: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+        def _get_raw_stack(level: int) -> np.ndarray:
+            lvl = int(level)
+            if lvl in raw_cache:
+                return raw_cache[lvl]
+
+            # Prevent preview from mutating channel lists / throw-out state.
+            saved_throw_out = self.throw_out_ratio
+            saved_pp = list(self.channels_pp) if self.channels_pp is not None else None
+            saved_pv = list(self.channels_pv) if self.channels_pv is not None else None
+            try:
+                self.throw_out_ratio = None
+                stack, _bbox, _orig_shapes = self._load_and_invert_images_from_metadatas(report_path=None, level=lvl)
+            finally:
+                self.throw_out_ratio = saved_throw_out
+                self.channels_pp = saved_pp
+                self.channels_pv = saved_pv
+
+            raw_small = downsample_stack_to_max_side(stack, 2048)
+            raw_cache[lvl] = raw_small
+            return raw_small
+
+        def _get_filtered_stack(level: int, bg_low_val: int, clahe_bg_suppress: int) -> np.ndarray:
+            # Always sync instance state to the UI values, even if we hit the cache.
+            self.bg_low_val = int(bg_low_val)
+            self.clahe_bg_suppress = int(clahe_bg_suppress)
+
+            key = (int(level), int(bg_low_val), int(clahe_bg_suppress))
+            if key in filt_cache:
+                return filt_cache[key]
+
+            raw = _get_raw_stack(level)
+            filt = self._filter(raw)
+            filt_cache[key] = filt
+            return filt
+
         viewer = napari.Viewer()
 
-        # Add each image as a separate layer in the viewer
-        for idx, im in enumerate(thumbs):
-            # Determine a layer name using provided titles or default naming
-            layer_name = titles[idx] if titles and idx < len(titles) else f"Layer_{idx}"
-            # Add as grayscale or color layer depending on image shape
-            if im.ndim == 2:
-                viewer.add_image(im, name=str(layer_name), colormap='gray')
-            elif im.ndim == 3 and im.shape[-1] in (3, 4):
-                # If image has 3 or 4 channels, treat it as an RGB(A) image
-                viewer.add_image(im, name=str(layer_name), rgb=True)
-            else:
-                # Fallback: add image with default settings
-                viewer.add_image(im, name=str(layer_name))
+        raw0 = _get_raw_stack(default_level)
+        filt0 = _get_filtered_stack(default_level, self.bg_low_val, self.clahe_bg_suppress)
 
-        # Start the Napari event loop (blocks until all viewer windows are closed)
+        raw_mean_layer = viewer.add_image(
+            raw0.mean(axis=2).astype(np.uint8),
+            name="raw/mean",
+            colormap="gray",
+        )
+
+        raw_layers: List[Any] = []
+        filt_layers: List[Any] = []
+        for c, title in enumerate(titles):
+            raw_layers.append(
+                viewer.add_image(
+                    raw0[..., c],
+                    name=f"raw/{title}",
+                    colormap="gray",
+                    visible=False,
+                )
+            )
+            filt_layers.append(
+                viewer.add_image(
+                    filt0[..., c],
+                    name=f"filtered/{title}",
+                    colormap="gray",
+                )
+            )
+
+        pending = {
+            "level": int(default_level),
+            "bg": int(self.bg_low_val),
+            "clahe": int(self.clahe_bg_suppress),
+        }
+
+        confirmed = {"ok": False}
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+
+        def _apply_update() -> None:
+            lvl = int(pending["level"])
+            bg = int(pending["bg"])
+            clahe = int(pending["clahe"])
+
+            raw = _get_raw_stack(lvl)
+            filt = _get_filtered_stack(lvl, bg, clahe)
+
+            raw_mean_layer.data = raw.mean(axis=2).astype(np.uint8)
+            for c in range(raw.shape[2]):
+                raw_layers[c].data = raw[..., c]
+                filt_layers[c].data = filt[..., c]
+
+        timer.timeout.connect(_apply_update)
+
+        @magicgui(
+            layout="vertical",
+            auto_call=True,
+            preview_level={"choices": common_levels},
+            bg_low_val={"min": 0, "max": 255, "step": 1},
+            clahe_bg_suppress={"min": 0, "max": 255, "step": 1},
+        )
+        def controls(
+                preview_level: int = int(default_level),
+                bg_low_val: int = int(self.bg_low_val),
+                clahe_bg_suppress: int = int(self.clahe_bg_suppress),
+        ):
+            pending["level"] = int(preview_level)
+            pending["bg"] = int(bg_low_val)
+            pending["clahe"] = int(clahe_bg_suppress)
+
+            # Debounce: restart timer on every change.
+            timer.start(200)
+
+        def on_update() -> None:
+            timer.stop()
+            _apply_update()
+
+        def on_confirm() -> None:
+            timer.stop()
+            _apply_update()
+            confirmed["ok"] = True
+            viewer.close()
+
+        add_napari_controls_dock(
+            viewer,
+            controls,
+            on_update=on_update,
+            on_confirm=on_confirm,
+            include_update=True,
+            include_confirm=True,
+            include_reset=False,
+            update_text="Preview / Update",
+            confirm_text="Confirm",
+        )
+
         napari.run()
+
+        return True if not require_confirm else bool(confirmed["ok"])
 
     def _preview_channel_weighting(
             self,
@@ -352,9 +432,12 @@ class LobuleSegmentor(BaseOperator):
         - Uses a downsampled copy of `image_stack` for speed.
         - Computes one weighted PP image and one weighted PV image
           (mean over the respective channels after nonlinear+alpha weights).
-        - Updates overlays automatically when a control changes (no 'Update' button).
+        - Updates overlays on a short debounce timer and provides a
+          'Preview / Update' button to force recomputation immediately.
         - Provides 'Reset to defaults' and 'Confirm and continue' buttons.
         """
+        from qtpy.QtCore import QTimer
+
         if image_stack.ndim != 3:
             raise ValueError(f"Expected (H, W, C) stack, got {image_stack.shape}")
 
@@ -373,9 +456,9 @@ class LobuleSegmentor(BaseOperator):
             )
             return
 
-        # downsample whole stack for preview
-        frames_small = [self._downsample_for_preview(image_stack[..., c]) for c in range(image_stack.shape[2])]
-        stack_small = np.stack(frames_small, axis=-1)
+        # Downsample whole stack for preview (fast).
+        stack_small = downsample_stack_to_max_side(image_stack, 2048)
+
         H, W, C = stack_small.shape
 
         # remember current values as "defaults" for reset
@@ -388,6 +471,8 @@ class LobuleSegmentor(BaseOperator):
             nl_low_pct=self.nl_low_pct,
             nl_high_pct=self.nl_high_pct,
         )
+
+        pending = dict(defaults)
 
         def compute_pp_pv_images() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
             """
@@ -419,48 +504,27 @@ class LobuleSegmentor(BaseOperator):
                 X = flat
 
             w_feat = np.ones(X.shape[1], dtype=np.float32)
-            for idx in channels_pp:
-                w_feat[idx] *= self.alpha_pp
-            for idx in channels_pv:
-                w_feat[idx] *= self.alpha_pv
+            for idx_ch in channels_pp:
+                w_feat[idx_ch] *= float(self.alpha_pp)
+            for idx_ch in channels_pv:
+                w_feat[idx_ch] *= float(self.alpha_pv)
 
-            Xw = X * w_feat
-            Xw_img = Xw.reshape(H, W, C)
+            Xw_img = (X * w_feat).reshape(H, W, C)
 
             pp_img: Optional[np.ndarray] = None
             pv_img: Optional[np.ndarray] = None
 
-            # composite PP: mean over weighted PP channels, then normalize 0–255
             if channels_pp:
                 pp_vals = Xw_img[..., channels_pp]
-                if pp_vals.ndim == 2:
-                    pp_float = pp_vals
-                else:
-                    pp_float = pp_vals.mean(axis=2)
-                mn = float(np.nanmin(pp_float))
-                mx = float(np.nanmax(pp_float))
-                if mx > mn:
-                    pp_img = (((pp_float - mn) / (mx - mn)) * 255.0).astype(np.uint8)
-                else:
-                    pp_img = np.zeros((H, W), dtype=np.uint8)
+                pp_float = pp_vals if pp_vals.ndim == 2 else pp_vals.mean(axis=2)
+                pp_img = minmax_to_uint8(pp_float)
 
-            # composite PV: mean over weighted PV channels, then normalize 0–255
             if channels_pv:
                 pv_vals = Xw_img[..., channels_pv]
-                if pv_vals.ndim == 2:
-                    pv_float = pv_vals
-                else:
-                    pv_float = pv_vals.mean(axis=2)
-                mn = float(np.nanmin(pv_float))
-                mx = float(np.nanmax(pv_float))
-                if mx > mn:
-                    pv_img = (((pv_float - mn) / (mx - mn)) * 255.0).astype(np.uint8)
-                else:
-                    pv_img = np.zeros((H, W), dtype=np.uint8)
+                pv_float = pv_vals if pv_vals.ndim == 2 else pv_vals.mean(axis=2)
+                pv_img = minmax_to_uint8(pv_float)
 
             return pp_img, pv_img
-
-        pp_img, pv_img = compute_pp_pv_images()
 
         # Napari viewer
         viewer = napari.Viewer()
@@ -469,27 +533,64 @@ class LobuleSegmentor(BaseOperator):
         pp_layer = None
         pv_layer = None
 
-        if pp_img is not None:
-            pp_layer = viewer.add_image(
-                pp_img,
-                name="PP channel (weighted)",
-                colormap="green",
-                blending="additive",
-                opacity=0.5,
-            )
+        def _apply_update() -> None:
+            """
+            Push pending parameters into self, recompute composites, update layers.
+            """
+            self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
+            self.alpha_pp = float(pending["alpha_pp"])
+            self.alpha_pv = float(pending["alpha_pv"])
+            self.pp_gamma = float(pending["pp_gamma"])
+            self.pv_gamma = float(pending["pv_gamma"])
+            self.nl_low_pct = float(pending["nl_low_pct"])
+            self.nl_high_pct = float(pending["nl_high_pct"])
 
-        if pv_img is not None:
-            pv_layer = viewer.add_image(
-                pv_img,
-                name="PV channel (weighted)",
-                colormap="magenta",
-                blending="additive",
-                opacity=0.5,
-            )
+            new_pp, new_pv = compute_pp_pv_images()
+
+            nonlocal pp_layer, pv_layer
+            if new_pp is not None:
+                if pp_layer is None:
+                    pp_layer = viewer.add_image(
+                        new_pp,
+                        name="PP channel (weighted)",
+                        colormap="green",
+                        blending="additive",
+                        opacity=0.5,
+                    )
+                else:
+                    pp_layer.data = new_pp
+
+            if new_pv is not None:
+                if pv_layer is None:
+                    pv_layer = viewer.add_image(
+                        new_pv,
+                        name="PV channel (weighted)",
+                        colormap="magenta",
+                        blending="additive",
+                        opacity=0.5,
+                    )
+                else:
+                    pv_layer.data = new_pv
+
+        # Initial render
+        pending.update(
+            nonlinear_kmeans=self.nonlinear_kmeans,
+            alpha_pp=self.alpha_pp,
+            alpha_pv=self.alpha_pv,
+            pp_gamma=self.pp_gamma,
+            pv_gamma=self.pv_gamma,
+            nl_low_pct=self.nl_low_pct,
+            nl_high_pct=self.nl_high_pct,
+        )
+        _apply_update()
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(_apply_update)
 
         @magicgui(
             layout="vertical",
-            auto_call=True,  # update on every change
+            auto_call=True,  # stage updates on every change; apply on debounce or button
             nonlinear_kmeans={"widget_type": "CheckBox"},
             alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
             alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
@@ -508,50 +609,29 @@ class LobuleSegmentor(BaseOperator):
                 nl_high_pct: float = self.nl_high_pct,
         ):
             """
-            This function is called automatically whenever any control changes.
-            It updates self.*, recomputes weighted PP/PV images and updates layers.
+            Stage parameter changes; actual recomputation happens on a short debounce
+            timer or when the user presses Preview / Update.
             """
-            # update object state: these will be used later by skeletize_kmeans
-            self.nonlinear_kmeans = nonlinear_kmeans
-            self.alpha_pp = alpha_pp
-            self.alpha_pv = alpha_pv
-            self.pp_gamma = pp_gamma
-            self.pv_gamma = pv_gamma
-            self.nl_low_pct = nl_low_pct
-            self.nl_high_pct = nl_high_pct
+            pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
+            pending["alpha_pp"] = float(alpha_pp)
+            pending["alpha_pv"] = float(alpha_pv)
+            pending["pp_gamma"] = float(pp_gamma)
+            pending["pv_gamma"] = float(pv_gamma)
+            pending["nl_low_pct"] = float(nl_low_pct)
+            pending["nl_high_pct"] = float(nl_high_pct)
 
-            console.print(
-                f"Updated KMeans weighting params:\n"
-                f"  nonlinear_kmeans={self.nonlinear_kmeans}\n"
-                f"  alpha_pp={self.alpha_pp}, alpha_pv={self.alpha_pv}\n"
-                f"  pp_gamma={self.pp_gamma}, pv_gamma={self.pv_gamma}\n"
-                f"  nl_low_pct={self.nl_low_pct}, nl_high_pct={self.nl_high_pct}",
-                style="info",
-            )
+            timer.start(200)
 
-            # recompute composite PP / PV images and update layers
-            new_pp, new_pv = compute_pp_pv_images()
-            nonlocal pp_layer, pv_layer
-            if pp_layer is not None and new_pp is not None:
-                pp_layer.data = new_pp
-            if pv_layer is not None and new_pv is not None:
-                pv_layer.data = new_pv
+        def on_update() -> None:
+            timer.stop()
+            _apply_update()
 
-        # extra buttons: reset to defaults, confirm and continue
-        confirm_btn = PushButton(text="Confirm and continue")
-        reset_btn = PushButton(text="Reset to defaults")
+        def on_reset() -> None:
+            timer.stop()
 
-        def on_reset(*args):
-            # restore defaults in the object
-            self.nonlinear_kmeans = defaults["nonlinear_kmeans"]
-            self.alpha_pp = defaults["alpha_pp"]
-            self.alpha_pv = defaults["alpha_pv"]
-            self.pp_gamma = defaults["pp_gamma"]
-            self.pv_gamma = defaults["pv_gamma"]
-            self.nl_low_pct = defaults["nl_low_pct"]
-            self.nl_high_pct = defaults["nl_high_pct"]
+            # restore defaults in pending and in GUI widgets
+            pending.update(defaults)
 
-            # restore defaults in the GUI; auto_call will recompute overlays
             weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
             weighting_controls.alpha_pp.value = defaults["alpha_pp"]
             weighting_controls.alpha_pv.value = defaults["alpha_pv"]
@@ -560,73 +640,53 @@ class LobuleSegmentor(BaseOperator):
             weighting_controls.nl_low_pct.value = defaults["nl_low_pct"]
             weighting_controls.nl_high_pct.value = defaults["nl_high_pct"]
 
-        def on_confirm(*args):
-            # just close the viewer; napari.run() will return and apply() continues
+            _apply_update()
+
+        def on_confirm() -> None:
+            timer.stop()
+            _apply_update()
             viewer.close()
 
-        confirm_btn.changed.connect(on_confirm)
-        reset_btn.changed.connect(on_reset)
-
-        controls = Container(widgets=[weighting_controls, confirm_btn, reset_btn], layout="vertical")
-        viewer.window.add_dock_widget(controls, area="right")
+        add_napari_controls_dock(
+            viewer,
+            weighting_controls,
+            on_update=on_update,
+            on_confirm=on_confirm,
+            on_reset=on_reset,
+            include_update=True,
+            include_confirm=True,
+            include_reset=True,
+            update_text="Preview / Update",
+            confirm_text="Confirm and continue",
+            reset_text="Reset to defaults",
+        )
 
         napari.run()
 
-    def _load_base_stack(self) -> Tuple[np.ndarray, Dict[int, Any]]:
-        """
-        Load each image at `self.base_level`, convert to 2D grayscale if necessary,
-        harmonize shapes, and stack into a uint8 array of shape (H, W, C).
 
-        Also returns `orig_shapes`, a dict {level: (H, W)} for pyramid levels that are
-        available in *all* images (intersection of levels). This is used to drive the
-        interactive load-level selector.
+    def _load_and_invert_images_from_metadatas(
+            self,
+            report_path: Optional[Path] = None,
+            level: Optional[int] = None,
+    ) -> Tuple[np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
+        Load each image at the pyramid level defined, invert selected channels,
+        harmonize shapes, and stack along the last axis -> (H, W, N).
+        """
+
+        lvl = int(self.base_level if level is None else level)
+
         arrays: List[np.ndarray] = []
-
-        # Determine pyramid levels available in ALL images (robust against mixed pyramids)
-        level_sets: List[set] = []
         for i, _md in enumerate(self.metadata):
             try:
-                level_sets.append(set(self.load_image(i).keys()))
-            except Exception:
-                level_sets.append(set())
-
-        common_levels: set = set.intersection(*level_sets) if level_sets else set()
-        if not common_levels and len(self.metadata) > 0:
-            # fallback: take whatever image 0 provides (better than empty)
-            common_levels = set(self.load_image(0).keys())
-
-        # Ensure current base_level exists in ALL images; otherwise choose a valid fallback.
-        # Policy:
-        #   - prefer the largest common level <= requested (e.g. requested=2, common={0,1} -> 1)
-        #   - if none are <= requested, fall back to the smallest available level.
-        if common_levels and int(self.base_level) not in common_levels:
-            requested = int(self.base_level)
-            common_int = sorted(int(l) for l in common_levels)
-
-            lower_or_equal = [l for l in common_int if l <= requested]
-            fallback = max(lower_or_equal) if lower_or_equal else min(common_int)
-
-            console.print(
-                f"Requested base_level={requested} not available in all images; "
-                f"falling back to base_level={fallback}.",
-                style="warning",
-            )
-            self.base_level = fallback
-
-        for i, _md in enumerate(self.metadata):
-            try:
-                img = self.load_image(i)[self.base_level]  # load resolution level
-            except Exception:
-                raise Exception(f"Level {self.base_level} failed for image {i} in stack")
+                img = load_level_from_multiscale(self.load_image(i), lvl)
+            except Exception as e:
+                raise Exception(f"Level {lvl} failed for image {i} in stack") from e
 
             img = np.asarray(img)
-            # collapse multi-channel data to a single grayscale plane
-            if img.ndim == 3:
-                if img.shape[-1] == 1:
-                    img = img[..., 0]
-                else:
-                    img = np.mean(img[..., :min(img.shape[-1], 3)], axis=-1).astype(img.dtype)
+            # ensure 2D
+            if img.ndim == 3 and img.shape[-1] in (3, 4):
+                img = np.mean(img[..., :3], axis=-1).astype(img.dtype)
 
             arrays.append(img)
 
@@ -638,566 +698,75 @@ class LobuleSegmentor(BaseOperator):
         w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
 
-        # Robust uint8 conversion:
-        # DO NOT use .astype(np.uint8) on uint16/float images: it wraps/clips and breaks ROI detection.
-        arrays_u8: List[np.ndarray] = []
-        for a in arrays:
-            if a.dtype == np.uint8:
-                a_u8 = a
-            else:
-                a_u8 = ensure_grayscale_uint8(a)
-            arrays_u8.append(np.ascontiguousarray(a_u8))
+        stack = np.dstack(arrays).astype(np.uint8)
 
-        stack = np.dstack(arrays_u8)
+        # Get resolutions / image sizes for later back mapping based on stain 0
+        orig_shapes = discover_pyramid_shapes(self.load_image(0))
 
-        # Pyramid-level shapes from image 0, restricted to common levels
-        if len(self.metadata) > 0:
-            img0 = self.load_image(0)
-            orig_shapes = {int(k): tuple(img0[k].shape[:2]) for k in sorted(common_levels)}
-        else:
-            orig_shapes = {}
-
-        return stack, orig_shapes
-
-    def _interactive_preprocessing_preview(
-        self,
-        base_stack: np.ndarray,
-        orig_shapes: Dict[int, Any],
-    ) -> Tuple[np.ndarray, Dict[int, Any]]:
-        """
-        Interactive Napari preview for early preprocessing parameters:
-          - base_level (pyramid level used for subsequent processing)
-          - multi_otsu (ROI detection)
-          - adaptive_histonorm (filtering)
-          - ksize (median blur)
-          - channels to invert (self.channels)
-
-        Operates on a downsampled copy of `base_stack`. On confirm, the chosen
-        values are stored in self.base_level, self.multi_otsu, self.adaptive_histonorm,
-        self.ksize and self.channels.
-
-        Returns
-        -------
-        base_stack_current, orig_shapes_current
-            The (possibly reloaded) base stack and pyramid shapes consistent with the
-            selected base_level.
-        """
-        if base_stack.ndim != 3:
-            raise ValueError(f"Expected (H, W, C) stack, got {base_stack.shape}")
-
-        # keep track of what is currently displayed and what apply() should continue with
-        base_stack_current: np.ndarray = base_stack
-        orig_shapes_current: Dict[int, Any] = orig_shapes
-
-        # Available pyramid levels (intersection across images is enforced in _load_base_stack)
-        available_levels: List[int] = sorted(int(k) for k in orig_shapes_current.keys())
-        if not available_levels:
-            available_levels = [int(self.base_level)]
-
-        # Ensure current base_level is valid; if not, fall back intelligently and reload.
-        # Prefer the largest available level <= requested; otherwise take the smallest available.
-        if int(self.base_level) not in available_levels:
-            requested = int(self.base_level)
-            lower_or_equal = [l for l in available_levels if l <= requested]
-            self.base_level = int(max(lower_or_equal) if lower_or_equal else min(available_levels))
-
-            base_stack_current, orig_shapes_current = self._load_base_stack()
-            available_levels = sorted(int(k) for k in orig_shapes_current.keys()) or [int(self.base_level)]
-
-        def _build_stack_small(bs: np.ndarray) -> np.ndarray:
-            """
-            Downsample each channel for interactive preview.
-            Uses self.preview_max_side, but never downsamples more than self.preview_max_downsample.
-            Returns (Hs, Ws, C).
-            """
-            frames = [self._downsample_for_preview(bs[..., c]) for c in range(bs.shape[2])]
-            return np.stack(frames, axis=-1)
-
-        def _reload_level(level: int) -> None:
-            """Reload the base stack at a different pyramid level and rebuild preview arrays."""
-            nonlocal base_stack_current, orig_shapes_current, available_levels, stack_small, Hs, Ws, C
-            level = int(level)
-            if level == int(self.base_level):
-                return
-
-            prev_level = int(self.base_level)
-            self.base_level = level
-            try:
-                base_stack_current, orig_shapes_current = self._load_base_stack()
-            except Exception as e:
-                console.print(
-                    f"Failed to load base_level={level}; keeping base_level={prev_level}. Error: {e}",
-                    style="error",
-                )
-                self.base_level = prev_level
-                return
-
-            available_levels = sorted(int(k) for k in orig_shapes_current.keys()) or [int(self.base_level)]
-            stack_small = _build_stack_small(base_stack_current)
-            Hs, Ws, C = stack_small.shape
-
-            # keep inversion channels in range
-            self.channels = [c for c in (self.channels or []) if 0 <= c < C]
-
-        # downsample each channel for preview (initial)
-        stack_small = _build_stack_small(base_stack_current)
-        Hs, Ws, C = stack_small.shape
-
-        # remember current values for reset
-        defaults = dict(
-            base_level=int(self.base_level),
-            multi_otsu=self.multi_otsu,
-            adaptive_histonorm=self.adaptive_histonorm,
-            ksize=self.ksize,
-            channels=list(self.channels or []),
-
-            # ROI + background control defaults
-            roi_projection=getattr(self, "roi_projection", "max"),
-            bg_low_val=int(getattr(self, "bg_low_val", 0)),
-            clahe_bg_suppress=int(getattr(self, "clahe_bg_suppress", 10)),
-        )
-        # ensure default invert channels are in range
-        defaults["channels"] = [c for c in defaults["channels"] if 0 <= c < C]
-
-        def compute_preview(
-            multi_otsu_val: bool,
-            adaptive_histonorm_val: bool,
-            ksize_val: int,
-            invert_channels: List[int],
-        ) -> Tuple[np.ndarray, np.ndarray]:
-            """
-            Run the same logical steps as the real preprocessing but on the
-            downsampled stack:
-              1) tissue detection with multi_otsu_val
-              2) crop to bbox
-              3) invert selected channels
-              4) filter with given ksize/histonorm
-              5) project back to full preview canvas for display
-            """
-            # store choices in the object, so they are ready when user confirms
-            self.multi_otsu = multi_otsu_val
-            self.adaptive_histonorm = adaptive_histonorm_val
-            self.ksize = int(ksize_val)
-            self.channels = list(invert_channels)
-
-            local = stack_small.copy()
-
-            # tissue detection
-            # For fluorescence, mean-projection is often too weak; max-projection is typically better.
-            proj_mode = str(getattr(self, "roi_projection", "max")).lower()
-
-            if proj_mode == "mean":
-                proj = local.mean(axis=2)
-            elif proj_mode == "sum":
-                proj = local.sum(axis=2)
-            else:
-                proj = local.max(axis=2)  # default
-
-            # optional background floor BEFORE Otsu (important for dim fluorescence)
-            bg_low_val = int(getattr(self, "bg_low_val", 0))
-            if bg_low_val > 0:
-                proj = np.where(proj <= bg_low_val, 0, proj)
-
-            # ensure uint8 grayscale for mask detection (avoid uint16->uint8 wrap + projection clipping)
-            proj_u8 = ensure_grayscale_uint8(proj)
-
-            if multi_otsu_val:
-                tissue_mask = detect_tissue_mask_multiotsu(
-                    proj_u8,
-                    morphological_radius=6,
-                    report_path=None,
-                )
-            else:
-                tissue_mask = detect_tissue_mask(
-                    proj_u8,
-                    morphological_radius=6,
-                )
-
-            local[~tissue_mask] = 0
-
-            # bbox in (min_row, min_col, max_row, max_col), optionally padded to compensate for conservative masks
-            Hm, Wm = tissue_mask.shape[:2]
-            ys, xs = np.nonzero(tissue_mask)
-            if ys.size == 0 or xs.size == 0:
-                bbox_small = (0, 0, Hm, Wm)
-            else:
-                r0 = int(ys.min())
-                r1 = int(ys.max()) + 1
-                c0 = int(xs.min())
-                c1 = int(xs.max()) + 1
-
-                pad_frac = float(getattr(self, "roi_bbox_pad_frac", 0.02))
-                pad_r = int(round(pad_frac * Hm))
-                pad_c = int(round(pad_frac * Wm))
-
-                r0 = max(0, r0 - pad_r)
-                c0 = max(0, c0 - pad_c)
-                r1 = min(Hm, r1 + pad_r)
-                c1 = min(Wm, c1 + pad_c)
-
-                bbox_small = (r0, c0, r1, c1)
-
-            roi = local[bbox_small[0]:bbox_small[2], bbox_small[1]:bbox_small[3], :]
-
-            # inversion on ROI
-            if self.channels:
-                for c in range(roi.shape[-1]):
-                    if c in self.channels:
-                        ch = roi[:, :, c]
-                        if np.issubdtype(ch.dtype, np.integer):
-                            info = np.iinfo(ch.dtype)
-                            roi[:, :, c] = info.max - ch
-                        else:
-                            roi[:, :, c] = 1.0 - ch
-
-            # filtering on ROI
-            roi_filtered = self._filter(roi)
-            roi_mean = roi_filtered.mean(axis=2).astype(np.uint8)
-
-            # visualize
-            mask_vis = np.zeros((Hs, Ws), dtype=np.uint8)
-            filt_vis = np.zeros((Hs, Ws), dtype=np.uint8)
-
-            mask_vis[tissue_mask] = 255
-
-            # bbox handling + safe paste-back (already in your attached file)
-            bbox = tuple(int(v) for v in bbox_small)
-            r0, c0, r1, c1 = bbox
-            if (r1 - r0, c1 - c0) != roi_mean.shape:
-                x0, y0, w, h = bbox
-                r0, c0 = y0, x0
-                r1, c1 = y0 + h, x0 + w
-
-            r0 = max(0, min(r0, Hs))
-            c0 = max(0, min(c0, Ws))
-            r1 = max(r0, min(r1, Hs))
-            c1 = max(c0, min(c1, Ws))
-
-            hp = r1 - r0
-            wp = c1 - c0
-            if hp > 0 and wp > 0:
-                filt_vis[r0:r1, c0:c1] = roi_mean[:hp, :wp]
-
-            return mask_vis, filt_vis
-
-        # Apply ROI/background defaults before first preview render
-        self.roi_projection = str(defaults["roi_projection"])
-        self.bg_low_val = int(defaults["bg_low_val"])
-        self.clahe_bg_suppress = int(defaults["clahe_bg_suppress"])
-
-        # initial preview with current settings
-        mask_vis, filt_vis = compute_preview(
-            self.multi_otsu,
-            self.adaptive_histonorm,
-            self.ksize,
-            defaults["channels"],
-        )
-
-        # Napari viewer and layers
-        viewer = napari.Viewer()
-        raw_mean = stack_small.mean(axis=2).astype(np.uint8)
-        raw_layer = viewer.add_image(
-            raw_mean,
-            name=f"Raw (downsampled mean) [base_level={int(self.base_level)}]",
-            colormap="gray",
-            visible=False,
-        )
-        mask_layer = viewer.add_image(
-            mask_vis,
-            name="Tissue mask (preview)",
-            colormap="gray",
-            blending="additive",
-            opacity=0.4,
-            visible=False,
-        )
-        filt_layer = viewer.add_image(
-            filt_vis,
-            name="Filtered composite (preview)",
-            colormap="gray",
-            blending="additive",
-            opacity=0.7,
-        )
-
-        channel_choices = list(range(C))
-
-        @magicgui(
-            layout="vertical",
-            auto_call=False,
-            call_button="Update preview",
-            base_level={"widget_type": "ComboBox", "choices": available_levels},
-            multi_otsu={"widget_type": "CheckBox"},
-            adaptive_histonorm={"widget_type": "CheckBox"},
-            ksize={"min": 3, "max": 21, "step": 2},
-
-            # ROI + background control
-            roi_projection={"widget_type": "ComboBox", "choices": ["max", "mean", "sum"]},
-            bg_low_val={"min": 0, "max": 50, "step": 1},
-            clahe_bg_suppress={"min": 0, "max": 50, "step": 1},
-
-            invert_channels={
-                "widget_type": "Select",
-                "choices": channel_choices,
-                "allow_multiple": True,
-            },
-        )
-        def preprocess_controls(
-                base_level: int = int(self.base_level),
-                multi_otsu: bool = self.multi_otsu,
-                adaptive_histonorm: bool = self.adaptive_histonorm,
-                ksize: int = self.ksize,
-
-                # ROI + background values
-                roi_projection: str = defaults["roi_projection"],
-                bg_low_val: int = defaults["bg_low_val"],
-                clahe_bg_suppress: int = defaults["clahe_bg_suppress"],
-
-                invert_channels: List[int] = defaults["channels"],
-        ):
-            # Persist ROI/background params into the object so compute_preview() and _filter() use them
-            self.roi_projection = str(roi_projection)
-            self.bg_low_val = int(bg_low_val)
-            self.clahe_bg_suppress = int(clahe_bg_suppress)
-
-            """
-            Called when user presses 'Update preview'. Recomputes mask and
-            filtered composite with the chosen parameters and updates layers.
-            """
-            # Reload stack if base_level changed
-            if int(base_level) != int(self.base_level):
-                _reload_level(int(base_level))
-                # sync GUI back to the effective base_level (may revert on load failure)
-                preprocess_controls.base_level.value = int(self.base_level)
-
-                # update raw view to the newly loaded stack
-                raw_layer.data = stack_small.mean(axis=2).astype(np.uint8)
-                raw_layer.name = f"Raw (downsampled mean) [base_level={int(self.base_level)}]"
-
-                # ensure invert_channels is valid after reload
-                invert_channels = [c for c in list(invert_channels) if 0 <= c < stack_small.shape[2]]
-                preprocess_controls.invert_channels.value = invert_channels
-
-            mask_vis_local, filt_vis_local = compute_preview(
-                multi_otsu,
-                adaptive_histonorm,
-                ksize,
-                list(invert_channels),
-            )
-            mask_layer.data = mask_vis_local
-            filt_layer.data = filt_vis_local
-
-        confirm_btn = PushButton(text="Confirm and continue")
-        reset_btn = PushButton(text="Reset preprocessing params")
-
-        def on_reset(*args):
-            # restore defaults in the object
-            _reload_level(int(defaults["base_level"]))
-            self.multi_otsu = defaults["multi_otsu"]
-            self.adaptive_histonorm = defaults["adaptive_histonorm"]
-            self.ksize = defaults["ksize"]
-            self.channels = list(defaults["channels"])
-
-            # restore ROI/background params
-            self.roi_projection = str(defaults["roi_projection"])
-            self.bg_low_val = int(defaults["bg_low_val"])
-            self.clahe_bg_suppress = int(defaults["clahe_bg_suppress"])
-
-            # restore GUI values
-            preprocess_controls.base_level.value = int(self.base_level)
-            preprocess_controls.multi_otsu.value = defaults["multi_otsu"]
-            preprocess_controls.adaptive_histonorm.value = defaults["adaptive_histonorm"]
-            preprocess_controls.ksize.value = defaults["ksize"]
-
-            preprocess_controls.roi_projection.value = defaults["roi_projection"]
-            preprocess_controls.bg_low_val.value = defaults["bg_low_val"]
-            preprocess_controls.clahe_bg_suppress.value = defaults["clahe_bg_suppress"]
-
-            preprocess_controls.invert_channels.value = defaults["channels"]
-
-            # update raw layer
-            raw_layer.data = stack_small.mean(axis=2).astype(np.uint8)
-            raw_layer.name = f"Raw (downsampled mean) [base_level={int(self.base_level)}]"
-
-            # recompute preview with defaults
-            mask_vis_local, filt_vis_local = compute_preview(
-                self.multi_otsu,
-                self.adaptive_histonorm,
-                self.ksize,
-                list(self.channels),
-            )
-            mask_layer.data = mask_vis_local
-            filt_layer.data = filt_vis_local
-
-        def on_confirm(*args):
-            viewer.close()
-
-        confirm_btn.changed.connect(on_confirm)
-        reset_btn.changed.connect(on_reset)
-
-        controls = Container(
-            widgets=[preprocess_controls, confirm_btn, reset_btn],
-            layout="vertical",
-        )
-        viewer.window.add_dock_widget(controls, area="right")
-
-        napari.run()
-
-        return base_stack_current, orig_shapes_current
-
-    def _prepare_stack_for_segmentation(
-        self,
-        base_stack: np.ndarray,
-        orig_shapes: Dict[int, Any],
-        report_path: Optional[Path] = None,
-    ) -> Tuple[np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
-        """
-        Apply ROI detection (Otsu / multi-Otsu), crop to tissue, per-channel inversion,
-        optional channel discard based on self.throw_out_ratio, and filtering.
-
-        Returns
-        -------
-        img_stack : np.ndarray
-            Preprocessed stack (filtered, cropped) of shape (H_roi, W_roi, C_eff).
-        bbox : tuple (min_row, min_col, max_row, max_col)
-            Bounding box in base_level coordinates.
-        orig_shapes : dict
-            Passed through unchanged.
-        """
+        # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
-
-        stack = base_stack.copy()
-
-        # Build grayscale projection for ROI detection (must match preview)
-        proj_mode = str(getattr(self, "roi_projection", "max")).lower()
-        if proj_mode == "mean":
-            proj = stack.mean(axis=2)
-        elif proj_mode == "sum":
-            proj = stack.sum(axis=2)
-        else:
-            proj = stack.max(axis=2)  # default
-
-        bg_low_val = int(getattr(self, "bg_low_val", 0))
-        if bg_low_val > 0:
-            proj = np.where(proj <= bg_low_val, 0, proj)
-
-        # Robust uint8 conversion for ROI detection (avoid uint16->uint8 wrap + sum-projection clipping artifacts)
-        stack_gray = ensure_grayscale_uint8(proj)
-
+        stack_grayscale = ensure_grayscale_uint8(stack)
         if self.multi_otsu:
-            tissue_mask = detect_tissue_mask_multiotsu(
-                stack_gray,
-                morphological_radius=6,
-                report_path=report_path,
-            )
+            # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
+            # returns tissue_mask
+            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=6, report_path=report_path)
         else:
-            tissue_mask = detect_tissue_mask(
-                stack_gray,
-                morphological_radius=6,
-            )
+            # just tissue detection
+            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=6)
 
-        # zero background
+        # stack: (H,W,C); tissue_mask: (H,W) True=tissue
         stack[~tissue_mask] = 0
 
-        # crop to tissue bbox (min/max in row/col, optionally padded)
-        Hm, Wm = tissue_mask.shape[:2]
-        ys, xs = np.nonzero(tissue_mask)
-        if ys.size == 0 or xs.size == 0:
-            bbox = (0, 0, Hm, Wm)
-        else:
-            r0 = int(ys.min())
-            r1 = int(ys.max()) + 1
-            c0 = int(xs.min())
-            c1 = int(xs.max()) + 1
+        # crop to tissue bbox
+        bbox = largest_bbox(tissue_mask.astype(np.uint8))
+        stack = crop_image(stack, bbox)
 
-            pad_frac = float(getattr(self, "roi_bbox_pad_frac", 0.02))
-            pad_r = int(round(pad_frac * Hm))
-            pad_c = int(round(pad_frac * Wm))
+        # Inversion and discard only AFTER cropping:
+        # NOTE: Discarding channels changes channel indices. We first decide what to drop,
+        # then delete in reverse order to avoid index shifting bugs.
+        drop: List[int] = []
 
-            r0 = max(0, r0 - pad_r)
-            c0 = max(0, c0 - pad_c)
-            r1 = min(Hm, r1 + pad_r)
-            c1 = min(Wm, c1 + pad_c)
-
-            bbox = (r0, c0, r1, c1)
-
-        stack = stack[bbox[0]:bbox[2], bbox[1]:bbox[3], :]
-
-        # Inversion and discard only AFTER cropping
-        if self.channels is None:
-            invert_channels: List[int] = []
-        else:
-            invert_channels = list(self.channels)
-
-        c = 0
-        while c < stack.shape[-1]:
-            ch = stack[:, :, c]
-
+        for i in range(stack.shape[-1]):
             # optional inversion
-            if c in invert_channels:
-                if np.issubdtype(ch.dtype, np.integer):
-                    info = np.iinfo(ch.dtype)
-                    ch = info.max - ch
-                else:
-                    ch = 1.0 - ch
-                stack[:, :, c] = ch
+            if self.channels is not None and i in self.channels:
+                if np.issubdtype(stack[:, :, i].dtype, np.integer):
+                    info = np.iinfo(stack[:, :, i].dtype)
+                    stack[:, :, i] = info.max - stack[:, :, i]
+                else:  # float images assumed in [0,1]
+                    stack[:, :, i] = 1.0 - stack[:, :, i]
 
-            # optional discard by foreground coverage
             if self.throw_out_ratio is not None:
-                non_bg = np.count_nonzero(ch != 255)
-                ratio = non_bg / ch.size
-                if ratio < self.throw_out_ratio:
-                    console.print(
-                        f"Discarded channel {c} with non-background pixel ratio: {ratio:.3f}",
-                        style="warning",
-                    )
-                    stack = np.delete(stack, c, axis=-1)
+                non_bg = np.count_nonzero(stack[:, :, i] != 255)
+                ratio = non_bg / float(stack[:, :, i].size)
+                if ratio < float(self.throw_out_ratio):
+                    drop.append(i)
 
-                    # keep channels_pp / channels_pv in sync
-                    if self.channels_pp is not None and c in self.channels_pp:
-                        self.channels_pp.remove(c)
-                    if self.channels_pv is not None and c in self.channels_pv:
-                        self.channels_pv.remove(c)
+        if drop:
+            for i in sorted(drop, reverse=True):
+                console.print(
+                    f"Discarded {i} with non-background pixel ratio: "
+                    f"{np.count_nonzero(stack[:, :, i] != 255) / float(stack[:, :, i].size):.3f}",
+                    style="warning",
+                )
+                stack = np.delete(stack, i, axis=-1)
 
-                    if (not self.channels_pp) and (not self.channels_pv):
-                        console.print(
-                            "No remaining channels for perivenous or periportal detection available.",
-                            style="error",
-                        )
-                        raise Exception("No remaining channels for segmentation available.")
+                # Keep PP/PV channel lists consistent with the new stack.
+                if self.channels_pp is not None:
+                    if i in self.channels_pp:
+                        console.print("Channel used for periportal detection removed.", style="warning")
+                    self.channels_pp = [j - 1 if j > i else j for j in self.channels_pp if j != i]
 
-                    def shift_list(lst: Optional[List[int]]) -> Optional[List[int]]:
-                        if lst is None:
-                            return None
-                        # any index bigger than the removed one shifts by -1
-                        out: List[int] = []
-                        for j in lst:
-                            if j > c:
-                                out.append(j - 1)
-                            elif j < c:
-                                out.append(j)
-                            # j == c already removed
-                        return out
+                if self.channels_pv is not None:
+                    if i in self.channels_pv:
+                        console.print("Channel used for perivenous detection removed.", style="warning")
+                    self.channels_pv = [j - 1 if j > i else j for j in self.channels_pv if j != i]
 
-                    self.channels_pp = shift_list(self.channels_pp)
-                    self.channels_pv = shift_list(self.channels_pv)
+            if (self.channels_pp is not None and not self.channels_pp) and (
+                    self.channels_pv is not None and not self.channels_pv):
+                console.print("No remaining channels for perivenous or periportal detection available.", style="error")
+                raise Exception("No remaining channels for segmentation available.")
 
-                    # also keep inversion channels consistent
-                    invert_channels = [
-                        idx - 1 if idx > c else idx
-                        for idx in invert_channels
-                        if idx != c
-                    ]
-                    continue  # re-check current index after deletion
-
-            c += 1
-
-        console.print("Complete. Now applying filters...", style="info")
-        img_stack = self._filter(stack)
-
-        if report_path is not None:
-            for i in range(img_stack.shape[2]):
-                cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
-
-        return img_stack, bbox, orig_shapes
+        return stack, bbox, orig_shapes
 
 
     def skeletize_kmeans(self, image_stack: np.ndarray,
@@ -1245,28 +814,55 @@ class LobuleSegmentor(BaseOperator):
 
         base_fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
 
+        # Keep base_gray for display only
         base_gray = image_stack.mean(axis=2).astype(np.uint8)
-        gray_flat = base_gray.reshape(-1).astype(np.float32)
-        nonzero_gray = gray_flat[gray_flat > 0.0]
+
+        # IMPORTANT: use float per-pixel mean (old behavior), not uint8-cast mean
+        # This matters when thresholds are very low (e.g. 3–10).
+        gray_flat = img_flat.mean(axis=1).astype(np.float32)
+
+        # Determine pixels that are definitely outside ROI (connected to border and ==0 in all channels)
+        # Pixels that are exactly 0 across all channels correspond to padded/outside ROI area.
+        # Exclude the connected components of that region that touch the image border.
+        border_bg_px = border_connected_mask(image_stack.sum(axis=2) == 0, connectivity=8)
+
+        # Convert border-bg pixels to border-bg SUPERPIXELS once.
+        border_bg_sp_ids = None
+        if border_bg_px is not None:
+            try:
+                border_bg_sp_ids = np.unique(labels[border_bg_px])
+            except Exception:
+                border_bg_sp_ids = None
 
         def compute_fg_masks(
                 vessel_pct_low_val: float,
                 vessel_pct_superpixel_frac_val: float,
         ):
+            """
+            Old, working behavior:
+              - thr_gray is an ABSOLUTE intensity threshold on per-pixel mean (0..255).
+              - A superpixel becomes a vessel/hole candidate if
+                    frac(pixels with mean <= thr_gray) >= vessel_pct_superpixel_frac_val
+              - Candidate superpixels are then PUNCHED OUT of FG so they become holes.
+            """
             fg_mask_local = base_fg_label_mask.copy()
 
-            pct_labels = np.zeros_like(base_fg_label_mask, dtype=bool)
-            if nonzero_gray.size > 0 and vessel_pct_low_val > 0.0:
-                thr_pct = float(np.percentile(nonzero_gray, vessel_pct_low_val))
-                pct_dark = (gray_flat <= thr_pct).astype(np.float32)
-                pct_dark_counts = np.bincount(
-                    lab_flat, weights=pct_dark, minlength=num_labels
-                )
-                pct_dark_frac = np.divide(pct_dark_counts, counts, where=nz)
-                pct_labels = pct_dark_frac >= float(vessel_pct_superpixel_frac_val)
+            # Ensure border-connected outside region cannot accidentally become FG.
+            if border_bg_sp_ids is not None and getattr(border_bg_sp_ids, "size", 0) > 0:
+                fg_mask_local[border_bg_sp_ids] = False
 
-            vessel_labels = pct_labels
+            vessel_labels = np.zeros_like(base_fg_label_mask, dtype=bool)
 
+            thr_gray = float(vessel_pct_low_val)
+            if thr_gray > 0.0:
+                gray_dark = (gray_flat <= thr_gray).astype(np.float32)
+                gray_dark_counts = np.bincount(lab_flat, weights=gray_dark, minlength=num_labels)
+                gray_dark_frac = np.divide(gray_dark_counts, counts, where=nz)
+
+                # Candidate vessel/hole superpixels (restricted to FG label set)
+                vessel_labels = (gray_dark_frac >= float(vessel_pct_superpixel_frac_val)) & fg_mask_local
+
+            # Optional pruning of tiny candidates (same as your new code, but applied to vessel_labels)
             min_area_sp = int(min(self.min_vessel_area_pp, self.min_vessel_area_pv))
             if min_area_sp > 0:
                 candidate_label_ids = np.nonzero(vessel_labels)[0]
@@ -1279,15 +875,21 @@ class LobuleSegmentor(BaseOperator):
                     for cc_id in range(1, num_cc):
                         area_cc = int(stats[cc_id, cv2.CC_STAT_AREA])
                         if area_cc < min_area_sp:
-                            cc_mask = cc_labels == cc_id
+                            cc_mask = (cc_labels == cc_id)
                             sp_ids = np.unique(labels[cc_mask])
                             vessel_labels[sp_ids] = False
 
+            # CRITICAL: punch candidates out of FG so they become holes for contour-based vessel detection
+            fg_mask_local = fg_mask_local & (~vessel_labels)
+
+            # Recompute FG pixels after punch-out
+            fg_labels_local = np.nonzero(fg_mask_local)[0]
+            fg_pix_mask_local = np.isin(labels, fg_labels_local)
+
+            # Candidate pixels (for debugging/preview layers)
             candidate_label_ids = np.nonzero(vessel_labels)[0]
             vessel_pix_mask_local = np.isin(labels, candidate_label_ids)
 
-            fg_labels_local = np.nonzero(fg_mask_local)[0]
-            fg_pix_mask_local = np.isin(labels, fg_labels_local)
             return fg_mask_local, fg_labels_local, fg_pix_mask_local, vessel_pix_mask_local
 
         if self.interactive_vessels:
@@ -1312,18 +914,35 @@ class LobuleSegmentor(BaseOperator):
                 blending="translucent",
             )
 
+            hole_preview = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
+
             vessel_layer = viewer.add_image(
-                (vessel_pix_mask.astype(np.uint8) * 255),
-                name="vessel candidates",
+                bool_mask_to_uint8(hole_preview),
+                name="vessel candidates (holes)",
                 colormap="cyan",
                 opacity=1.0,
                 blending="additive",
             )
 
+            # Optional: keep the original candidate superpixels as a second debug layer
+            vessel_sp_layer = viewer.add_image(
+                bool_mask_to_uint8(vessel_pix_mask),
+                name="vessel candidates (superpixels)",
+                colormap="yellow",
+                opacity=0.7,
+                blending="additive",
+                visible=False,
+            )
+
+            pending = {
+                "vessel_pct_low": float(self.vessel_pct_low),
+                "vessel_pct_superpixel_frac": float(self.vessel_pct_superpixel_frac),
+                "min_vessel_area": int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
+            }
+
             @magicgui(
                 layout="vertical",
-                auto_call=False,
-                call_button="Change vessel/background mask",
+                auto_call=True,  # stage values on change
                 vessel_pct_low={"min": 0.0, "max": 20.0, "step": 0.5},
                 vessel_pct_superpixel_frac={"min": 0.0, "max": 1.0, "step": 0.01},
                 min_vessel_area={"min": 0, "max": 20000, "step": 50},
@@ -1333,44 +952,62 @@ class LobuleSegmentor(BaseOperator):
                     vessel_pct_superpixel_frac: float = self.vessel_pct_superpixel_frac,
                     min_vessel_area: int = int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
             ):
-                self.vessel_pct_low = float(vessel_pct_low)
-                self.vessel_pct_superpixel_frac = float(vessel_pct_superpixel_frac)
-                min_area_int = int(min_vessel_area)
+                pending["vessel_pct_low"] = float(vessel_pct_low)
+                pending["vessel_pct_superpixel_frac"] = float(vessel_pct_superpixel_frac)
+                pending["min_vessel_area"] = int(min_vessel_area)
+
+            def _apply_vessel_candidate_update() -> None:
+                self.vessel_pct_low = float(pending["vessel_pct_low"])
+                self.vessel_pct_superpixel_frac = float(pending["vessel_pct_superpixel_frac"])
+                min_area_int = int(pending["min_vessel_area"])
                 self.min_vessel_area_pp = min_area_int
                 self.min_vessel_area_pv = min_area_int
 
-                _, _, _, vessel_pix_mask_local = compute_fg_masks(
+                _, _, fg_pix_mask_local, vessel_pix_mask_local = compute_fg_masks(
                     self.vessel_pct_low,
                     self.vessel_pct_superpixel_frac,
                 )
-                vessel_layer.data = (vessel_pix_mask_local.astype(np.uint8) * 255)
 
-            confirm_btn = PushButton(text="Confirm and continue")
-            reset_btn = PushButton(text="Reset vessel detection params")
+                hole_preview_local = holes_from_fg_mask(fg_pix_mask_local)
+                vessel_layer.data = (hole_preview_local.astype(np.uint8) * 255)
 
-            def on_reset(*args):
+                # Optional debug layer update
+                vessel_sp_layer.data = (vessel_pix_mask_local.astype(np.uint8) * 255)
+
+            def on_reset() -> None:
                 self.vessel_pct_low = stored_vals[0]
                 self.vessel_pct_superpixel_frac = stored_vals[1]
                 min_area_int = int(stored_vals[2])
                 self.min_vessel_area_pp = min_area_int
                 self.min_vessel_area_pv = min_area_int
 
-                vessel_controls.vessel_pct_low.value = self.vessel_pct_low
-                vessel_controls.vessel_pct_superpixel_frac.value = self.vessel_pct_superpixel_frac
-                vessel_controls.min_vessel_area.value = min_area_int
-                vessel_controls()
+                pending["vessel_pct_low"] = float(self.vessel_pct_low)
+                pending["vessel_pct_superpixel_frac"] = float(self.vessel_pct_superpixel_frac)
+                pending["min_vessel_area"] = int(min_area_int)
 
-            def on_confirm(*args):
+                vessel_controls.vessel_pct_low.value = float(self.vessel_pct_low)
+                vessel_controls.vessel_pct_superpixel_frac.value = float(self.vessel_pct_superpixel_frac)
+                vessel_controls.min_vessel_area.value = int(min_area_int)
+
+                _apply_vessel_candidate_update()
+
+            def on_confirm() -> None:
+                _apply_vessel_candidate_update()
                 viewer.close()
 
-            confirm_btn.changed.connect(on_confirm)
-            reset_btn.changed.connect(on_reset)
-
-            controls = Container(
-                widgets=[vessel_controls, confirm_btn, reset_btn],
-                layout="vertical",
+            add_napari_controls_dock(
+                viewer,
+                vessel_controls,
+                on_update=_apply_vessel_candidate_update,
+                on_confirm=on_confirm,
+                on_reset=on_reset,
+                include_update=True,
+                include_confirm=True,
+                include_reset=True,
+                update_text="Preview / Update",
+                confirm_text="Confirm and continue",
+                reset_text="Reset vessel detection params",
             )
-            viewer.window.add_dock_widget(controls, area="right")
 
             napari.run()
 
@@ -1399,6 +1036,21 @@ class LobuleSegmentor(BaseOperator):
             out_template[fg_pix_mask] = (255, 255, 255)
             cv2.imwrite(str(report_path / "superpixels_bg_fg.png"), out_template)
 
+            # Candidate outputs:
+            # 1) superpixel-based candidates (threshold stage)
+            cv2.imwrite(
+                str(report_path / "vessel_candidates_superpixels.png"),
+                bool_mask_to_uint8(vessel_pix_mask),
+            )
+
+            # 2) hole-based candidates (topology stage; matches vessel contour candidate concept)
+            hole_candidates = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
+
+            cv2.imwrite(
+                str(report_path / "vessel_candidates_holes.png"),
+                bool_mask_to_uint8(hole_candidates),
+            )
+
             for k in range(C):
                 out_gray = means[:, k][labels]
                 out_gray[~fg_pix_mask] = 0
@@ -1426,10 +1078,10 @@ class LobuleSegmentor(BaseOperator):
         console.print(f"Complete. Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values...",
                       style="info")
 
-        if self.nonlinear_kmeans:
-            X = X_means.copy()
-            C = X.shape[1]
+        X = X_means.copy()
+        C = X.shape[1]
 
+        if self.nonlinear_kmeans:
             # non-linear lifting
             X = nonlinear_channel_weighting(
                 X,
@@ -1441,31 +1093,16 @@ class LobuleSegmentor(BaseOperator):
                 self.nl_high_pct,
             )
 
-            # linear weights
-            w_feat = np.ones(C, dtype=np.float32)
-            if self.channels_pp is not None:
-                w_feat[self.channels_pp] *= self.alpha_pp
-            if self.channels_pv is not None:
-                w_feat[self.channels_pv] *= self.alpha_pv
-            Xw = X * w_feat
+        # linear weights
+        w_feat = np.ones(C, dtype=np.float32)
+        if self.channels_pp is not None:
+            w_feat[self.channels_pp] *= self.alpha_pp
+        if self.channels_pv is not None:
+            w_feat[self.channels_pv] *= self.alpha_pv
+        Xw = X * w_feat
 
-            kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
-            kmeans.fit(Xw)
-
-        else:
-
-            X = X_means
-            C = X.shape[1]
-
-            w_feat = np.ones(C, dtype=np.float32)
-            if self.channels_pp is not None:
-                w_feat[self.channels_pp] *= self.alpha_pp
-            if self.channels_pv is not None:
-                w_feat[self.channels_pv] *= self.alpha_pv
-            Xw = X * w_feat
-
-            kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
-            kmeans.fit(Xw)
+        kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
+        kmeans.fit(Xw)
 
         centers = kmeans.cluster_centers_ / w_feat
         labels_k = kmeans.labels_
@@ -1500,8 +1137,14 @@ class LobuleSegmentor(BaseOperator):
             assigned_by_sp[sp] = km
 
         # Vectorized lookup of assigned_by_sp over the SLIC label image
-        get_lab = np.vectorize(lambda sp: assigned_by_sp.get(int(sp), -1))
-        cluster_map = get_lab(labels).astype(np.int32)  # shape (H, W), values in {-1, 0..n_clusters-1}
+        # Faster than np.vectorize: build a LUT once and index it
+        lut = np.full((num_labels,), -1, dtype=np.int32)
+        for sp_id, cid in assigned_by_sp.items():
+            sid = int(sp_id)
+            if 0 <= sid < num_labels:
+                lut[sid] = int(cid)
+
+        cluster_map = lut[labels].astype(np.int32)  # shape (H, W), values in {-1, 0..n_clusters-1}
 
         if report_path is not None:
             template_init = render_cluster_gray(cluster_map, sorted_label_idx, self.n_clusters)
@@ -1548,7 +1191,7 @@ class LobuleSegmentor(BaseOperator):
             # start each run from the unmodified KMeans assignment
             assigned_by_sp_local: Dict[int, int] = dict(assigned_by_sp_kmeans)
 
-            get_lab_local = np.vectorize(lambda sp: assigned_by_sp_local.get(int(sp), -1))
+            # Fast LUT mapping is built once at the end; avoid np.vectorize here.
 
             # 4) Vessel detection and superpixel reassignment
             vessel_classes: List[int] = []
@@ -1634,7 +1277,8 @@ class LobuleSegmentor(BaseOperator):
                 return out
 
             mask_all = np.zeros((H, W), dtype=np.uint8)
-            mask_all[(cluster_map >= 0) & vessel_pix_mask] = 255
+            # Use full tissue support. Holes (cluster_map < 0) become child contours.
+            mask_all[(cluster_map >= 0)] = 255
             candidates = _collect_candidates_from_mask(mask_all)
 
             # classify by ring-majority; collect (no reassignment yet); then group & reassign
@@ -1697,8 +1341,13 @@ class LobuleSegmentor(BaseOperator):
                 vessel_contours.append(cnt)
                 vessel_classes.append(cls)
 
-            # Rebuild final per-pixel cluster map after reassignment
-            cluster_map_final = get_lab_local(labels).astype(np.int32)
+            # Rebuild final per-pixel cluster map after reassignment (fast LUT)
+            lut_local = np.full((num_labels,), -1, dtype=np.int32)
+            for sp_id, cid in assigned_by_sp_local.items():
+                sid = int(sp_id)
+                if 0 <= sid < num_labels:
+                    lut_local[sid] = int(cid)
+            cluster_map_final = lut_local[labels].astype(np.int32)
 
             return cluster_map_final, vessel_classes, vessel_contours
 
@@ -1816,11 +1465,7 @@ class LobuleSegmentor(BaseOperator):
                 )
                 overlay_layer.data = make_overlay(cm_local, vclasses_local, vcontours_local)
 
-            # two extra buttons: Reset and Confirm
-            confirm_btn = PushButton(text="Confirm and continue")
-            reset_btn = PushButton(text="Reset vessel params")
-
-            def on_reset(*args):
+            def on_reset() -> None:
                 # restore defaults in self
                 self.min_vessel_area_pp = defaults["min_vessel_area_pp"]
                 self.min_vessel_area_pv = defaults["min_vessel_area_pv"]
@@ -1840,18 +1485,22 @@ class LobuleSegmentor(BaseOperator):
                 # re-run with defaults (same as pressing Change)
                 vessel_controls()
 
-            def on_confirm(*args):
-                # keep whatever is currently in self.* and close viewer
+            def on_confirm() -> None:
                 viewer.close()
 
-            confirm_btn.changed.connect(on_confirm)
-            reset_btn.changed.connect(on_reset)
-
-            controls = Container(
-                widgets=[vessel_controls, confirm_btn, reset_btn],
-                layout="vertical",
+            # Keep the "Change (recalculate vessels)" button inside `vessel_controls`
+            # (auto_call=False), and add only Confirm/Reset here.
+            add_napari_controls_dock(
+                viewer,
+                vessel_controls,
+                on_confirm=on_confirm,
+                on_reset=on_reset,
+                include_update=False,
+                include_confirm=True,
+                include_reset=True,
+                confirm_text="Confirm and continue",
+                reset_text="Reset vessel params",
             )
-            viewer.window.add_dock_widget(controls, area="right")
 
             napari.run()
 
@@ -1970,53 +1619,28 @@ class LobuleSegmentor(BaseOperator):
         report_path = OUTPUT_PATH / f"segmentation-{new_uid}"
         report_path.mkdir(parents=True, exist_ok=True)
 
-        console.print("Loading images...", style="info")
-
-        # Step 1: load base stack at requested pyramid level
-        base_stack, orig_shapes = self._load_base_stack()
-
-        # Step 2: interactive preprocessing preview on downsampled stack
+        # Initial interactive preprocessing preview (napari):
+        # - preview_level selector uses intersection across stains
+        # - bg_low_val and clahe_bg_suppress update immediately (debounced)
+        # - confirm is handled in the napari UI when preview is enabled
         if self.preview:
-            base_stack, orig_shapes = self._interactive_preprocessing_preview(base_stack, orig_shapes)
+            ok = self._interactive_preprocessing_preview(report_path=report_path, require_confirm=self.confirm)
+            if self.confirm and not ok:
+                console.print("Aborted by user. No segmentation performed.", style="error")
+                return self.metadata
 
-        # Step 3: apply ROI detection, cropping, inversion, channel discard and filtering
-        img_stack, bbox, orig_shapes = self._prepare_stack_for_segmentation(
-            base_stack,
-            orig_shapes,
-            report_path=report_path,
-        )
+        console.print("Loading images...", style="info")
+        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
 
         img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
-        # Optional classic per-channel preview after filtering
-        if isinstance(img_stack, list):
-            imgs = img_stack
-        elif hasattr(img_stack, "shape"):
-            if img_stack.ndim == 2:
-                imgs = [np.asarray(img_stack)]
-            elif img_stack.ndim == 3:
-                # assume H, W, N and split channels
-                imgs = [np.asarray(img_stack[..., i]) for i in range(img_stack.shape[2])]
-            else:
-                raise ValueError("Unsupported img_stack shape for preview.")
-        else:
-            raise ValueError("Unsupported img_stack type for preview.")
+        console.print("Complete. Now applying filters...", style="info")
+        img_stack = self._filter(img_stack)
 
-        titles = []
-        for i, md in enumerate(self.metadata):
-            name = getattr(md, "name", None) or getattr(md, "sample_id", None) \
-                   or getattr(md, "path", None)
-            try:
-                name = Path(name).name  # shorten if it's a path
-            except Exception:
-                pass
-            titles.append(str(name) if name is not None else f"image_{i}")
+        for i in range(img_stack.shape[2]):
+            cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
 
-        # Classic preview of all channels after preprocessing
-        if self.preview:
-            self._preview_images(imgs, titles)
-
-        if self.confirm:
+        if (not self.preview) and self.confirm:
             apply = Confirm.ask("Continue with lobule segmentation?", default=True, console=console)
             if not apply:
                 console.print("Aborted by user. No segmentation performed.", style="error")
@@ -2123,7 +1747,7 @@ class LobuleSegmentor(BaseOperator):
             portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
             portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
 
-            self._preview_images(
+            preview_images_napari(
                 [orig_vis, overlay_vis, portality_rgba],
                 titles=["Original", "Segmentation Overlay", "Portality"],
             )
@@ -2154,7 +1778,7 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete.", style="info")
 
         # Memory Management
-        del (portality_pyramid, P, P_base_full, Pm, full_mask, img_stack, mask, mask_pyramid, mask_cropped, imgs,
+        del (portality_pyramid, P, P_base_full, Pm, full_mask, img_stack, mask, mask_pyramid, mask_cropped,
              line_segments, cv_cnt_base, cv_cnt_roi, cv_lvl, orig_vis, overlay_vis, pf_cnt_base, pf_cnt_roi, pf_lvl,
              portality_cropped, portality_rgba, thinned, vessel_classes, vessel_contours)
 
