@@ -465,30 +465,33 @@ def add_napari_controls_dock(
     *,
     on_update: Optional[Callable[[], None]] = None,
     on_confirm: Optional[Callable[[], None]] = None,
+    on_back: Optional[Callable[[], None]] = None,
     on_reset: Optional[Callable[[], None]] = None,
     update_text: str = "Preview / Update",
     confirm_text: str = "Confirm and continue",
+    back_text: str = "Back",
     reset_text: str = "Reset to defaults",
     include_update: bool = True,
     include_confirm: bool = True,
+    include_back: bool = False,
     include_reset: bool = False,
     dock_area: str = "right",
 ) -> Dict[str, Any]:
     """
     Unify napari preview UI wiring across the codebase.
 
-    Parameters
-    ----------
-    viewer:
-        napari.Viewer instance.
-    controls_widget:
-        A magicgui widget (or any QWidget) containing parameter controls.
-    on_update / on_confirm / on_reset:
-        Callbacks invoked by the respective buttons.
-    include_*:
-        Toggle which buttons appear.
-    dock_area:
-        napari dock area; usually "right".
+    Notes on environment compatibility
+    ---------------------------------
+    Different napari/magicgui versions expose PushButton signals differently:
+      - some versions use `changed`
+      - others use `clicked`
+      - some require wiring through the underlying Qt widget (`.native`)
+
+    Critical robustness fix
+    ----------------------
+    Some Qt bindings (notably some PySide setups) can drop callbacks connected via
+    anonymous lambdas if no Python reference is kept. We therefore create a
+    wrapper function and store it on the button to prevent GC.
 
     Returns
     -------
@@ -496,28 +499,88 @@ def add_napari_controls_dock(
         Mapping of button names to PushButton widgets for optional external wiring.
     """
     from magicgui.widgets import Container, PushButton
+    import warnings
+
+    def _btn_text(btn: Any) -> str:
+        txt = getattr(btn, "text", None)
+        try:
+            return str(txt()) if callable(txt) else str(txt)
+        except Exception:
+            return "<unknown>"
+
+    def _wire_button(btn: Any, cb: Optional[Callable[[], None]]) -> None:
+        """Best-effort connect for magicgui/Qt push buttons across versions (GC-safe)."""
+        if cb is None:
+            return
+
+        def _invoke_cb(*_args: Any, **_kwargs: Any) -> None:
+            try:
+                cb()
+            except Exception as e:
+                warnings.warn(
+                    f"add_napari_controls_dock: callback error for button '{_btn_text(btn)}': {e!r}",
+                    RuntimeWarning,
+                )
+
+        # Keep a strong reference to avoid GC issues in some environments.
+        try:
+            setattr(btn, "_napari_controls_cb_ref", _invoke_cb)
+        except Exception:
+            pass
+
+        # Prefer underlying Qt signal if available (most reliable across versions)
+        native = getattr(btn, "native", None)
+        if native is not None:
+            for sig_name in ("clicked", "pressed", "released"):
+                sig = getattr(native, sig_name, None)
+                if sig is None:
+                    continue
+                try:
+                    sig.connect(_invoke_cb)
+                    return
+                except Exception:
+                    pass
+
+        # Fall back to magicgui-level signals
+        for sig_name in ("clicked", "changed"):
+            sig = getattr(btn, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                sig.connect(_invoke_cb)
+                return
+            except Exception:
+                pass
+
+        warnings.warn(
+            f"add_napari_controls_dock: could not connect callback for button '{_btn_text(btn)}'.",
+            RuntimeWarning,
+        )
 
     widgets = [controls_widget]
     out: Dict[str, Any] = {}
 
     if include_update:
         update_btn = PushButton(text=str(update_text))
-        if on_update is not None:
-            update_btn.changed.connect(lambda *_: on_update())
+        _wire_button(update_btn, on_update)
         widgets.append(update_btn)
         out["update"] = update_btn
 
     if include_confirm:
         confirm_btn = PushButton(text=str(confirm_text))
-        if on_confirm is not None:
-            confirm_btn.changed.connect(lambda *_: on_confirm())
+        _wire_button(confirm_btn, on_confirm)
         widgets.append(confirm_btn)
         out["confirm"] = confirm_btn
 
+    if include_back:
+        back_btn = PushButton(text=str(back_text))
+        _wire_button(back_btn, on_back)
+        widgets.append(back_btn)
+        out["back"] = back_btn
+
     if include_reset:
         reset_btn = PushButton(text=str(reset_text))
-        if on_reset is not None:
-            reset_btn.changed.connect(lambda *_: on_reset())
+        _wire_button(reset_btn, on_reset)
         widgets.append(reset_btn)
         out["reset"] = reset_btn
 
@@ -526,16 +589,47 @@ def add_napari_controls_dock(
     return out
 
 
-def preview_images_napari(images: Sequence[np.ndarray], titles: Optional[Sequence[str]] = None) -> None:
+def preview_images_napari(
+    images: Sequence[np.ndarray],
+    titles: Optional[Sequence[str]] = None,
+    *,
+    require_confirm: bool = False,
+    return_action: bool = False,
+    include_confirm: bool = True,
+    include_back: bool = False,
+    confirm_text: str = "Confirm",
+    back_text: str = "Back",
+    dock_area: str = "right",
+) -> Optional[str]:
     """
     Small helper to preview one or more images in napari.
 
     Images are downsampled (max side 2048 px) for responsiveness.
+
+    New (optional) behavior:
+      - Can show Confirm/Back buttons in a dock.
+      - Can return an action string in {"confirm", "back", "closed"}.
+
+    Parameters
+    ----------
+    require_confirm:
+        If True, closing the viewer without pressing Confirm returns "closed".
+        If False, closing the viewer maps to "confirm".
+    return_action:
+        If True, return one of {"confirm","back","closed"}.
+        If False, preserve legacy behavior and return None.
+    include_confirm / include_back:
+        Toggle whether to show Confirm/Back buttons.
+    confirm_text / back_text:
+        Button labels.
+    dock_area:
+        Napari dock area; usually "right".
     """
     if not images:
-        return
+        return ("confirm" if not require_confirm else "closed") if return_action else None
 
     import napari
+    from magicgui.widgets import Label
 
     thumbs = [downsample_to_max_side(np.asarray(im), 2048) for im in images]
     viewer = napari.Viewer()
@@ -549,4 +643,43 @@ def preview_images_napari(images: Sequence[np.ndarray], titles: Optional[Sequenc
         else:
             viewer.add_image(im, name=name)
 
+    # Navigation result
+    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | None (closed)
+
+    def on_confirm() -> None:
+        nav["action"] = "confirm"
+        viewer.close()
+
+    def on_back() -> None:
+        nav["action"] = "back"
+        viewer.close()
+
+    # Minimal "controls" widget so we can reuse the shared dock builder.
+    # (Keeps UI consistent across previews.)
+    controls_stub = Label(value="")
+
+    if include_confirm or include_back:
+        add_napari_controls_dock(
+            viewer,
+            controls_stub,
+            on_confirm=on_confirm if include_confirm else None,
+            on_back=on_back if include_back else None,
+            include_update=False,
+            include_confirm=bool(include_confirm),
+            include_back=bool(include_back),
+            include_reset=False,
+            confirm_text=str(confirm_text),
+            back_text=str(back_text),
+            dock_area=str(dock_area),
+        )
+
     napari.run()
+
+    if not return_action:
+        return None
+
+    action = nav["action"]
+    if action is None:
+        action = "confirm" if not require_confirm else "closed"
+    return action
+

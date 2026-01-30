@@ -31,6 +31,23 @@ from slidekick.processing.lobule_segmentation.lob_utils import (
 )
 
 
+class PipelineBack(Exception):
+    """
+    Raised when the user requests to move backwards in the interactive napari pipeline.
+
+    `target_step` is interpreted by `apply()`'s simple wizard state machine.
+      0 = preprocessing preview
+      1 = load + filter
+      2 = weighting preview
+      3 = superpixels / KMeans / vessels
+    """
+
+    def __init__(self, target_step: int, message: str = "Back requested"):
+        super().__init__(message)
+        self.target_step = int(target_step)
+
+
+
 class LobuleSegmentor(BaseOperator):
     """
     Based on https://github.com/matthiaskoenig/zonation-image-analysis/blob/develop/src/zia/pipeline/pipeline_components/segementation_component.py
@@ -235,32 +252,28 @@ class LobuleSegmentor(BaseOperator):
 
         return out
 
+
     def _interactive_preprocessing_preview(
             self,
             report_path: Optional[Path] = None,
             *,
             require_confirm: bool = False,
-    ) -> bool:
+            return_action: bool = False,
+    ) -> Union[bool, str]:
         """
         Interactive napari preview for preprocessing (ROI crop + filter) before segmentation.
 
-        Controls:
-          - preview_level: pyramid level used for preview computations (common to all stains).
-          - bg_low_val: values <= bg_low_val are treated as background.
-          - clahe_bg_suppress: after CLAHE, values below this are zeroed.
-
-        Notes:
-          - Level choices are the intersection of levels across stains.
-          - If levels cannot be determined for a stain, it is treated as [0].
-          - Processing runs on a downsampled copy (max side 2048) for responsiveness.
+        Button-only behavior:
+          - Parameter widgets only stage values.
+          - Computation + layer updates happen ONLY when pressing "Preview / Update"
+            (or Confirm/Back, which apply once before closing).
 
         Returns
         -------
-        bool
-            True if confirmed (or if require_confirm=False), False if the viewer was closed
-            without pressing Confirm.
+        Union[bool, str]
+            - bool (legacy): True if confirmed (or if require_confirm=False), False if not confirmed.
+            - str (wizard): "confirm", "back", or "closed".
         """
-        from qtpy.QtCore import QTimer
 
         # Load multiscale handles once; discover common levels from these handles.
         multiscales = [self.load_image(i) for i in range(len(self.metadata))]
@@ -356,9 +369,7 @@ class LobuleSegmentor(BaseOperator):
         }
 
         confirmed = {"ok": False}
-
-        timer = QTimer()
-        timer.setSingleShot(True)
+        nav = {"action": None}  # "confirm" | "back" | None (closed)
 
         def _apply_update() -> None:
             lvl = int(pending["level"])
@@ -373,11 +384,9 @@ class LobuleSegmentor(BaseOperator):
                 raw_layers[c].data = raw[..., c]
                 filt_layers[c].data = filt[..., c]
 
-        timer.timeout.connect(_apply_update)
-
         @magicgui(
             layout="vertical",
-            auto_call=True,
+            auto_call=True,  # stages values only; NO computation here
             preview_level={"choices": common_levels},
             bg_low_val={"min": 0, "max": 255, "step": 1},
             clahe_bg_suppress={"min": 0, "max": 255, "step": 1},
@@ -391,17 +400,18 @@ class LobuleSegmentor(BaseOperator):
             pending["bg"] = int(bg_low_val)
             pending["clahe"] = int(clahe_bg_suppress)
 
-            # Debounce: restart timer on every change.
-            timer.start(200)
-
         def on_update() -> None:
-            timer.stop()
             _apply_update()
 
         def on_confirm() -> None:
-            timer.stop()
             _apply_update()
             confirmed["ok"] = True
+            nav["action"] = "confirm"
+            viewer.close()
+
+        def on_back() -> None:
+            _apply_update()
+            nav["action"] = "back"
             viewer.close()
 
         add_napari_controls_dock(
@@ -409,39 +419,44 @@ class LobuleSegmentor(BaseOperator):
             controls,
             on_update=on_update,
             on_confirm=on_confirm,
+            on_back=on_back,
             include_update=True,
             include_confirm=True,
+            include_back=True,
             include_reset=False,
             update_text="Preview / Update",
             confirm_text="Confirm",
+            back_text="Back",
         )
 
         napari.run()
 
+        if return_action:
+            action = nav["action"]
+            if action is None:
+                action = "confirm" if not require_confirm else "closed"
+            return action
+
         return True if not require_confirm else bool(confirmed["ok"])
+
 
     def _preview_channel_weighting(
             self,
             image_stack: np.ndarray,
-    ) -> None:
+            *,
+            return_action: bool = False,
+    ) -> Optional[str]:
         """
-        Interactive Napari preview that shows how the KMeans / nonlinear
-        weighting parameters affect the *composite* PP and PV channels
-        BEFORE superpixel generation and KMeans.
+        Interactive Napari preview for PP/PV weighting.
 
-        - Uses a downsampled copy of `image_stack` for speed.
-        - Computes one weighted PP image and one weighted PV image
-          (mean over the respective channels after nonlinear+alpha weights).
-        - Updates overlays on a short debounce timer and provides a
-          'Preview / Update' button to force recomputation immediately.
-        - Provides 'Reset to defaults' and 'Confirm and continue' buttons.
+        Button-only behavior:
+          - Parameter widgets only stage values.
+          - Computation + layer updates happen ONLY when pressing "Preview / Update"
+            (or Confirm/Back, which apply once before closing).
         """
-        from qtpy.QtCore import QTimer
-
         if image_stack.ndim != 3:
             raise ValueError(f"Expected (H, W, C) stack, got {image_stack.shape}")
 
-        # only show relevant channels (PP + PV)
         channels_interest: List[int] = []
         if self.channels_pp is not None:
             channels_interest.extend(self.channels_pp)
@@ -454,14 +469,11 @@ class LobuleSegmentor(BaseOperator):
                 "Interactive weighting requested, but no channels_pp/channels_pv defined.",
                 style="warning",
             )
-            return
+            return "confirm" if return_action else None
 
-        # Downsample whole stack for preview (fast).
         stack_small = downsample_stack_to_max_side(image_stack, 2048)
-
         H, W, C = stack_small.shape
 
-        # remember current values as "defaults" for reset
         defaults = dict(
             nonlinear_kmeans=self.nonlinear_kmeans,
             alpha_pp=self.alpha_pp,
@@ -471,20 +483,9 @@ class LobuleSegmentor(BaseOperator):
             nl_low_pct=self.nl_low_pct,
             nl_high_pct=self.nl_high_pct,
         )
-
         pending = dict(defaults)
 
         def compute_pp_pv_images() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-            """
-            Compute composite PP and PV images that mirror the feature
-            transformation used for KMeans:
-
-              - optional nonlinear_channel_weighting (gamma + percentiles)
-              - alpha_pp / alpha_pv linear weighting
-
-            Returns (pp_img, pv_img) as uint8 arrays in [0, 255],
-            or None if the respective channel list is empty.
-            """
             flat = stack_small.reshape(-1, C).astype(np.float32)
 
             channels_pp = [c for c in (self.channels_pp or []) if 0 <= c < C]
@@ -526,17 +527,13 @@ class LobuleSegmentor(BaseOperator):
 
             return pp_img, pv_img
 
-        # Napari viewer
         viewer = napari.Viewer()
-        # TODO: Integrate with slidekick viewer
 
         pp_layer = None
         pv_layer = None
+        nav = {"action": None}  # "confirm" | "back" | None (closed)
 
         def _apply_update() -> None:
-            """
-            Push pending parameters into self, recompute composites, update layers.
-            """
             self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
             self.alpha_pp = float(pending["alpha_pp"])
             self.alpha_pv = float(pending["alpha_pv"])
@@ -572,25 +569,13 @@ class LobuleSegmentor(BaseOperator):
                 else:
                     pv_layer.data = new_pv
 
-        # Initial render
-        pending.update(
-            nonlinear_kmeans=self.nonlinear_kmeans,
-            alpha_pp=self.alpha_pp,
-            alpha_pv=self.alpha_pv,
-            pp_gamma=self.pp_gamma,
-            pv_gamma=self.pv_gamma,
-            nl_low_pct=self.nl_low_pct,
-            nl_high_pct=self.nl_high_pct,
-        )
+        # Initial render uses current self.* once
+        pending.update(defaults)
         _apply_update()
-
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(_apply_update)
 
         @magicgui(
             layout="vertical",
-            auto_call=True,  # stage updates on every change; apply on debounce or button
+            auto_call=True,  # stages values only
             nonlinear_kmeans={"widget_type": "CheckBox"},
             alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
             alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
@@ -608,10 +593,6 @@ class LobuleSegmentor(BaseOperator):
                 nl_low_pct: float = self.nl_low_pct,
                 nl_high_pct: float = self.nl_high_pct,
         ):
-            """
-            Stage parameter changes; actual recomputation happens on a short debounce
-            timer or when the user presses Preview / Update.
-            """
             pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
             pending["alpha_pp"] = float(alpha_pp)
             pending["alpha_pv"] = float(alpha_pv)
@@ -620,16 +601,10 @@ class LobuleSegmentor(BaseOperator):
             pending["nl_low_pct"] = float(nl_low_pct)
             pending["nl_high_pct"] = float(nl_high_pct)
 
-            timer.start(200)
-
         def on_update() -> None:
-            timer.stop()
             _apply_update()
 
         def on_reset() -> None:
-            timer.stop()
-
-            # restore defaults in pending and in GUI widgets
             pending.update(defaults)
 
             weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
@@ -643,8 +618,13 @@ class LobuleSegmentor(BaseOperator):
             _apply_update()
 
         def on_confirm() -> None:
-            timer.stop()
             _apply_update()
+            nav["action"] = "confirm"
+            viewer.close()
+
+        def on_back() -> None:
+            _apply_update()
+            nav["action"] = "back"
             viewer.close()
 
         add_napari_controls_dock(
@@ -652,16 +632,23 @@ class LobuleSegmentor(BaseOperator):
             weighting_controls,
             on_update=on_update,
             on_confirm=on_confirm,
+            on_back=on_back,
             on_reset=on_reset,
             include_update=True,
             include_confirm=True,
+            include_back=True,
             include_reset=True,
             update_text="Preview / Update",
             confirm_text="Confirm and continue",
+            back_text="Back",
             reset_text="Reset to defaults",
         )
 
         napari.run()
+
+        if return_action:
+            return nav["action"] or "confirm"
+        return None
 
 
     def _load_and_invert_images_from_metadatas(
@@ -839,11 +826,16 @@ class LobuleSegmentor(BaseOperator):
                 vessel_pct_superpixel_frac_val: float,
         ):
             """
-            Old, working behavior:
-              - thr_gray is an ABSOLUTE intensity threshold on per-pixel mean (0..255).
-              - A superpixel becomes a vessel/hole candidate if
-                    frac(pixels with mean <= thr_gray) >= vessel_pct_superpixel_frac_val
-              - Candidate superpixels are then PUNCHED OUT of FG so they become holes.
+            Vessel candidate pre-gating used to punch out "holes" from the FG mask.
+
+            This stage marks *superpixels* as "dark enough" if a sufficient fraction of their
+            pixels fall below a gray threshold, then removes those superpixels from the FG mask.
+            The resulting punched-out FG mask is later converted to "holes" via topology.
+
+            Important: `vessel_pct_low_val` is expressed in 8-bit-equivalent intensity units (0..255).
+            If the underlying data is float-normalized (~0..1) or high-bit-depth (~0..65535),
+            the threshold is auto-scaled into the data's numeric range so the GUI slider keeps
+            the same practical meaning across environments.
             """
             fg_mask_local = base_fg_label_mask.copy()
 
@@ -853,7 +845,33 @@ class LobuleSegmentor(BaseOperator):
 
             vessel_labels = np.zeros_like(base_fg_label_mask, dtype=bool)
 
-            thr_gray = float(vessel_pct_low_val)
+            # Resolve an effective gray threshold in the *data* units of gray_flat.
+            thr_in = float(vessel_pct_low_val)
+            thr_gray = thr_in
+
+            try:
+                # Reference distribution only from current FG (ignoring padded border BG).
+                fg_pix_flat = fg_mask_local[lab_flat]
+                gray_ref = gray_flat[fg_pix_flat]
+
+                if gray_ref.size > 0:
+                    # Robust proxy for "max" that avoids a few saturated pixels.
+                    g99 = float(np.percentile(gray_ref, 99.5))
+
+                    # Heuristic:
+                    # - float-normalized images: g99 ~ 1.0
+                    # - uint8 images: g99 ~ 255
+                    # - uint16 / HDR: g99 >> 255
+                    if g99 <= 1.5:
+                        thr_gray = thr_in / 255.0
+                    elif g99 > 255.0:
+                        thr_gray = thr_in * (g99 / 255.0)
+                    else:
+                        thr_gray = thr_in
+            except Exception:
+                # If anything goes wrong (unexpected shapes, NaNs), fall back to raw input.
+                thr_gray = thr_in
+
             if thr_gray > 0.0:
                 gray_dark = (gray_flat <= thr_gray).astype(np.float32)
                 gray_dark_counts = np.bincount(lab_flat, weights=gray_dark, minlength=num_labels)
@@ -862,7 +880,7 @@ class LobuleSegmentor(BaseOperator):
                 # Candidate vessel/hole superpixels (restricted to FG label set)
                 vessel_labels = (gray_dark_frac >= float(vessel_pct_superpixel_frac_val)) & fg_mask_local
 
-            # Optional pruning of tiny candidates (same as your new code, but applied to vessel_labels)
+            # Optional pruning of tiny candidates (applied to vessel_labels)
             min_area_sp = int(min(self.min_vessel_area_pp, self.min_vessel_area_pv))
             if min_area_sp > 0:
                 candidate_label_ids = np.nonzero(vessel_labels)[0]
@@ -892,8 +910,34 @@ class LobuleSegmentor(BaseOperator):
 
             return fg_mask_local, fg_labels_local, fg_pix_mask_local, vessel_pix_mask_local
 
-        if self.interactive_vessels:
+        def _filter_small_holes_px(mask_bool: np.ndarray, min_area_px: int) -> np.ndarray:
+            """
+            Remove connected components in the *hole mask* smaller than min_area_px.
+            This matches user expectation for the cyan preview: small cyan holes disappear.
 
+            NOTE: This helper is used BOTH for the interactive preview AND as the
+            single source of truth for which holes are later eligible for classification.
+            """
+            m = mask_bool.astype(bool)
+            thr = int(min_area_px)
+            if thr <= 0 or not np.any(m):
+                return m
+
+            num_cc, cc_lab, stats, _ = cv2.connectedComponentsWithStats(
+                m.astype(np.uint8),
+                connectivity=8,
+            )
+            if num_cc <= 1:
+                return m
+
+            out = m.copy()
+            for cc_id in range(1, num_cc):
+                area = int(stats[cc_id, cv2.CC_STAT_AREA])
+                if area < thr:
+                    out[cc_lab == cc_id] = False
+            return out
+
+        if self.interactive_vessels:
             stored_vals = [
                 self.vessel_pct_low,
                 self.vessel_pct_superpixel_frac,
@@ -915,23 +959,20 @@ class LobuleSegmentor(BaseOperator):
             )
 
             hole_preview = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
+            hole_preview = _filter_small_holes_px(
+                hole_preview,
+                int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
+            )
 
+            # Keep ONLY the hole-based overlay.
+            # This is the one that matches the later contour-based vessel candidate extraction
+            # (candidates are punched out of the FG mask and appear as holes).
             vessel_layer = viewer.add_image(
                 bool_mask_to_uint8(hole_preview),
                 name="vessel candidates (holes)",
                 colormap="cyan",
                 opacity=1.0,
                 blending="additive",
-            )
-
-            # Optional: keep the original candidate superpixels as a second debug layer
-            vessel_sp_layer = viewer.add_image(
-                bool_mask_to_uint8(vessel_pix_mask),
-                name="vessel candidates (superpixels)",
-                colormap="yellow",
-                opacity=0.7,
-                blending="additive",
-                visible=False,
             )
 
             pending = {
@@ -943,7 +984,8 @@ class LobuleSegmentor(BaseOperator):
             @magicgui(
                 layout="vertical",
                 auto_call=True,  # stage values on change
-                vessel_pct_low={"min": 0.0, "max": 20.0, "step": 0.5},
+                # NOTE: this is an ABSOLUTE intensity threshold on per-pixel mean (0..255), not a percent.
+                vessel_pct_low={"min": 0.0, "max": 255.0, "step": 1.0},
                 vessel_pct_superpixel_frac={"min": 0.0, "max": 1.0, "step": 0.01},
                 min_vessel_area={"min": 0, "max": 20000, "step": 50},
             )
@@ -957,22 +999,44 @@ class LobuleSegmentor(BaseOperator):
                 pending["min_vessel_area"] = int(min_vessel_area)
 
             def _apply_vessel_candidate_update() -> None:
+                # Commit staged values to object state
                 self.vessel_pct_low = float(pending["vessel_pct_low"])
                 self.vessel_pct_superpixel_frac = float(pending["vessel_pct_superpixel_frac"])
                 min_area_int = int(pending["min_vessel_area"])
                 self.min_vessel_area_pp = min_area_int
                 self.min_vessel_area_pv = min_area_int
 
+                # Recompute masks with current settings
                 _, _, fg_pix_mask_local, vessel_pix_mask_local = compute_fg_masks(
                     self.vessel_pct_low,
                     self.vessel_pct_superpixel_frac,
                 )
 
-                hole_preview_local = holes_from_fg_mask(fg_pix_mask_local)
-                vessel_layer.data = (hole_preview_local.astype(np.uint8) * 255)
+                # IMPORTANT: keep border exclusion consistent with the initial preview
+                hole_preview_local = holes_from_fg_mask(
+                    fg_pix_mask_local,
+                    border_exclude=border_bg_px,
+                )
 
-                # Optional debug layer update
-                vessel_sp_layer.data = (vessel_pix_mask_local.astype(np.uint8) * 255)
+                # Filter *visible* cyan holes by pixel area (what the UI knob suggests)
+                hole_preview_local = _filter_small_holes_px(hole_preview_local, min_area_int)
+
+                # Update preview layer (single source of truth)
+                vessel_layer.data = bool_mask_to_uint8(hole_preview_local)
+                try:
+                    vessel_layer.refresh()
+                except Exception:
+                    pass
+
+                console.print(
+                    "Updated vessel candidates: "
+                    f"gray_thr={self.vessel_pct_low:.1f}, "
+                    f"sp_dark_frac>={self.vessel_pct_superpixel_frac:.2f}, "
+                    f"min_area_px={min_area_int} | "
+                    f"holes_px={int(np.count_nonzero(hole_preview_local))}, "
+                    f"cand_px={int(np.count_nonzero(vessel_pix_mask_local))}",
+                    style="info",
+                )
 
             def on_reset() -> None:
                 self.vessel_pct_low = stored_vals[0]
@@ -991,8 +1055,16 @@ class LobuleSegmentor(BaseOperator):
 
                 _apply_vessel_candidate_update()
 
+            nav = {"action": None}  # "confirm" | "back" | None (closed)
+
             def on_confirm() -> None:
                 _apply_vessel_candidate_update()
+                nav["action"] = "confirm"
+                viewer.close()
+
+            def on_back() -> None:
+                _apply_vessel_candidate_update()
+                nav["action"] = "back"
                 viewer.close()
 
             add_napari_controls_dock(
@@ -1000,26 +1072,39 @@ class LobuleSegmentor(BaseOperator):
                 vessel_controls,
                 on_update=_apply_vessel_candidate_update,
                 on_confirm=on_confirm,
+                on_back=on_back,
                 on_reset=on_reset,
                 include_update=True,
                 include_confirm=True,
+                include_back=True,
                 include_reset=True,
                 update_text="Preview / Update",
                 confirm_text="Confirm and continue",
+                back_text="Back",
                 reset_text="Reset vessel detection params",
             )
 
             napari.run()
 
+            if nav["action"] == "back":
+                raise PipelineBack(2)
+
             fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
                 self.vessel_pct_low,
                 self.vessel_pct_superpixel_frac,
             )
+
         else:
             fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
                 self.vessel_pct_low,
                 self.vessel_pct_superpixel_frac,
             )
+
+        # Precompute hole candidates ONCE and reuse everywhere.
+        # This ensures interactive preview == report outputs == later vessel classification candidates.
+        vessel_candidate_min_area_px = int(min(self.min_vessel_area_pp, self.min_vessel_area_pv))
+        vessel_candidate_holes_all = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
+        vessel_candidate_holes = _filter_small_holes_px(vessel_candidate_holes_all, vessel_candidate_min_area_px)
 
         sums = np.vstack([
             np.bincount(lab_flat, weights=img_flat[:, c], minlength=num_labels)
@@ -1044,11 +1129,16 @@ class LobuleSegmentor(BaseOperator):
             )
 
             # 2) hole-based candidates (topology stage; matches vessel contour candidate concept)
-            hole_candidates = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
-
+            # IMPORTANT: this must match what the user sees in the cyan preview AND what is later eligible for classification.
             cv2.imwrite(
                 str(report_path / "vessel_candidates_holes.png"),
-                bool_mask_to_uint8(hole_candidates),
+                bool_mask_to_uint8(vessel_candidate_holes),
+            )
+
+            # Optional debug: raw (unfiltered) holes implied by fg_pix_mask
+            cv2.imwrite(
+                str(report_path / "vessel_candidates_holes_raw.png"),
+                bool_mask_to_uint8(vessel_candidate_holes_all),
             )
 
             for k in range(C):
@@ -1279,6 +1369,24 @@ class LobuleSegmentor(BaseOperator):
             mask_all = np.zeros((H, W), dtype=np.uint8)
             # Use full tissue support. Holes (cluster_map < 0) become child contours.
             mask_all[(cluster_map >= 0)] = 255
+
+            # Enforce the vessel-candidate hole mask coming from the earlier "vessel candidates (holes)" stage.
+            # Any interior holes that were filtered out there are filled here so they cannot be classified as vessels.
+            try:
+                if (
+                        vessel_candidate_holes_all is not None
+                        and vessel_candidate_holes is not None
+                        and vessel_candidate_holes_all.shape == mask_all.shape
+                        and vessel_candidate_holes.shape == mask_all.shape
+                ):
+                    holes_to_fill = vessel_candidate_holes_all & (~vessel_candidate_holes)
+                    if np.any(holes_to_fill):
+                        mask_all[holes_to_fill] = 255
+            except NameError:
+                pass
+            except Exception:
+                pass
+
             candidates = _collect_candidates_from_mask(mask_all)
 
             # classify by ring-majority; collect (no reassignment yet); then group & reassign
@@ -1485,24 +1593,39 @@ class LobuleSegmentor(BaseOperator):
                 # re-run with defaults (same as pressing Change)
                 vessel_controls()
 
+            nav = {"action": None}  # "confirm" | "back" | None (closed)
+
             def on_confirm() -> None:
+                nav["action"] = "confirm"
+                viewer.close()
+
+            def on_back() -> None:
+                nav["action"] = "back"
                 viewer.close()
 
             # Keep the "Change (recalculate vessels)" button inside `vessel_controls`
-            # (auto_call=False), and add only Confirm/Reset here.
+            # (auto_call=False), and add Confirm/Back/Reset here.
             add_napari_controls_dock(
                 viewer,
                 vessel_controls,
                 on_confirm=on_confirm,
+                on_back=on_back,
                 on_reset=on_reset,
                 include_update=False,
                 include_confirm=True,
+                include_back=True,
                 include_reset=True,
                 confirm_text="Confirm and continue",
+                back_text="Back",
                 reset_text="Reset vessel params",
             )
 
             napari.run()
+
+            if nav["action"] == "back":
+                # classification back should return to the previous vessel UI
+                # (still within "superpixels / KMeans / vessels"), not the weighting step
+                raise PipelineBack(3)
 
         # final vessel detection with whatever parameters the user ended up with
         cluster_map_final, vessel_classes, vessel_contours = run_vessel_detection(
@@ -1610,6 +1733,7 @@ class LobuleSegmentor(BaseOperator):
 
         return thinned, (vessel_classes, vessel_contours)
 
+
     def apply(self) -> Tuple[Metadata, Metadata]:
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1619,55 +1743,118 @@ class LobuleSegmentor(BaseOperator):
         report_path = OUTPUT_PATH / f"segmentation-{new_uid}"
         report_path.mkdir(parents=True, exist_ok=True)
 
-        # Initial interactive preprocessing preview (napari):
-        # - preview_level selector uses intersection across stains
-        # - bg_low_val and clahe_bg_suppress update immediately (debounced)
-        # - confirm is handled in the napari UI when preview is enabled
-        if self.preview:
-            ok = self._interactive_preprocessing_preview(report_path=report_path, require_confirm=self.confirm)
-            if self.confirm and not ok:
-                console.print("Aborted by user. No segmentation performed.", style="error")
-                return self.metadata
+        # Wizard-style pipeline so interactive napari previews can go forward AND backward.
+        #
+        # Steps:
+        #   0 = preprocessing preview (bg_low_val / clahe_bg_suppress / preview_level)
+        #   1 = load + filter
+        #   2 = weighting preview (nonlinear + alpha)
+        #   3 = superpixels / KMeans / vessels (may raise PipelineBack)
+        step = 0
 
-        console.print("Loading images...", style="info")
-        img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
+        img_stack: Optional[np.ndarray] = None
+        bbox: Optional[Tuple[int, int, int, int]] = None
+        orig_shapes: Optional[Dict[int, Any]] = None
+        img_size_base: Optional[Tuple[int, int]] = None
 
-        img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
+        while True:
+            if step == 0:
+                # Initial interactive preprocessing preview (napari):
+                # - preview_level selector uses intersection across stains
+                # - parameters are staged on change; updates apply only on "Preview / Update"
+                # - confirm/back is handled in the napari UI when preview is enabled
+                if self.preview:
+                    action = self._interactive_preprocessing_preview(
+                        report_path=report_path,
+                        require_confirm=self.confirm,
+                        return_action=True,
+                    )
+                    if action == "back":
+                        console.print("Aborted by user. No segmentation performed.", style="error")
+                        return self.metadata
+                    if self.confirm and action != "confirm":
+                        console.print("Aborted by user. No segmentation performed.", style="error")
+                        return self.metadata
 
-        console.print("Complete. Now applying filters...", style="info")
-        img_stack = self._filter(img_stack)
+                step = 1
+                continue
 
-        for i in range(img_stack.shape[2]):
-            cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
+            if step == 1:
+                console.print("Loading images...", style="info")
+                img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
 
-        if (not self.preview) and self.confirm:
-            apply = Confirm.ask("Continue with lobule segmentation?", default=True, console=console)
-            if not apply:
-                console.print("Aborted by user. No segmentation performed.", style="error")
-                return self.metadata
+                img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
-        # Interactive weighting preview
-        if self.interactive_weighting:
-            self._preview_channel_weighting(img_stack)
+                console.print("Complete. Now applying filters...", style="info")
+                img_stack = self._filter(img_stack)
 
-        # Superpixel algorithm (steps 3–7)
-        pad = 10  # adjust if you want a different safety border
+                for i in range(img_stack.shape[2]):
+                    cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
 
-        # Adjust region size from number of superpixels if specified
-        if self.target_superpixels is not None:
-            H, W, _ = img_stack.shape
-            region_size = int(np.sqrt((H * W) / self.target_superpixels))
-            console.print(f"Region size for SLIC was computed as {region_size}", style="info")
-            if region_size < self.region_size:
-                console.print(f"Computed region size {region_size} is smaller than specified region size {self.region_size}", style="warning")
-            self.region_size = region_size
+                if (not self.preview) and self.confirm:
+                    apply = Confirm.ask("Continue with lobule segmentation?", default=True, console=console)
+                    if not apply:
+                        console.print("Aborted by user. No segmentation performed.", style="error")
+                        return self.metadata
 
-        thinned, (vessel_classes, vessel_contours) = self.skeletize_kmeans(
-            img_stack,
-            pad=pad,
-            region_size=self.region_size,
-            report_path=report_path,
-        )
+                step = 2
+                continue
+
+            if step == 2:
+                # Interactive weighting preview
+                if self.interactive_weighting:
+                    action = self._preview_channel_weighting(img_stack, return_action=True)
+                    if action == "back":
+                        console.print("Moving back to preprocessing preview...", style="warning")
+                        step = 0
+                        continue
+
+                step = 3
+                continue
+
+            if step == 3:
+                # Superpixel algorithm (steps 3–7)
+                pad = 10  # adjust if you want a different safety border
+
+                # Adjust region size from number of superpixels if specified
+                if self.target_superpixels is not None:
+                    H, W, _ = img_stack.shape
+                    region_size = int(np.sqrt((H * W) / self.target_superpixels))
+                    console.print(f"Region size for SLIC was computed as {region_size}", style="info")
+                    if region_size < self.region_size:
+                        console.print(
+                            f"Computed region size {region_size} is smaller than specified region size {self.region_size}",
+                            style="warning",
+                        )
+                    self.region_size = region_size
+
+                try:
+                    thinned, (vessel_classes, vessel_contours) = self.skeletize_kmeans(
+                        img_stack,
+                        pad=pad,
+                        region_size=self.region_size,
+                        report_path=report_path,
+                    )
+
+                except PipelineBack as e:
+                    # All Back buttons in the vessel/final previews map here.
+                    target = int(e.target_step)
+
+                    step_name = {
+                        0: "preprocessing preview",
+                        1: "load + filter",
+                        2: "weighting preview",
+                        3: "superpixels / KMeans / vessels",
+                        4: "post-processing + final preview",
+                    }.get(target, f"step {target}")
+
+                    console.print(f"Moving back to {step_name}...", style="warning")
+
+                    step = target
+                    continue
+
+                # Successful completion of the interactive portion.
+                break
 
         console.print("Complete. Creating lines segments from skeleton...", style="info")
 
@@ -1747,10 +1934,25 @@ class LobuleSegmentor(BaseOperator):
             portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
             portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
 
-            preview_images_napari(
+            action = preview_images_napari(
                 [orig_vis, overlay_vis, portality_rgba],
                 titles=["Original", "Segmentation Overlay", "Portality"],
+                require_confirm=self.confirm,
+                return_action=True,
+                include_confirm=True,
+                include_back=True,
+                confirm_text="Confirm and finish",
+                back_text="Back",
             )
+
+            if action == "back":
+                # Back from the final preview should typically return to the last interactive stage.
+                # Assumption: step 3 = superpixels / KMeans / vessels.
+                raise PipelineBack(3)
+
+            if self.confirm and action == "closed":
+                console.print("Aborted by user at final preview. No outputs written.", style="error")
+                return self.metadata
 
         # Save mask pyramid
         seg_path = report_path / f"{new_uid}_seg.tiff"
@@ -1759,7 +1961,7 @@ class LobuleSegmentor(BaseOperator):
             path_original=seg_path,
             path_storage=seg_path,
             image_type="mask",
-            uid=new_uid+"_mask",
+            uid=new_uid + "_mask",
         )
         new_meta.save(report_path)
         save_tif(mask_pyramid, seg_path, metadata=new_meta)
@@ -1770,7 +1972,7 @@ class LobuleSegmentor(BaseOperator):
             path_original=portality_path,
             path_storage=portality_path,
             image_type="portality",
-            uid=new_uid+"_portality",
+            uid=new_uid + "_portality",
         )
         new_port.save(report_path)
         save_tif(portality_pyramid, portality_path, metadata=new_port)
