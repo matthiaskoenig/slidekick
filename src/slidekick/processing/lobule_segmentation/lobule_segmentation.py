@@ -47,6 +47,17 @@ class PipelineBack(Exception):
         self.target_step = int(target_step)
 
 
+class PipelineAbort(Exception):
+    """
+    Raised when the user presses ABORT in any interactive napari preview.
+
+    This is handled at the top-level `apply()` to exit the pipeline cleanly without
+    producing new segmentations.
+    """
+
+    def __init__(self, message: str = "Abort requested"):
+        super().__init__(message)
+
 
 class LobuleSegmentor(BaseOperator):
     """
@@ -369,7 +380,7 @@ class LobuleSegmentor(BaseOperator):
         }
 
         confirmed = {"ok": False}
-        nav = {"action": None}  # "confirm" | "back" | None (closed)
+        nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
         def _apply_update() -> None:
             lvl = int(pending["level"])
@@ -414,19 +425,26 @@ class LobuleSegmentor(BaseOperator):
             nav["action"] = "back"
             viewer.close()
 
+        def on_abort() -> None:
+            nav["action"] = "abort"
+            viewer.close()
+
         add_napari_controls_dock(
             viewer,
             controls,
             on_update=on_update,
             on_confirm=on_confirm,
             on_back=on_back,
+            on_abort=on_abort,
             include_update=True,
             include_confirm=True,
             include_back=True,
             include_reset=False,
+            include_abort=True,
             update_text="Preview / Update",
             confirm_text="Confirm",
             back_text="Back",
+            abort_text="ABORT",
         )
 
         napari.run()
@@ -531,7 +549,7 @@ class LobuleSegmentor(BaseOperator):
 
         pp_layer = None
         pv_layer = None
-        nav = {"action": None}  # "confirm" | "back" | None (closed)
+        nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
         def _apply_update() -> None:
             self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
@@ -627,6 +645,10 @@ class LobuleSegmentor(BaseOperator):
             nav["action"] = "back"
             viewer.close()
 
+        def on_abort() -> None:
+            nav["action"] = "abort"
+            viewer.close()
+
         add_napari_controls_dock(
             viewer,
             weighting_controls,
@@ -634,14 +656,17 @@ class LobuleSegmentor(BaseOperator):
             on_confirm=on_confirm,
             on_back=on_back,
             on_reset=on_reset,
+            on_abort=on_abort,
             include_update=True,
             include_confirm=True,
             include_back=True,
             include_reset=True,
+            include_abort=True,
             update_text="Preview / Update",
             confirm_text="Confirm and continue",
             back_text="Back",
             reset_text="Reset to defaults",
+            abort_text="ABORT",
         )
 
         napari.run()
@@ -1055,7 +1080,7 @@ class LobuleSegmentor(BaseOperator):
 
                 _apply_vessel_candidate_update()
 
-            nav = {"action": None}  # "confirm" | "back" | None (closed)
+            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
             def on_confirm() -> None:
                 _apply_vessel_candidate_update()
@@ -1067,6 +1092,10 @@ class LobuleSegmentor(BaseOperator):
                 nav["action"] = "back"
                 viewer.close()
 
+            def on_abort() -> None:
+                nav["action"] = "abort"
+                viewer.close()
+
             add_napari_controls_dock(
                 viewer,
                 vessel_controls,
@@ -1074,17 +1103,23 @@ class LobuleSegmentor(BaseOperator):
                 on_confirm=on_confirm,
                 on_back=on_back,
                 on_reset=on_reset,
+                on_abort=on_abort,
                 include_update=True,
                 include_confirm=True,
                 include_back=True,
                 include_reset=True,
+                include_abort=True,
                 update_text="Preview / Update",
                 confirm_text="Confirm and continue",
                 back_text="Back",
                 reset_text="Reset vessel detection params",
+                abort_text="ABORT",
             )
 
             napari.run()
+
+            if nav["action"] == "abort":
+                raise PipelineAbort()
 
             if nav["action"] == "back":
                 raise PipelineBack(2)
@@ -1593,7 +1628,7 @@ class LobuleSegmentor(BaseOperator):
                 # re-run with defaults (same as pressing Change)
                 vessel_controls()
 
-            nav = {"action": None}  # "confirm" | "back" | None (closed)
+            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
             def on_confirm() -> None:
                 nav["action"] = "confirm"
@@ -1601,6 +1636,10 @@ class LobuleSegmentor(BaseOperator):
 
             def on_back() -> None:
                 nav["action"] = "back"
+                viewer.close()
+
+            def on_abort() -> None:
+                nav["action"] = "abort"
                 viewer.close()
 
             # Keep the "Change (recalculate vessels)" button inside `vessel_controls`
@@ -1611,16 +1650,22 @@ class LobuleSegmentor(BaseOperator):
                 on_confirm=on_confirm,
                 on_back=on_back,
                 on_reset=on_reset,
+                on_abort=on_abort,
                 include_update=False,
                 include_confirm=True,
                 include_back=True,
                 include_reset=True,
+                include_abort=True,
                 confirm_text="Confirm and continue",
                 back_text="Back",
                 reset_text="Reset vessel params",
+                abort_text="ABORT",
             )
 
             napari.run()
+
+            if nav["action"] == "abort":
+                raise PipelineAbort()
 
             if nav["action"] == "back":
                 # classification back should return to the previous vessel UI
@@ -1769,6 +1814,9 @@ class LobuleSegmentor(BaseOperator):
                         require_confirm=self.confirm,
                         return_action=True,
                     )
+                    if action == "abort":
+                        console.print("Aborted by user. No segmentation performed.", style="error")
+                        return self.metadata
                     if action == "back":
                         console.print("Aborted by user. No segmentation performed.", style="error")
                         return self.metadata
@@ -1804,6 +1852,9 @@ class LobuleSegmentor(BaseOperator):
                 # Interactive weighting preview
                 if self.interactive_weighting:
                     action = self._preview_channel_weighting(img_stack, return_action=True)
+                    if action == "abort":
+                        console.print("Aborted by user. No segmentation performed.", style="error")
+                        return self.metadata
                     if action == "back":
                         console.print("Moving back to preprocessing preview...", style="warning")
                         step = 0
@@ -1835,6 +1886,10 @@ class LobuleSegmentor(BaseOperator):
                         region_size=self.region_size,
                         report_path=report_path,
                     )
+
+                except PipelineAbort:
+                    console.print("Aborted by user. No segmentation performed.", style="error")
+                    return self.metadata
 
                 except PipelineBack as e:
                     # All Back buttons in the vessel/final previews map here.

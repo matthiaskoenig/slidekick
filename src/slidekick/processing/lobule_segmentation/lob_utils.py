@@ -467,14 +467,17 @@ def add_napari_controls_dock(
     on_confirm: Optional[Callable[[], None]] = None,
     on_back: Optional[Callable[[], None]] = None,
     on_reset: Optional[Callable[[], None]] = None,
+    on_abort: Optional[Callable[[], None]] = None,
     update_text: str = "Preview / Update",
     confirm_text: str = "Confirm and continue",
     back_text: str = "Back",
     reset_text: str = "Reset to defaults",
+    abort_text: str = "ABORT",
     include_update: bool = True,
     include_confirm: bool = True,
     include_back: bool = False,
     include_reset: bool = False,
+    include_abort: bool = False,
     dock_area: str = "right",
 ) -> Dict[str, Any]:
     """
@@ -584,6 +587,12 @@ def add_napari_controls_dock(
         widgets.append(reset_btn)
         out["reset"] = reset_btn
 
+    if include_abort:
+        abort_btn = PushButton(text=str(abort_text))
+        _wire_button(abort_btn, on_abort)
+        widgets.append(abort_btn)
+        out["abort"] = abort_btn
+
     dock = Container(widgets=widgets, layout="vertical")
     viewer.window.add_dock_widget(dock, area=str(dock_area))
     return out
@@ -597,8 +606,10 @@ def preview_images_napari(
     return_action: bool = False,
     include_confirm: bool = True,
     include_back: bool = False,
+    include_abort: bool = False,
     confirm_text: str = "Confirm",
     back_text: str = "Back",
+    abort_text: str = "ABORT",
     dock_area: str = "right",
 ) -> Optional[str]:
     """
@@ -607,8 +618,8 @@ def preview_images_napari(
     Images are downsampled (max side 2048 px) for responsiveness.
 
     New (optional) behavior:
-      - Can show Confirm/Back buttons in a dock.
-      - Can return an action string in {"confirm", "back", "closed"}.
+      - Can show Confirm/Back/Abort buttons in a dock.
+      - Can return an action string in {"confirm", "back", "abort", "closed"}.
 
     Parameters
     ----------
@@ -616,11 +627,11 @@ def preview_images_napari(
         If True, closing the viewer without pressing Confirm returns "closed".
         If False, closing the viewer maps to "confirm".
     return_action:
-        If True, return one of {"confirm","back","closed"}.
+        If True, return one of {"confirm","back","abort","closed"}.
         If False, preserve legacy behavior and return None.
-    include_confirm / include_back:
-        Toggle whether to show Confirm/Back buttons.
-    confirm_text / back_text:
+    include_confirm / include_back / include_abort:
+        Toggle whether to show Confirm/Back/Abort buttons.
+    confirm_text / back_text / abort_text:
         Button labels.
     dock_area:
         Napari dock area; usually "right".
@@ -644,7 +655,7 @@ def preview_images_napari(
             viewer.add_image(im, name=name)
 
     # Navigation result
-    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | None (closed)
+    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
     def on_confirm() -> None:
         nav["action"] = "confirm"
@@ -654,22 +665,29 @@ def preview_images_napari(
         nav["action"] = "back"
         viewer.close()
 
+    def on_abort() -> None:
+        nav["action"] = "abort"
+        viewer.close()
+
     # Minimal "controls" widget so we can reuse the shared dock builder.
     # (Keeps UI consistent across previews.)
     controls_stub = Label(value="")
 
-    if include_confirm or include_back:
+    if include_confirm or include_back or include_abort:
         add_napari_controls_dock(
             viewer,
             controls_stub,
             on_confirm=on_confirm if include_confirm else None,
             on_back=on_back if include_back else None,
+            on_abort=on_abort if include_abort else None,
             include_update=False,
             include_confirm=bool(include_confirm),
             include_back=bool(include_back),
             include_reset=False,
+            include_abort=bool(include_abort),
             confirm_text=str(confirm_text),
             back_text=str(back_text),
+            abort_text=str(abort_text),
             dock_area=str(dock_area),
         )
 
