@@ -468,20 +468,28 @@ def add_napari_controls_dock(
     on_back: Optional[Callable[[], None]] = None,
     on_reset: Optional[Callable[[], None]] = None,
     on_abort: Optional[Callable[[], None]] = None,
-    update_text: str = "Preview / Update",
-    confirm_text: str = "Confirm and continue",
+    update_text: str = "Preview/Recalculate",
+    confirm_text: str = "Confirm and Continue",
     back_text: str = "Back",
-    reset_text: str = "Reset to defaults",
-    abort_text: str = "ABORT",
+    reset_text: str = "Reset Parameters",
+    abort_text: str = "Abort",
     include_update: bool = True,
     include_confirm: bool = True,
-    include_back: bool = False,
-    include_reset: bool = False,
-    include_abort: bool = False,
+    include_back: bool = True,
+    include_reset: bool = True,
+    include_abort: bool = True,
     dock_area: str = "right",
 ) -> Dict[str, Any]:
     """
     Unify napari preview UI wiring across the codebase.
+
+    Default button set (in this exact order)
+    ----------------------------------------
+      1) Preview/Recalculate
+      2) Confirm and Continue
+      3) Back
+      4) Reset Parameters
+      5) Abort
 
     Notes on environment compatibility
     ---------------------------------
@@ -563,6 +571,7 @@ def add_napari_controls_dock(
     widgets = [controls_widget]
     out: Dict[str, Any] = {}
 
+    # IMPORTANT: keep button order stable across ALL previews.
     if include_update:
         update_btn = PushButton(text=str(update_text))
         _wire_button(update_btn, on_update)
@@ -606,10 +615,10 @@ def preview_images_napari(
     return_action: bool = False,
     include_confirm: bool = True,
     include_back: bool = False,
-    include_abort: bool = False,
-    confirm_text: str = "Confirm",
+    include_abort: bool = True,
+    confirm_text: str = "Confirm and Continue",
     back_text: str = "Back",
-    abort_text: str = "ABORT",
+    abort_text: str = "Abort",
     dock_area: str = "right",
 ) -> Optional[str]:
     """
@@ -617,9 +626,11 @@ def preview_images_napari(
 
     Images are downsampled (max side 2048 px) for responsiveness.
 
-    New (optional) behavior:
-      - Can show Confirm/Back/Abort buttons in a dock.
-      - Can return an action string in {"confirm", "back", "abort", "closed"}.
+    Behavior
+    --------
+      - Always uses the unified 5-button dock:
+          Preview/Recalculate, Confirm and Continue, Back, Reset Parameters, Abort
+      - Returns an action string in {"confirm", "back", "abort", "closed"} if return_action=True.
 
     Parameters
     ----------
@@ -630,7 +641,8 @@ def preview_images_napari(
         If True, return one of {"confirm","back","abort","closed"}.
         If False, preserve legacy behavior and return None.
     include_confirm / include_back / include_abort:
-        Toggle whether to show Confirm/Back/Abort buttons.
+        Still supported for call-site compatibility, but the dock always shows all five buttons.
+        If a callback is not enabled, the button is wired as a no-op.
     confirm_text / back_text / abort_text:
         Button labels.
     dock_area:
@@ -645,17 +657,32 @@ def preview_images_napari(
     thumbs = [downsample_to_max_side(np.asarray(im), 2048) for im in images]
     viewer = napari.Viewer()
 
+    layers = []
     for idx, im in enumerate(thumbs):
         name = str(titles[idx]) if titles and idx < len(titles) else f"Layer_{idx}"
         if im.ndim == 2:
-            viewer.add_image(im, name=name, colormap="gray")
+            layers.append(viewer.add_image(im, name=name, colormap="gray"))
         elif im.ndim == 3 and im.shape[-1] in (3, 4):
-            viewer.add_image(im, name=name, rgb=True)
+            layers.append(viewer.add_image(im, name=name, rgb=True))
         else:
-            viewer.add_image(im, name=name)
+            layers.append(viewer.add_image(im, name=name))
 
     # Navigation result
     nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
+
+    def on_update() -> None:
+        # No parameters to recompute here; treat as a "refresh" button for consistency.
+        try:
+            viewer.reset_view()
+        except Exception:
+            pass
+
+    def on_reset() -> None:
+        # No parameters to reset; treat as a view reset.
+        try:
+            viewer.reset_view()
+        except Exception:
+            pass
 
     def on_confirm() -> None:
         nav["action"] = "confirm"
@@ -670,26 +697,28 @@ def preview_images_napari(
         viewer.close()
 
     # Minimal "controls" widget so we can reuse the shared dock builder.
-    # (Keeps UI consistent across previews.)
     controls_stub = Label(value="")
 
-    if include_confirm or include_back or include_abort:
-        add_napari_controls_dock(
-            viewer,
-            controls_stub,
-            on_confirm=on_confirm if include_confirm else None,
-            on_back=on_back if include_back else None,
-            on_abort=on_abort if include_abort else None,
-            include_update=False,
-            include_confirm=bool(include_confirm),
-            include_back=bool(include_back),
-            include_reset=False,
-            include_abort=bool(include_abort),
-            confirm_text=str(confirm_text),
-            back_text=str(back_text),
-            abort_text=str(abort_text),
-            dock_area=str(dock_area),
-        )
+    add_napari_controls_dock(
+        viewer,
+        controls_stub,
+        on_update=on_update,
+        on_confirm=on_confirm if include_confirm else None,
+        on_back=on_back if include_back else None,
+        on_reset=on_reset,
+        on_abort=on_abort if include_abort else None,
+        include_update=True,
+        include_confirm=True,
+        include_back=True,
+        include_reset=True,
+        include_abort=True,
+        update_text="Preview/Recalculate",
+        confirm_text=str(confirm_text),
+        back_text=str(back_text),
+        reset_text="Reset Parameters",
+        abort_text=str(abort_text),
+        dock_area=str(dock_area),
+    )
 
     napari.run()
 
@@ -700,4 +729,3 @@ def preview_images_napari(
     if action is None:
         action = "confirm" if not require_confirm else "closed"
     return action
-

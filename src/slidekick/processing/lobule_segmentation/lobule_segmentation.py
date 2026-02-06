@@ -373,11 +373,13 @@ class LobuleSegmentor(BaseOperator):
                 )
             )
 
-        pending = {
+        defaults = {
             "level": int(default_level),
             "bg": int(self.bg_low_val),
             "clahe": int(self.clahe_bg_suppress),
         }
+
+        pending = dict(defaults)
 
         confirmed = {"ok": False}
         nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
@@ -414,6 +416,15 @@ class LobuleSegmentor(BaseOperator):
         def on_update() -> None:
             _apply_update()
 
+        def on_reset() -> None:
+            pending.update(defaults)
+
+            controls.preview_level.value = int(defaults["level"])
+            controls.bg_low_val.value = int(defaults["bg"])
+            controls.clahe_bg_suppress.value = int(defaults["clahe"])
+
+            _apply_update()
+
         def on_confirm() -> None:
             _apply_update()
             confirmed["ok"] = True
@@ -435,16 +446,18 @@ class LobuleSegmentor(BaseOperator):
             on_update=on_update,
             on_confirm=on_confirm,
             on_back=on_back,
+            on_reset=on_reset,
             on_abort=on_abort,
             include_update=True,
             include_confirm=True,
             include_back=True,
-            include_reset=False,
+            include_reset=True,
             include_abort=True,
-            update_text="Preview / Update",
-            confirm_text="Confirm",
+            update_text="Preview/Recalculate",
+            confirm_text="Confirm and Continue",
             back_text="Back",
-            abort_text="ABORT",
+            reset_text="Reset Parameters",
+            abort_text="Abort",
         )
 
         napari.run()
@@ -662,11 +675,11 @@ class LobuleSegmentor(BaseOperator):
             include_back=True,
             include_reset=True,
             include_abort=True,
-            update_text="Preview / Update",
-            confirm_text="Confirm and continue",
+            update_text="Preview/Recalculate",
+            confirm_text="Confirm and Continue",
             back_text="Back",
-            reset_text="Reset to defaults",
-            abort_text="ABORT",
+            reset_text="Reset Parameters",
+            abort_text="Abort",
         )
 
         napari.run()
@@ -962,178 +975,10 @@ class LobuleSegmentor(BaseOperator):
                     out[cc_lab == cc_id] = False
             return out
 
-        if self.interactive_vessels:
-            stored_vals = [
-                self.vessel_pct_low,
-                self.vessel_pct_superpixel_frac,
-                int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
-            ]
-
-            fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
-                self.vessel_pct_low,
-                self.vessel_pct_superpixel_frac,
-            )
-
-            base_gray = image_stack.mean(axis=2).astype(np.uint8)
-            viewer = napari.Viewer()
-            base_layer = viewer.add_image(
-                base_gray,
-                name="base_gray",
-                colormap="gray",
-                blending="translucent",
-            )
-
-            hole_preview = holes_from_fg_mask(fg_pix_mask, border_exclude=border_bg_px)
-            hole_preview = _filter_small_holes_px(
-                hole_preview,
-                int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
-            )
-
-            # Keep ONLY the hole-based overlay.
-            # This is the one that matches the later contour-based vessel candidate extraction
-            # (candidates are punched out of the FG mask and appear as holes).
-            vessel_layer = viewer.add_image(
-                bool_mask_to_uint8(hole_preview),
-                name="vessel candidates (holes)",
-                colormap="cyan",
-                opacity=1.0,
-                blending="additive",
-            )
-
-            pending = {
-                "vessel_pct_low": float(self.vessel_pct_low),
-                "vessel_pct_superpixel_frac": float(self.vessel_pct_superpixel_frac),
-                "min_vessel_area": int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
-            }
-
-            @magicgui(
-                layout="vertical",
-                auto_call=True,  # stage values on change
-                # NOTE: this is an ABSOLUTE intensity threshold on per-pixel mean (0..255), not a percent.
-                vessel_pct_low={"min": 0.0, "max": 255.0, "step": 1.0},
-                vessel_pct_superpixel_frac={"min": 0.0, "max": 1.0, "step": 0.01},
-                min_vessel_area={"min": 0, "max": 20000, "step": 50},
-            )
-            def vessel_controls(
-                    vessel_pct_low: float = self.vessel_pct_low,
-                    vessel_pct_superpixel_frac: float = self.vessel_pct_superpixel_frac,
-                    min_vessel_area: int = int(min(self.min_vessel_area_pp, self.min_vessel_area_pv)),
-            ):
-                pending["vessel_pct_low"] = float(vessel_pct_low)
-                pending["vessel_pct_superpixel_frac"] = float(vessel_pct_superpixel_frac)
-                pending["min_vessel_area"] = int(min_vessel_area)
-
-            def _apply_vessel_candidate_update() -> None:
-                # Commit staged values to object state
-                self.vessel_pct_low = float(pending["vessel_pct_low"])
-                self.vessel_pct_superpixel_frac = float(pending["vessel_pct_superpixel_frac"])
-                min_area_int = int(pending["min_vessel_area"])
-                self.min_vessel_area_pp = min_area_int
-                self.min_vessel_area_pv = min_area_int
-
-                # Recompute masks with current settings
-                _, _, fg_pix_mask_local, vessel_pix_mask_local = compute_fg_masks(
-                    self.vessel_pct_low,
-                    self.vessel_pct_superpixel_frac,
-                )
-
-                # IMPORTANT: keep border exclusion consistent with the initial preview
-                hole_preview_local = holes_from_fg_mask(
-                    fg_pix_mask_local,
-                    border_exclude=border_bg_px,
-                )
-
-                # Filter *visible* cyan holes by pixel area (what the UI knob suggests)
-                hole_preview_local = _filter_small_holes_px(hole_preview_local, min_area_int)
-
-                # Update preview layer (single source of truth)
-                vessel_layer.data = bool_mask_to_uint8(hole_preview_local)
-                try:
-                    vessel_layer.refresh()
-                except Exception:
-                    pass
-
-                console.print(
-                    "Updated vessel candidates: "
-                    f"gray_thr={self.vessel_pct_low:.1f}, "
-                    f"sp_dark_frac>={self.vessel_pct_superpixel_frac:.2f}, "
-                    f"min_area_px={min_area_int} | "
-                    f"holes_px={int(np.count_nonzero(hole_preview_local))}, "
-                    f"cand_px={int(np.count_nonzero(vessel_pix_mask_local))}",
-                    style="info",
-                )
-
-            def on_reset() -> None:
-                self.vessel_pct_low = stored_vals[0]
-                self.vessel_pct_superpixel_frac = stored_vals[1]
-                min_area_int = int(stored_vals[2])
-                self.min_vessel_area_pp = min_area_int
-                self.min_vessel_area_pv = min_area_int
-
-                pending["vessel_pct_low"] = float(self.vessel_pct_low)
-                pending["vessel_pct_superpixel_frac"] = float(self.vessel_pct_superpixel_frac)
-                pending["min_vessel_area"] = int(min_area_int)
-
-                vessel_controls.vessel_pct_low.value = float(self.vessel_pct_low)
-                vessel_controls.vessel_pct_superpixel_frac.value = float(self.vessel_pct_superpixel_frac)
-                vessel_controls.min_vessel_area.value = int(min_area_int)
-
-                _apply_vessel_candidate_update()
-
-            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
-
-            def on_confirm() -> None:
-                _apply_vessel_candidate_update()
-                nav["action"] = "confirm"
-                viewer.close()
-
-            def on_back() -> None:
-                _apply_vessel_candidate_update()
-                nav["action"] = "back"
-                viewer.close()
-
-            def on_abort() -> None:
-                nav["action"] = "abort"
-                viewer.close()
-
-            add_napari_controls_dock(
-                viewer,
-                vessel_controls,
-                on_update=_apply_vessel_candidate_update,
-                on_confirm=on_confirm,
-                on_back=on_back,
-                on_reset=on_reset,
-                on_abort=on_abort,
-                include_update=True,
-                include_confirm=True,
-                include_back=True,
-                include_reset=True,
-                include_abort=True,
-                update_text="Preview / Update",
-                confirm_text="Confirm and continue",
-                back_text="Back",
-                reset_text="Reset vessel detection params",
-                abort_text="ABORT",
-            )
-
-            napari.run()
-
-            if nav["action"] == "abort":
-                raise PipelineAbort()
-
-            if nav["action"] == "back":
-                raise PipelineBack(2)
-
-            fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
-                self.vessel_pct_low,
-                self.vessel_pct_superpixel_frac,
-            )
-
-        else:
-            fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
-                self.vessel_pct_low,
-                self.vessel_pct_superpixel_frac,
-            )
+        fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
+            self.vessel_pct_low,
+            self.vessel_pct_superpixel_frac,
+        )
 
         # Precompute hole candidates ONCE and reuse everywhere.
         # This ensures interactive preview == report outputs == later vessel classification candidates.
@@ -1164,12 +1009,6 @@ class LobuleSegmentor(BaseOperator):
             )
 
             # 2) hole-based candidates (topology stage; matches vessel contour candidate concept)
-            # IMPORTANT: this must match what the user sees in the cyan preview AND what is later eligible for classification.
-            cv2.imwrite(
-                str(report_path / "vessel_candidates_holes.png"),
-                bool_mask_to_uint8(vessel_candidate_holes),
-            )
-
             # Optional debug: raw (unfiltered) holes implied by fg_pix_mask
             cv2.imwrite(
                 str(report_path / "vessel_candidates_holes_raw.png"),
@@ -1293,7 +1132,7 @@ class LobuleSegmentor(BaseOperator):
                 vessel_zone_ratio_thr_pp: float,
                 vessel_zone_ratio_thr_pv: float,
                 vessel_circularity_min: float,
-        ) -> Tuple[np.ndarray, List[int], List[np.ndarray]]:
+        ) -> Tuple[np.ndarray, List[int], List[np.ndarray], List[np.ndarray]]:
             """
             Run vessel detection and superpixel reassignment on top of the
             fixed SLIC + KMeans result.
@@ -1310,6 +1149,9 @@ class LobuleSegmentor(BaseOperator):
                 One entry per contour, 0 for PV, 1 for PP.
             vessel_contours : list of np.ndarray
                 Contours corresponding to detected vessels.
+            rejected_contours : list of np.ndarray
+                Contours that were considered but rejected by gating (zone, size, nesting, etc.).
+                This is intended for interactive QA/preview only.
             """
             H, W, _ = image_stack.shape
 
@@ -1321,6 +1163,7 @@ class LobuleSegmentor(BaseOperator):
             # 4) Vessel detection and superpixel reassignment
             vessel_classes: List[int] = []
             vessel_contours: List[np.ndarray] = []
+            rejected_contours: List[np.ndarray] = []
 
             k = max(1, int(vessel_annulus_px))
             se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
@@ -1438,6 +1281,7 @@ class LobuleSegmentor(BaseOperator):
                 ring_eligible = ring_bool & ~(ring_mid | ring_bg)
                 eligible_n = int(np.count_nonzero(ring_eligible))
                 if eligible_n == 0:
+                    rejected_contours.append(cnt)
                     continue
 
                 pp_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pp)))
@@ -1448,6 +1292,7 @@ class LobuleSegmentor(BaseOperator):
                 pp_pass = pp_frac >= float(vessel_zone_ratio_thr_pp)
                 pv_pass = pv_frac >= float(vessel_zone_ratio_thr_pv)
                 if not (pp_pass or pv_pass):
+                    rejected_contours.append(cnt)
                     continue
 
                 if pp_pass and (not pv_pass or pp_frac >= pv_frac):
@@ -1456,6 +1301,15 @@ class LobuleSegmentor(BaseOperator):
                 else:
                     cls = 0
                     zone_idx = idx_pv
+
+                # Class-specific minimum size:
+                # PP uses min_vessel_area_pp, PV uses min_vessel_area_pv.
+                if cls == 1 and float(area_c) < float(min_vessel_area_pp):
+                    rejected_contours.append(cnt)
+                    continue
+                if cls == 0 and float(area_c) < float(min_vessel_area_pv):
+                    rejected_contours.append(cnt)
+                    continue
 
                 # No nesting (centroid inside an existing kept contour of ANY class)
                 M = cv2.moments(cnt)
@@ -1472,6 +1326,7 @@ class LobuleSegmentor(BaseOperator):
                         nested = True
                         break
                 if nested:
+                    rejected_contours.append(cnt)
                     continue
 
                 kept_items.append((hole_bool, cnt, cls, zone_idx, ring_bool))
@@ -1492,7 +1347,7 @@ class LobuleSegmentor(BaseOperator):
                     lut_local[sid] = int(cid)
             cluster_map_final = lut_local[labels].astype(np.int32)
 
-            return cluster_map_final, vessel_classes, vessel_contours
+            return cluster_map_final, vessel_classes, vessel_contours, rejected_contours
 
         # remember current vessel params as defaults for this run
         defaults = dict(
@@ -1505,17 +1360,7 @@ class LobuleSegmentor(BaseOperator):
         )
 
         if self.interactive_vessels:
-            # initial run with current parameters (reuses SLIC + KMeans result)
-            cluster_map_prev, vessel_classes_prev, vessel_contours_prev = run_vessel_detection(
-                self.min_vessel_area_pp,
-                self.min_vessel_area_pv,
-                self.vessel_annulus_px,
-                self.vessel_zone_ratio_thr_pp,
-                self.vessel_zone_ratio_thr_pv,
-                self.vessel_circularity_min,
-            )
-
-            # base image and helper for overlay
+            # base image (for the bottom grayscale layer)
             base_vis = image_stack.mean(axis=2).astype(np.uint8)
             base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
 
@@ -1523,10 +1368,17 @@ class LobuleSegmentor(BaseOperator):
             COLOR_MID = (60, 160, 60)
             COLOR_PV = (0, 165, 255)
 
-            def make_overlay(cm_local: np.ndarray,
-                             vclasses_local: List[int],
-                             vcontours_local: List[np.ndarray]) -> np.ndarray:
-                """""Build zonation + vessel overlay as RGB image."""
+            # Stage parameters (magicgui only stages; computation only on Preview/Recalculate)
+            pending = dict(
+                min_vessel_area_pp=int(self.min_vessel_area_pp),
+                min_vessel_area_pv=int(self.min_vessel_area_pv),
+                vessel_annulus_px=int(self.vessel_annulus_px),
+                vessel_zone_ratio_thr_pp=float(self.vessel_zone_ratio_thr_pp),
+                vessel_zone_ratio_thr_pv=float(self.vessel_zone_ratio_thr_pv),
+                vessel_circularity_min=float(self.vessel_circularity_min),
+            )
+
+            def _make_zonation_rgb(cm_local: np.ndarray) -> np.ndarray:
                 zon_rgb = np.zeros_like(base_rgb, dtype=np.uint8)
 
                 mask_pp = (cm_local == idx_pp) & fg_pix_mask
@@ -1540,51 +1392,64 @@ class LobuleSegmentor(BaseOperator):
                 zon_rgb[mask_mid] = COLOR_MID
                 zon_rgb[mask_pv] = COLOR_PV
 
-                ov_bgr = cv2.addWeighted(base_rgb, 0.6, zon_rgb, 0.4, 0.0)
+                return cv2.cvtColor(zon_rgb, cv2.COLOR_BGR2RGB)
+
+            def _draw_inner_border_bgr(
+                    canvas_bgr: np.ndarray,
+                    cnt: np.ndarray,
+                    color_bgr: Tuple[int, int, int],
+                    border_px: int = 4,
+            ) -> None:
+                """
+                Draw a contour border that grows *inward* (towards the vessel interior).
+
+                Why:
+                  cv2.drawContours(thickness=k) is centered on the contour and grows both in/out.
+                  For vessel QA, we want more thickness on the inside so edges stay readable without
+                  obscuring surrounding zonation.
+
+                Implementation:
+                  1) rasterize filled contour into a binary mask
+                  2) erode mask by `border_px`
+                  3) inner_border = filled - eroded (a band fully inside the contour)
+                  4) paint inner_border pixels into the canvas
+                """
+                bp = int(max(1, border_px))
+
+                tmp = np.zeros(canvas_bgr.shape[:2], dtype=np.uint8)
+                cv2.drawContours(tmp, [cnt], -1, 255, thickness=cv2.FILLED)
+
+                k = 3  # small kernel -> stable inward border
+                se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                er = cv2.erode(tmp, se, iterations=bp)
+
+                inner = (tmp > 0) & (er == 0)
+                canvas_bgr[inner] = color_bgr
+
+            def _make_discarded_rgb(rejected_contours_local: List[np.ndarray]) -> np.ndarray:
+                out = np.zeros_like(base_rgb, dtype=np.uint8)
+                for cnt in rejected_contours_local:
+                    _draw_inner_border_bgr(out, cnt, (0, 0, 255), border_px=4)  # red in BGR
+                return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+
+            def _make_used_rgb(vcontours_local: List[np.ndarray], vclasses_local: List[int]) -> np.ndarray:
+                out = np.zeros_like(base_rgb, dtype=np.uint8)
                 for cnt, cls in zip(vcontours_local, vclasses_local):
-                    # central (PV) = yellow, portal (PP) = magenta
+                    # PV -> cyan (BGR yellow becomes RGB cyan after conversion), PP -> magenta
                     color = (255, 255, 0) if cls == 0 else (255, 0, 255)
-                    cv2.drawContours(ov_bgr, [cnt], -1, color, thickness=2)
+                    _draw_inner_border_bgr(out, cnt, color, border_px=4)
+                return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
-                return cv2.cvtColor(ov_bgr, cv2.COLOR_BGR2RGB)
+            def _apply_pending_to_self() -> None:
+                self.min_vessel_area_pp = int(pending["min_vessel_area_pp"])
+                self.min_vessel_area_pv = int(pending["min_vessel_area_pv"])
+                self.vessel_annulus_px = int(pending["vessel_annulus_px"])
+                self.vessel_zone_ratio_thr_pp = float(pending["vessel_zone_ratio_thr_pp"])
+                self.vessel_zone_ratio_thr_pv = float(pending["vessel_zone_ratio_thr_pv"])
+                self.vessel_circularity_min = float(pending["vessel_circularity_min"])
 
-            overlay_rgb = make_overlay(cluster_map_prev, vessel_classes_prev, vessel_contours_prev)
-
-            viewer = napari.Viewer()
-            overlay_layer = viewer.add_image(
-                overlay_rgb,
-                name="Zonation + vessels (preview)",
-                rgb=True,
-                blending="translucent",
-            )
-
-            # sliders + a single "Change" button created by magicgui
-            @magicgui(
-                layout="vertical",
-                auto_call=False,
-                call_button="Change (recalculate vessels)",  # rename magicgui's Run button
-                min_vessel_area_pp={"min": 0, "max": 10000, "step": 50},
-                min_vessel_area_pv={"min": 0, "max": 10000, "step": 50},
-                vessel_annulus_px={"min": 1, "max": 100, "step": 1},
-                vessel_zone_ratio_thr_pp={"min": 0.0, "max": 1.0, "step": 0.01},
-                vessel_zone_ratio_thr_pv={"min": 0.0, "max": 1.0, "step": 0.01},
-                vessel_circularity_min={"min": 0.0, "max": 1.0, "step": 0.01},
-            )
-            def vessel_controls(
-                    min_vessel_area_pp: int = self.min_vessel_area_pp,
-                    min_vessel_area_pv: int = self.min_vessel_area_pv,
-                    vessel_annulus_px: int = self.vessel_annulus_px,
-                    vessel_zone_ratio_thr_pp: float = self.vessel_zone_ratio_thr_pp,
-                    vessel_zone_ratio_thr_pv: float = self.vessel_zone_ratio_thr_pv,
-                    vessel_circularity_min: float = self.vessel_circularity_min,
-            ):
-                # push values from GUI into object state
-                self.min_vessel_area_pp = int(min_vessel_area_pp)
-                self.min_vessel_area_pv = int(min_vessel_area_pv)
-                self.vessel_annulus_px = int(vessel_annulus_px)
-                self.vessel_zone_ratio_thr_pp = float(vessel_zone_ratio_thr_pp)
-                self.vessel_zone_ratio_thr_pv = float(vessel_zone_ratio_thr_pv)
-                self.vessel_circularity_min = float(vessel_circularity_min)
+            def _recompute_and_update_layers() -> None:
+                _apply_pending_to_self()
 
                 console.print(
                     "Updated vessel gating params: "
@@ -1597,8 +1462,7 @@ class LobuleSegmentor(BaseOperator):
                     style="info",
                 )
 
-                # recompute vessels only
-                cm_local, vclasses_local, vcontours_local = run_vessel_detection(
+                cm_local, vclasses_local, vcontours_local, rejected_local = run_vessel_detection(
                     self.min_vessel_area_pp,
                     self.min_vessel_area_pv,
                     self.vessel_annulus_px,
@@ -1606,7 +1470,85 @@ class LobuleSegmentor(BaseOperator):
                     self.vessel_zone_ratio_thr_pv,
                     self.vessel_circularity_min,
                 )
-                overlay_layer.data = make_overlay(cm_local, vclasses_local, vcontours_local)
+
+                zon_layer.data = _make_zonation_rgb(cm_local)
+                disc_layer.data = _make_discarded_rgb(rejected_local)
+                used_layer.data = _make_used_rgb(vcontours_local, vclasses_local)
+
+            # initial run
+            cm0, vcls0, vcnt0, rej0 = run_vessel_detection(
+                self.min_vessel_area_pp,
+                self.min_vessel_area_pv,
+                self.vessel_annulus_px,
+                self.vessel_zone_ratio_thr_pp,
+                self.vessel_zone_ratio_thr_pv,
+                self.vessel_circularity_min,
+            )
+
+            viewer = napari.Viewer()
+
+            # Required layer order (back -> front):
+            # greyscale, zonation, discarded (red), used (cyan/magenta)
+            viewer.add_image(
+                base_vis,
+                name="Greyscale",
+                colormap="gray",
+                blending="translucent",
+            )
+
+            zon_layer = viewer.add_image(
+                _make_zonation_rgb(cm0),
+                name="Zonation",
+                rgb=True,
+                blending="additive",
+                opacity=0.35,
+            )
+
+            disc_layer = viewer.add_image(
+                _make_discarded_rgb(rej0),
+                name="Discarded vessels (red)",
+                rgb=True,
+                blending="additive",
+                opacity=1.0,
+            )
+
+            used_layer = viewer.add_image(
+                _make_used_rgb(vcnt0, vcls0),
+                name="Used vessels (cyan/magenta)",
+                rgb=True,
+                blending="additive",
+                opacity=1.0,
+            )
+
+            @magicgui(
+                layout="vertical",
+                auto_call=True,  # stage values only; NO computation here
+                min_vessel_area_pp={"min": 0, "max": 10000, "step": 50},
+                min_vessel_area_pv={"min": 0, "max": 10000, "step": 50},
+                vessel_annulus_px={"min": 1, "max": 100, "step": 1},
+                vessel_zone_ratio_thr_pp={"min": 0.0, "max": 1.0, "step": 0.01},
+                vessel_zone_ratio_thr_pv={"min": 0.0, "max": 1.0, "step": 0.01},
+                vessel_circularity_min={"min": 0.0, "max": 1.0, "step": 0.01},
+            )
+            def vessel_controls(
+                    min_vessel_area_pp: int = int(self.min_vessel_area_pp),
+                    min_vessel_area_pv: int = int(self.min_vessel_area_pv),
+                    vessel_annulus_px: int = int(self.vessel_annulus_px),
+                    vessel_zone_ratio_thr_pp: float = float(self.vessel_zone_ratio_thr_pp),
+                    vessel_zone_ratio_thr_pv: float = float(self.vessel_zone_ratio_thr_pv),
+                    vessel_circularity_min: float = float(self.vessel_circularity_min),
+            ):
+                pending["min_vessel_area_pp"] = int(min_vessel_area_pp)
+                pending["min_vessel_area_pv"] = int(min_vessel_area_pv)
+                pending["vessel_annulus_px"] = int(vessel_annulus_px)
+                pending["vessel_zone_ratio_thr_pp"] = float(vessel_zone_ratio_thr_pp)
+                pending["vessel_zone_ratio_thr_pv"] = float(vessel_zone_ratio_thr_pv)
+                pending["vessel_circularity_min"] = float(vessel_circularity_min)
+
+            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
+
+            def on_update() -> None:
+                _recompute_and_update_layers()
 
             def on_reset() -> None:
                 # restore defaults in self
@@ -1617,6 +1559,14 @@ class LobuleSegmentor(BaseOperator):
                 self.vessel_zone_ratio_thr_pv = defaults["vessel_zone_ratio_thr_pv"]
                 self.vessel_circularity_min = defaults["vessel_circularity_min"]
 
+                # restore staged values
+                pending["min_vessel_area_pp"] = int(self.min_vessel_area_pp)
+                pending["min_vessel_area_pv"] = int(self.min_vessel_area_pv)
+                pending["vessel_annulus_px"] = int(self.vessel_annulus_px)
+                pending["vessel_zone_ratio_thr_pp"] = float(self.vessel_zone_ratio_thr_pp)
+                pending["vessel_zone_ratio_thr_pv"] = float(self.vessel_zone_ratio_thr_pv)
+                pending["vessel_circularity_min"] = float(self.vessel_circularity_min)
+
                 # restore GUI values
                 vessel_controls.min_vessel_area_pp.value = defaults["min_vessel_area_pp"]
                 vessel_controls.min_vessel_area_pv.value = defaults["min_vessel_area_pv"]
@@ -1625,16 +1575,15 @@ class LobuleSegmentor(BaseOperator):
                 vessel_controls.vessel_zone_ratio_thr_pv.value = defaults["vessel_zone_ratio_thr_pv"]
                 vessel_controls.vessel_circularity_min.value = defaults["vessel_circularity_min"]
 
-                # re-run with defaults (same as pressing Change)
-                vessel_controls()
-
-            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
+                _recompute_and_update_layers()
 
             def on_confirm() -> None:
+                _recompute_and_update_layers()
                 nav["action"] = "confirm"
                 viewer.close()
 
             def on_back() -> None:
+                _recompute_and_update_layers()
                 nav["action"] = "back"
                 viewer.close()
 
@@ -1642,24 +1591,24 @@ class LobuleSegmentor(BaseOperator):
                 nav["action"] = "abort"
                 viewer.close()
 
-            # Keep the "Change (recalculate vessels)" button inside `vessel_controls`
-            # (auto_call=False), and add Confirm/Back/Reset here.
             add_napari_controls_dock(
                 viewer,
                 vessel_controls,
+                on_update=on_update,
                 on_confirm=on_confirm,
                 on_back=on_back,
                 on_reset=on_reset,
                 on_abort=on_abort,
-                include_update=False,
+                include_update=True,
                 include_confirm=True,
                 include_back=True,
                 include_reset=True,
                 include_abort=True,
-                confirm_text="Confirm and continue",
+                update_text="Preview/Recalculate",
+                confirm_text="Confirm and Continue",
                 back_text="Back",
-                reset_text="Reset vessel params",
-                abort_text="ABORT",
+                reset_text="Reset Parameters",
+                abort_text="Abort",
             )
 
             napari.run()
@@ -1673,7 +1622,7 @@ class LobuleSegmentor(BaseOperator):
                 raise PipelineBack(3)
 
         # final vessel detection with whatever parameters the user ended up with
-        cluster_map_final, vessel_classes, vessel_contours = run_vessel_detection(
+        cluster_map_final, vessel_classes, vessel_contours, _rejected_contours = run_vessel_detection(
             self.min_vessel_area_pp,
             self.min_vessel_area_pv,
             self.vessel_annulus_px,
