@@ -607,6 +607,98 @@ def add_napari_controls_dock(
     return out
 
 
+def run_napari_preview_action(
+    viewer: Any,
+    controls_widget: Any,
+    *,
+    require_confirm: bool = False,
+    on_update: Optional[Callable[[], None]] = None,
+    on_reset: Optional[Callable[[], None]] = None,
+    on_confirm: Optional[Callable[[], None]] = None,
+    on_back: Optional[Callable[[], None]] = None,
+    on_abort: Optional[Callable[[], None]] = None,
+    include_update: bool = True,
+    include_confirm: bool = True,
+    include_back: bool = True,
+    include_reset: bool = True,
+    include_abort: bool = True,
+    update_text: str = "Preview/Recalculate",
+    confirm_text: str = "Confirm and Continue",
+    back_text: str = "Back",
+    reset_text: str = "Reset Parameters",
+    abort_text: str = "Abort",
+    dock_area: str = "right",
+) -> str:
+    """
+    Centralized napari preview runner for "button-only apply" previews.
+
+    - Wires the unified 5-button dock via add_napari_controls_dock
+    - Runs napari event loop
+    - Returns action in {"confirm","back","abort","closed"}
+
+    Closing the viewer without pressing a button maps to:
+      - "closed" if require_confirm=True
+      - "confirm" if require_confirm=False
+    """
+    import napari
+
+    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
+
+    def _safe_call(cb: Optional[Callable[[], None]]) -> None:
+        if cb is None:
+            return
+        cb()
+
+    def _on_update() -> None:
+        _safe_call(on_update)
+
+    def _on_reset() -> None:
+        _safe_call(on_reset)
+
+    def _on_confirm() -> None:
+        _safe_call(on_confirm)
+        nav["action"] = "confirm"
+        viewer.close()
+
+    def _on_back() -> None:
+        _safe_call(on_back)
+        nav["action"] = "back"
+        viewer.close()
+
+    def _on_abort() -> None:
+        _safe_call(on_abort)
+        nav["action"] = "abort"
+        viewer.close()
+
+    add_napari_controls_dock(
+        viewer,
+        controls_widget,
+        on_update=_on_update if include_update else None,
+        on_confirm=_on_confirm if include_confirm else None,
+        on_back=_on_back if include_back else None,
+        on_reset=_on_reset if include_reset else None,
+        on_abort=_on_abort if include_abort else None,
+        include_update=bool(include_update),
+        include_confirm=bool(include_confirm),
+        include_back=bool(include_back),
+        include_reset=bool(include_reset),
+        include_abort=bool(include_abort),
+        update_text=str(update_text),
+        confirm_text=str(confirm_text),
+        back_text=str(back_text),
+        reset_text=str(reset_text),
+        abort_text=str(abort_text),
+        dock_area=str(dock_area),
+    )
+
+    napari.run()
+
+    action = nav["action"]
+    if action is None:
+        action = "confirm" if not require_confirm else "closed"
+    return str(action)
+
+
 def preview_images_napari(
     images: Sequence[np.ndarray],
     titles: Optional[Sequence[str]] = None,
@@ -667,9 +759,6 @@ def preview_images_napari(
         else:
             layers.append(viewer.add_image(im, name=name))
 
-    # Navigation result
-    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
-
     def on_update() -> None:
         # No parameters to recompute here; treat as a "refresh" button for consistency.
         try:
@@ -684,29 +773,18 @@ def preview_images_napari(
         except Exception:
             pass
 
-    def on_confirm() -> None:
-        nav["action"] = "confirm"
-        viewer.close()
-
-    def on_back() -> None:
-        nav["action"] = "back"
-        viewer.close()
-
-    def on_abort() -> None:
-        nav["action"] = "abort"
-        viewer.close()
-
     # Minimal "controls" widget so we can reuse the shared dock builder.
     controls_stub = Label(value="")
 
-    add_napari_controls_dock(
+    action = run_napari_preview_action(
         viewer,
         controls_stub,
+        require_confirm=bool(require_confirm),
         on_update=on_update,
-        on_confirm=on_confirm if include_confirm else None,
-        on_back=on_back if include_back else None,
         on_reset=on_reset,
-        on_abort=on_abort if include_abort else None,
+        on_confirm=None,  # no state to apply
+        on_back=None,     # no state to apply
+        on_abort=None,    # no state to apply
         include_update=True,
         include_confirm=True,
         include_back=True,
@@ -720,12 +798,17 @@ def preview_images_napari(
         dock_area=str(dock_area),
     )
 
-    napari.run()
-
     if not return_action:
         return None
 
-    action = nav["action"]
-    if action is None:
-        action = "confirm" if not require_confirm else "closed"
+    # Preserve call-site compatibility: disable actions by mapping to no-op wiring only.
+    # Note: the UI still shows all buttons (by design), but callers can still request
+    # whether a back/abort action is meaningfully used.
+    if (action == "back") and (not include_back):
+        return "confirm"
+    if (action == "abort") and (not include_abort):
+        return "confirm"
+    if (action == "confirm") and (not include_confirm):
+        return "confirm"
+
     return action

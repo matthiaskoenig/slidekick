@@ -27,7 +27,8 @@ from slidekick.processing.lobule_segmentation.lob_utils import (
     bool_mask_to_uint8, minmax_to_uint8, border_connected_mask,
     render_cluster_gray, nonlinear_channel_weighting, to_base_full, rescale_full,
     common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
-    discover_pyramid_shapes, preview_images_napari, add_napari_controls_dock,
+    discover_pyramid_shapes, preview_images_napari,
+    run_napari_preview_action,
 )
 
 
@@ -381,9 +382,6 @@ class LobuleSegmentor(BaseOperator):
 
         pending = dict(defaults)
 
-        confirmed = {"ok": False}
-        nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
-
         def _apply_update() -> None:
             lvl = int(pending["level"])
             bg = int(pending["bg"])
@@ -427,49 +425,24 @@ class LobuleSegmentor(BaseOperator):
 
         def on_confirm() -> None:
             _apply_update()
-            confirmed["ok"] = True
-            nav["action"] = "confirm"
-            viewer.close()
 
         def on_back() -> None:
             _apply_update()
-            nav["action"] = "back"
-            viewer.close()
 
-        def on_abort() -> None:
-            nav["action"] = "abort"
-            viewer.close()
-
-        add_napari_controls_dock(
+        action = run_napari_preview_action(
             viewer,
             controls,
+            require_confirm=bool(require_confirm),
             on_update=on_update,
+            on_reset=on_reset,
             on_confirm=on_confirm,
             on_back=on_back,
-            on_reset=on_reset,
-            on_abort=on_abort,
-            include_update=True,
-            include_confirm=True,
-            include_back=True,
-            include_reset=True,
-            include_abort=True,
-            update_text="Preview/Recalculate",
-            confirm_text="Confirm and Continue",
-            back_text="Back",
-            reset_text="Reset Parameters",
-            abort_text="Abort",
         )
 
-        napari.run()
-
         if return_action:
-            action = nav["action"]
-            if action is None:
-                action = "confirm" if not require_confirm else "closed"
             return action
 
-        return True if not require_confirm else bool(confirmed["ok"])
-
+        return True if not require_confirm else (action == "confirm")
 
     def _preview_channel_weighting(
             self,
@@ -562,7 +535,6 @@ class LobuleSegmentor(BaseOperator):
 
         pp_layer = None
         pv_layer = None
-        nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
 
         def _apply_update() -> None:
             self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
@@ -650,44 +622,23 @@ class LobuleSegmentor(BaseOperator):
 
         def on_confirm() -> None:
             _apply_update()
-            nav["action"] = "confirm"
-            viewer.close()
 
         def on_back() -> None:
             _apply_update()
-            nav["action"] = "back"
-            viewer.close()
 
-        def on_abort() -> None:
-            nav["action"] = "abort"
-            viewer.close()
-
-        add_napari_controls_dock(
+        action = run_napari_preview_action(
             viewer,
             weighting_controls,
+            require_confirm=False,
             on_update=on_update,
+            on_reset=on_reset,
             on_confirm=on_confirm,
             on_back=on_back,
-            on_reset=on_reset,
-            on_abort=on_abort,
-            include_update=True,
-            include_confirm=True,
-            include_back=True,
-            include_reset=True,
-            include_abort=True,
-            update_text="Preview/Recalculate",
-            confirm_text="Confirm and Continue",
-            back_text="Back",
-            reset_text="Reset Parameters",
-            abort_text="Abort",
         )
 
-        napari.run()
-
         if return_action:
-            return nav["action"] or "confirm"
+            return action if action != "closed" else "confirm"
         return None
-
 
     def _load_and_invert_images_from_metadatas(
             self,
@@ -1545,8 +1496,6 @@ class LobuleSegmentor(BaseOperator):
                 pending["vessel_zone_ratio_thr_pv"] = float(vessel_zone_ratio_thr_pv)
                 pending["vessel_circularity_min"] = float(vessel_circularity_min)
 
-            nav = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
-
             def on_update() -> None:
                 _recompute_and_update_layers()
 
@@ -1579,44 +1528,24 @@ class LobuleSegmentor(BaseOperator):
 
             def on_confirm() -> None:
                 _recompute_and_update_layers()
-                nav["action"] = "confirm"
-                viewer.close()
 
             def on_back() -> None:
                 _recompute_and_update_layers()
-                nav["action"] = "back"
-                viewer.close()
 
-            def on_abort() -> None:
-                nav["action"] = "abort"
-                viewer.close()
-
-            add_napari_controls_dock(
+            action = run_napari_preview_action(
                 viewer,
                 vessel_controls,
+                require_confirm=False,
                 on_update=on_update,
+                on_reset=on_reset,
                 on_confirm=on_confirm,
                 on_back=on_back,
-                on_reset=on_reset,
-                on_abort=on_abort,
-                include_update=True,
-                include_confirm=True,
-                include_back=True,
-                include_reset=True,
-                include_abort=True,
-                update_text="Preview/Recalculate",
-                confirm_text="Confirm and Continue",
-                back_text="Back",
-                reset_text="Reset Parameters",
-                abort_text="Abort",
             )
 
-            napari.run()
-
-            if nav["action"] == "abort":
+            if action == "abort":
                 raise PipelineAbort()
 
-            if nav["action"] == "back":
+            if action == "back":
                 # classification back should return to the previous vessel UI
                 # (still within "superpixels / KMeans / vessels"), not the weighting step
                 raise PipelineBack(3)
