@@ -77,21 +77,22 @@ def detect_tissue_mask(gray: np.ndarray, morphological_radius: int) -> np.ndarra
 
 # Find the bounding box of the largest connected component in the mask
 def largest_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """Return (x, y, w, h) of the largest connected component or None if none present."""
-    if mask is None or np.count_nonzero(mask) == 0:
+    """
+    Return (x, y, w, h) bounding all non-zero pixels.
+    Returns None if mask contains no non-zero values.
+    """
+    if mask is None or not np.any(mask):
         return None
 
-    lbl = label(mask)
-    props = regionprops(lbl)
-    if not props:
-        return None
+    coords = np.argwhere(mask)
+    minr, minc = coords.min(axis=0)
+    maxr, maxc = coords.max(axis=0)
 
-    largest = max(props, key=lambda p: p.area)
-    minr, minc, maxr, maxc = largest.bbox
     x = int(minc)
     y = int(minr)
-    w = int(maxc - minc)
-    h = int(maxr - minr)
+    w = int(maxc - minc + 1)
+    h = int(maxr - minr + 1)
+
     return (x, y, w, h)
 
 
