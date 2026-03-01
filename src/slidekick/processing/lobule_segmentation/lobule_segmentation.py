@@ -360,7 +360,7 @@ class LobuleSegmentor(BaseOperator):
         for c, title in enumerate(titles):
             raw_layers.append(
                 viewer.add_image(
-                    raw0[..., c],
+                    raw0[..., c].copy(),
                     name=f"raw/{title}",
                     colormap="gray",
                     visible=False,
@@ -368,7 +368,7 @@ class LobuleSegmentor(BaseOperator):
             )
             filt_layers.append(
                 viewer.add_image(
-                    filt0[..., c],
+                    filt0[..., c].copy(),
                     name=f"filtered/{title}",
                     colormap="gray",
                 )
@@ -392,8 +392,8 @@ class LobuleSegmentor(BaseOperator):
 
             raw_mean_layer.data = raw.mean(axis=2).astype(np.uint8)
             for c in range(raw.shape[2]):
-                raw_layers[c].data = raw[..., c]
-                filt_layers[c].data = filt[..., c]
+                raw_layers[c].data = raw[..., c].copy()
+                filt_layers[c].data = filt[..., c].copy()
 
         @magicgui(
             layout="vertical",

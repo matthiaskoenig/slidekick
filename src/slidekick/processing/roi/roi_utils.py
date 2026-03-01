@@ -5,46 +5,93 @@ from skimage.morphology import closing, disk
 from skimage.measure import label, regionprops
 
 
-# Convert image to uint8 grayscale suitable for Otsu thresholding
+def _ensure_hwc(arr: np.ndarray) -> np.ndarray:
+    """Rearrange a 3D array to (H, W, C) layout.
+
+    Uses the heuristic that the channel dimension is much smaller
+    than the spatial dimensions (C <= 64 and C < H and C < W).
+    """
+    s = arr.shape
+    # Channel-first: (C, H, W) where s[0] <= 64, s[1] > s[0], s[2] > s[0]
+    if s[0] <= 64 and s[1] > s[0] and s[2] > s[0]:
+        return np.moveaxis(arr, 0, 2)
+    # Channel-last: (H, W, C) where s[2] <= 64, s[0] > s[2], s[1] > s[2]
+    if s[2] <= 64 and s[0] > s[2] and s[1] > s[2]:
+        return arr
+    # Fallback: smallest axis is channels
+    cax = int(np.argmin(s))
+    if cax == 2:
+        return arr
+    return np.moveaxis(arr, cax, 2)
+
+
 def ensure_grayscale_uint8(image: np.ndarray) -> np.ndarray:
     """Convert an input image to a uint8 grayscale image.
+
+    Handles any combination of layout (H,W  /  H,W,C  /  C,H,W),
+    dtype (uint8, uint16, float32/64), and channel count (RGB, multiplex).
 
     Parameters
     ----------
     image : np.ndarray
-        Input image. Can be single-channel, multi-channel (RGB/RGBA), or
-        floating-point in range 0..1.
+        Input image.  For 3-D inputs the channel axis is detected
+        heuristically (smallest dim <= 64 that is smaller than both
+        spatial dims).
 
     Returns
     -------
     np.ndarray
-        A 2D uint8 array with values in 0..255 suitable for thresholding.
+        A 2D uint8 array with values in [0, 255] suitable for thresholding.
     """
-    if image.ndim == 3:
-        arr = image
-        # Scale float images to 0..255 and convert types
-        if np.issubdtype(arr.dtype, np.floating):
-            arr = np.clip((arr * 255.0).astype(np.float32), 0, 255).astype(np.uint8)
-        elif arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
+    arr = np.asarray(image)
 
-        # average
-        gray = np.mean(arr, axis=2).astype(np.uint8)
+    # --- Stage 1: ensure (H, W, C) ---
+    if arr.ndim == 2:
+        hwc = arr[:, :, np.newaxis]
+    elif arr.ndim == 3:
+        hwc = _ensure_hwc(arr)
     else:
-        # Single-channel input handling
-        if np.issubdtype(image.dtype, np.floating):
-            gray = np.clip((image * 255.0).astype(np.float32), 0, 255).astype(np.uint8)
-        elif image.dtype != np.uint8:
-            arr = image.astype(np.float32)
-            arr_min = np.nanmin(arr)
-            arr_max = np.nanmax(arr)
-            if arr_max > arr_min:
-                gray = ((arr - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
-            else:
-                gray = np.clip(arr, 0, 255).astype(np.uint8)
+        arr = np.squeeze(arr)
+        if arr.ndim == 2:
+            hwc = arr[:, :, np.newaxis]
+        elif arr.ndim == 3:
+            hwc = _ensure_hwc(arr)
         else:
-            gray = image.copy()
-    return gray
+            raise ValueError(
+                f"Cannot convert array with shape {image.shape} to grayscale."
+            )
+
+    src_dtype = hwc.dtype
+    C = hwc.shape[2]
+
+    # --- Stage 2: normalize each channel to float32 [0, 1] ---
+    hwc_f = hwc.astype(np.float32)
+
+    if np.issubdtype(src_dtype, np.integer):
+        maxv = float(np.iinfo(src_dtype).max)
+        if maxv > 0:
+            hwc_f /= maxv
+    else:
+        for c in range(C):
+            ch = hwc_f[:, :, c]
+            p_high = float(np.nanpercentile(ch, 99))
+            if p_high > 1.5:
+                p_low = float(np.nanpercentile(ch, 1))
+                rng = p_high - p_low
+                if rng > 0:
+                    hwc_f[:, :, c] = (ch - p_low) / rng
+                else:
+                    hwc_f[:, :, c] = 0.0
+
+    np.clip(hwc_f, 0.0, 1.0, out=hwc_f)
+
+    # --- Stage 3: combine channels -> single grayscale uint8 ---
+    if C == 1:
+        gray = hwc_f[:, :, 0]
+    else:
+        gray = np.mean(hwc_f, axis=2)
+
+    return np.clip(gray * 255.0, 0, 255).astype(np.uint8)
 
 
 # Compute a binary tissue mask using Otsu thresholding and morphological closing
