@@ -12,38 +12,59 @@ def ensure_grayscale_uint8(image: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     image : np.ndarray
-        Input image. Can be single-channel, multi-channel (RGB/RGBA), or
-        floating-point in range 0..1.
+        Input image. Can be 2D (H, W), or 3D in either H,W,C or C,H,W layout,
+        with any number of channels (RGB, RGBA, multiplex, etc.). The channel
+        axis is identified as the smallest dimension. Dtype may be float (any
+        range) or any integer type.
 
     Returns
     -------
     np.ndarray
-        A 2D uint8 array with values in 0..255 suitable for thresholding.
+        A 2D uint8 array with values in 0..255 suitable for Otsu thresholding.
+
+    Notes
+    -----
+    Channels are collapsed via ``np.max`` (max-intensity projection) so that
+    signal present in *any* channel is preserved. For float images, values
+    already in [0, 1] are scaled directly; otherwise a min-max normalisation
+    is applied. Non-uint8 integer images are always min-max normalised.
     """
     if image.ndim == 3:
-        arr = image
-        # Scale float images to 0..255 and convert types
-        if np.issubdtype(arr.dtype, np.floating):
-            arr = np.clip((arr * 255.0).astype(np.float32), 0, 255).astype(np.uint8)
-        elif arr.dtype != np.uint8:
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        # Detect channel order: C is much smaller than H and W.
+        # argmin == 0  →  C,H,W;  argmin == 2  →  H,W,C
+        if np.argmin(image.shape) == 0:
+            image = np.moveaxis(image, 0, -1)  # C,H,W → H,W,C
 
-        # average
-        gray = np.mean(arr, axis=2).astype(np.uint8)
+        # Max-intensity projection across channels → 2D
+        arr = np.max(image, axis=2)
     else:
-        # Single-channel input handling
-        if np.issubdtype(image.dtype, np.floating):
-            gray = np.clip((image * 255.0).astype(np.float32), 0, 255).astype(np.uint8)
-        elif image.dtype != np.uint8:
-            arr = image.astype(np.float32)
+        arr = image
+
+    # Normalise to uint8 using a unified path
+    if np.issubdtype(arr.dtype, np.floating):
+        if arr.max() <= 1.0:
+            # Standard [0, 1] float
+            gray = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        else:
+            # Raw float intensities — min-max normalise
             arr_min = np.nanmin(arr)
             arr_max = np.nanmax(arr)
             if arr_max > arr_min:
                 gray = ((arr - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
             else:
-                gray = np.clip(arr, 0, 255).astype(np.uint8)
+                gray = np.zeros(arr.shape, dtype=np.uint8)
+    elif arr.dtype == np.uint8:
+        gray = arr.copy()
+    else:
+        # Integer types (uint16, int32, …) — min-max normalise
+        arr_f = arr.astype(np.float32)
+        arr_min = np.nanmin(arr_f)
+        arr_max = np.nanmax(arr_f)
+        if arr_max > arr_min:
+            gray = ((arr_f - arr_min) / (arr_max - arr_min) * 255.0).astype(np.uint8)
         else:
-            gray = image.copy()
+            gray = np.zeros(arr_f.shape, dtype=np.uint8)
+
     return gray
 
 
