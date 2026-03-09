@@ -48,14 +48,51 @@ def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5,
     return lbl.astype(np.int32), (idx_true_bg, idx_mic_bg, idx_tissue)
 
 
+# Fraction of pixels in the middle intensity class below which the histogram
+# is considered bimodal (true BG + tissue only, no microscopy artefact band).
+_MIC_BG_THRESHOLD = 0.05
+
+
 def detect_tissue_mask_multiotsu(gray: np.ndarray,
-                                 morphological_radius: int = 5, report_path: Path = None):
+                                 morphological_radius: int = 5,
+                                 auto: bool = True,
+                                 report_path: Path = None):
     """
-    Build boolean masks: tissue, microscope background, true background.
-    Cleans with closing + small object/hole removal.
+    Build a boolean tissue mask via 3-class multi-Otsu.
+
+    Parameters
+    ----------
+    gray : np.ndarray
+        2D uint8 grayscale image.
+    morphological_radius : int
+        Radius for morphological closing after thresholding.
+    auto : bool
+        If True (default), automatically decide whether the histogram is
+        bimodal or trimodal based on the fraction of pixels in the middle
+        intensity class (mic_bg_frac):
+          - mic_bg_frac < _MIC_BG_THRESHOLD  → bimodal (good export): the
+            middle class is an artefact of forcing 3 classes onto 2 real
+            modes; both middle and top classes are included as tissue.
+          - mic_bg_frac >= _MIC_BG_THRESHOLD → trimodal (microscopy BG
+            present): only the top class is tissue.
+        If False, always use the legacy forced 3-class behaviour (tissue =
+        top class only), equivalent to the old multi_otsu=True path.
+    report_path : Path, optional
+        If provided, saves a debug PNG of the class labels.
     """
     lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=15, report_path=report_path)
-    m_tis  = (lbl == i2)
+    if auto:
+        mic_bg_frac = float(np.sum(lbl == i1)) / lbl.size
+        if mic_bg_frac < _MIC_BG_THRESHOLD:
+            # Bimodal image: middle class is noise from forcing 3 onto 2 modes.
+            # Treat everything that is not true background as tissue.
+            m_tis = (lbl != i0)
+        else:
+            # Trimodal image: real microscopy background band; exclude it.
+            m_tis = (lbl == i2)
+    else:
+        # Legacy forced 3-class: tissue = top class only.
+        m_tis = (lbl == i2)
 
     m_tis = closing(m_tis, disk(int(morphological_radius)))
 

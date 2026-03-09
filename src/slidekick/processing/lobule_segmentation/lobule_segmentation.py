@@ -75,7 +75,7 @@ class LobuleSegmentor(BaseOperator):
                  confirm: bool = True,
                  base_level: int = 0,
                  region_size: int = 20,
-                 multi_otsu: bool = True,
+                 multi_otsu: Optional[bool] = None,
                  ksize: int = 7,
                  n_clusters: int = 3,
                  target_superpixels: int = None,
@@ -111,7 +111,14 @@ class LobuleSegmentor(BaseOperator):
         @param preview: whether to preview the segmentation
         @param confirm: whether to confirm the segmentation
         @param base_level: Pyramid level to load
-        @param multi_otsu: whether to use multi-otsu to filter out microscopy background, otherwise classic otsu
+        @param multi_otsu: tissue detection mode.
+            None (default) — auto-detect: runs 3-class multi-Otsu and checks the fraction of
+            pixels in the middle intensity class (mic_bg_frac). If mic_bg_frac < 5 % the
+            histogram is treated as bimodal (good export, no microscopy artefact) and both
+            middle and top classes become tissue. If mic_bg_frac >= 5 % the histogram is
+            trimodal (microscopy background present) and only the top class is tissue.
+            True — force 3-class behaviour (tissue = top class only, old default).
+            False — force 2-class simple Otsu (no microscopy background handling).
         @param region_size: average size of superpixels for SLIC in pixels
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
@@ -223,10 +230,6 @@ class LobuleSegmentor(BaseOperator):
 
         H, W, N = image_stack.shape
 
-        # set missing to 0 (any low-value across channels -> zero all channels)
-        # bg_low_val defaults to 0 to preserve previous behavior.
-        missing_mask = np.any(image_stack <= int(self.bg_low_val), axis=-1)
-
         out = np.empty((H, W, N), dtype=np.uint8)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
 
@@ -238,8 +241,12 @@ class LobuleSegmentor(BaseOperator):
             if ch.dtype != np.uint8:
                 ch = np.clip(ch, 0, 255).astype(np.uint8)
 
-            # apply missing mask on this channel
-            ch[missing_mask] = 0
+            # Per-channel background suppression.
+            # Previous implementation used a shared mask across all channels
+            # (np.any(stack <= bg_low_val, axis=-1)) which leaked spatial
+            # patterns from zonated channels (e.g. CYP) into uniform channels
+            # (e.g. DAPI), creating false zonation artifacts.
+            ch[ch <= int(self.bg_low_val)] = 0
 
             # blur, ksize from zia=7
             ch = cv2.medianBlur(ch, ksize=self.ksize)
@@ -264,6 +271,27 @@ class LobuleSegmentor(BaseOperator):
 
         return out
 
+    def _load_stack_only(self, level: int) -> np.ndarray:
+        """
+        Load and per-channel normalize the image stack without applying the
+        tissue mask, cropping, or channel inversion.
+
+        Used by the napari preprocessing preview so the "raw" layers reflect
+        the actual data on disk rather than the post-masked, post-cropped stack
+        that _load_and_invert_images_from_metadatas returns.
+        """
+        lvl = int(level)
+        arrays = []
+        for i in range(len(self.metadata)):
+            img = np.asarray(load_level_from_multiscale(self.load_image(i), lvl))
+            if img.ndim == 3 and img.shape[-1] in (3, 4):
+                img = np.mean(img[..., :3], axis=-1).astype(img.dtype)
+            arrays.append(img)
+        h_min = min(a.shape[0] for a in arrays)
+        w_min = min(a.shape[1] for a in arrays)
+        arrays = [a[:h_min, :w_min] for a in arrays]
+        arrays = [minmax_to_uint8(a) for a in arrays]
+        return np.dstack(arrays)
 
     def _interactive_preprocessing_preview(
             self,
@@ -314,19 +342,9 @@ class LobuleSegmentor(BaseOperator):
             if lvl in raw_cache:
                 return raw_cache[lvl]
 
-            # Prevent preview from mutating channel lists / throw-out state.
-            saved_throw_out = self.throw_out_ratio
-            saved_pp = list(self.channels_pp) if self.channels_pp is not None else None
-            saved_pv = list(self.channels_pv) if self.channels_pv is not None else None
-            try:
-                self.throw_out_ratio = None
-                stack, _bbox, _orig_shapes = self._load_and_invert_images_from_metadatas(report_path=None, level=lvl)
-            finally:
-                self.throw_out_ratio = saved_throw_out
-                self.channels_pp = saved_pp
-                self.channels_pv = saved_pv
-
-            raw_small = downsample_stack_to_max_side(stack, 2048)
+            # Load without tissue masking or cropping so the napari "raw" layers
+            # reflect the actual per-channel data from disk.
+            raw_small = downsample_stack_to_max_side(self._load_stack_only(lvl), 2048)
             raw_cache[lvl] = raw_small
             return raw_small
 
@@ -360,7 +378,7 @@ class LobuleSegmentor(BaseOperator):
         for c, title in enumerate(titles):
             raw_layers.append(
                 viewer.add_image(
-                    raw0[..., c].copy(),
+                    raw0[..., c],
                     name=f"raw/{title}",
                     colormap="gray",
                     visible=False,
@@ -368,7 +386,7 @@ class LobuleSegmentor(BaseOperator):
             )
             filt_layers.append(
                 viewer.add_image(
-                    filt0[..., c].copy(),
+                    filt0[..., c],
                     name=f"filtered/{title}",
                     colormap="gray",
                 )
@@ -392,8 +410,8 @@ class LobuleSegmentor(BaseOperator):
 
             raw_mean_layer.data = raw.mean(axis=2).astype(np.uint8)
             for c in range(raw.shape[2]):
-                raw_layers[c].data = raw[..., c].copy()
-                filt_layers[c].data = filt[..., c].copy()
+                raw_layers[c].data = raw[..., c]
+                filt_layers[c].data = filt[..., c]
 
         @magicgui(
             layout="vertical",
@@ -674,7 +692,12 @@ class LobuleSegmentor(BaseOperator):
         w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
 
-        stack = np.dstack(arrays).astype(np.uint8)
+        # Normalize each channel independently to [0, 255] before stacking.
+        # This prevents high-intensity channels from dominating the tissue-detection
+        # grayscale (e.g. a bright zonated CYP channel biasing the mean against DAPI),
+        # and avoids silent bit-depth truncation for >8-bit source images.
+        arrays = [minmax_to_uint8(a) for a in arrays]
+        stack = np.dstack(arrays)
 
         # Get resolutions / image sizes for later back mapping based on stain 0
         orig_shapes = discover_pyramid_shapes(self.load_image(0))
@@ -682,13 +705,20 @@ class LobuleSegmentor(BaseOperator):
         # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
         stack_grayscale = ensure_grayscale_uint8(stack)
-        if self.multi_otsu:
-            # We detect three levels in each wsi: actual tissue, black background and the background in microscopy.
-            # returns tissue_mask
-            tissue_mask = detect_tissue_mask_multiotsu(stack_grayscale, morphological_radius=6, report_path=report_path)
+        morph_r = min(10, max(stack_grayscale.shape) // 200)
+        if self.multi_otsu is False:
+            # Explicit 2-class override: simple Otsu, no microscopy BG handling.
+            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=morph_r)
         else:
-            # just tissue detection
-            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=6)
+            # multi_otsu is None (auto) or True (force 3-class legacy).
+            # auto=True  → decide bimodal/trimodal from mic_bg_frac heuristic.
+            # auto=False → always tissue = top class only (old multi_otsu=True behaviour).
+            tissue_mask = detect_tissue_mask_multiotsu(
+                stack_grayscale,
+                morphological_radius=morph_r,
+                auto=(self.multi_otsu is None),
+                report_path=report_path,
+            )
 
         # stack: (H,W,C); tissue_mask: (H,W) True=tissue
         stack[~tissue_mask] = 0
@@ -696,6 +726,10 @@ class LobuleSegmentor(BaseOperator):
         # crop to tissue bbox
         bbox = largest_bbox(tissue_mask.astype(np.uint8))
         stack = crop_image(stack, bbox)
+        # Convert bbox from (x, y, w, h) to (min_r, min_c, max_r, max_c)
+        # for downstream consumers (build_mask_pyramid, to_base_full, portality crop).
+        bx, by, bw, bh = bbox
+        bbox = (by, bx, by + bh, bx + bw)
 
         # Inversion and discard only AFTER cropping:
         # NOTE: Discarding channels changes channel indices. We first decide what to drop,
@@ -1530,7 +1564,7 @@ class LobuleSegmentor(BaseOperator):
                 _recompute_and_update_layers()
 
             def on_back() -> None:
-                _recompute_and_update_layers()
+                _apply_pending_to_self()
 
             action = run_napari_preview_action(
                 viewer,
@@ -1546,9 +1580,7 @@ class LobuleSegmentor(BaseOperator):
                 raise PipelineAbort()
 
             if action == "back":
-                # classification back should return to the previous vessel UI
-                # (still within "superpixels / KMeans / vessels"), not the weighting step
-                raise PipelineBack(3)
+                raise PipelineBack(2)
 
         # final vessel detection with whatever parameters the user ended up with
         cluster_map_final, vessel_classes, vessel_contours, _rejected_contours = run_vessel_detection(
