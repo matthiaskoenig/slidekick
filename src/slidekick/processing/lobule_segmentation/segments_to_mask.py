@@ -432,19 +432,30 @@ def _faces_from_edges(H: int, W: int, edges: List[Dict[str, Any]]
     border = set(np.unique(np.concatenate([comp[0, :], comp[-1, :], comp[:, 0], comp[:, -1]])))
     interior = [lab for lab in range(1, comp_n) if lab not in border]
 
-    dists: Dict[int, np.ndarray] = {}
+    dists: Dict[int, Tuple[Tuple[int,int,int,int], np.ndarray]] = {}
+    margin = 2
     for lab in interior:
-        region = (comp == lab).astype(np.uint8)
-        cnts, _ = cv2.findContours((region * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        boundary = np.zeros((H, W), np.uint8)
+        # Find ROI bbox for this label to avoid full-res allocations.
+        ys, xs = np.where(comp == lab)
+        if len(ys) == 0:
+            continue
+        y0 = max(int(ys.min()) - margin, 0)
+        x0 = max(int(xs.min()) - margin, 0)
+        y1 = min(int(ys.max()) + 1 + margin, H)
+        x1 = min(int(xs.max()) + 1 + margin, W)
+        roi_h, roi_w = y1 - y0, x1 - x0
+
+        region_roi = (comp[y0:y1, x0:x1] == lab).astype(np.uint8)
+        cnts, _ = cv2.findContours((region_roi * 255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        boundary_roi = np.zeros((roi_h, roi_w), np.uint8)
         for c in cnts:
             if len(c) >= 3:
-                cv2.polylines(boundary, [c], True, 255, 1, cv2.LINE_8)
-        inv = (boundary == 0).astype(np.uint8) * 255
+                cv2.polylines(boundary_roi, [c], True, 255, 1, cv2.LINE_8)
+        inv_roi = (boundary_roi == 0).astype(np.uint8) * 255
         # Distance to the nearest boundary pixel. Used later to decide whether an edge
         # runs along a face boundary within a pixel tolerance.
-        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-        dists[lab] = dist
+        dist_roi = cv2.distanceTransform(inv_roi, cv2.DIST_L2, 3)
+        dists[lab] = ((y0, x0, y1, x1), dist_roi)
     return interior, comp, dists
 
 
@@ -1142,8 +1153,16 @@ def process_segments_to_mask(
         votes_untreated = 0
         touched = []
         for lab in interior_labels:
-            dist = face_dists[lab]
-            close = (dist[rr, cc] <= float(edge_boundary_tol_px)).sum()
+            if lab not in face_dists:
+                continue
+            (fy0, fx0, fy1, fx1), dist_roi = face_dists[lab]
+            # Mask edge pixels that fall inside this face's ROI bbox
+            in_roi = (rr >= fy0) & (rr < fy1) & (cc >= fx0) & (cc < fx1)
+            if not np.any(in_roi):
+                continue
+            rr_local = rr[in_roi] - fy0
+            cc_local = cc[in_roi] - fx0
+            close = (dist_roi[rr_local, cc_local] <= float(edge_boundary_tol_px)).sum()
             frac = close / edge_len[eid]
             # Consider this edge adjacent to a face if at least edge_on_boundary_frac of its pixels lie
             # within edge_boundary_tol_px of the face boundary in distance space.

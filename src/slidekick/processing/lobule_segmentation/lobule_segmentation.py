@@ -25,7 +25,8 @@ from slidekick.processing.lobule_segmentation.lob_utils import (
     detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
     downsample_stack_to_max_side, holes_from_fg_mask,
     bool_mask_to_uint8, minmax_to_uint8, border_connected_mask,
-    render_cluster_gray, nonlinear_channel_weighting, to_base_full, rescale_full,
+    render_cluster_gray, nonlinear_channel_weighting, quantile_normalize_features,
+    to_base_full, rescale_full,
     common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
     discover_pyramid_shapes, preview_images_napari,
     run_napari_preview_action,
@@ -91,6 +92,10 @@ class LobuleSegmentor(BaseOperator):
                  pv_gamma: float = 0.75,
                  nl_low_pct: float = 5.0,
                  nl_high_pct: float = 90.0,
+                 quantile_kmeans: Optional[bool] = None,
+                 spatial_smooth: bool = False,
+                 spatial_smooth_majority: float = 0.7,
+                 fg_min_signal_frac: float = 0.05,
                  # vessel gating
                  interactive_vessels: bool = True,
                  min_vessel_area_pp: int = 200,
@@ -164,6 +169,10 @@ class LobuleSegmentor(BaseOperator):
         self.pv_gamma = pv_gamma
         self.nl_low_pct = nl_low_pct
         self.nl_high_pct = nl_high_pct
+        self.quantile_kmeans = quantile_kmeans
+        self.spatial_smooth = bool(spatial_smooth)
+        self.spatial_smooth_majority = float(spatial_smooth_majority)
+        self.fg_min_signal_frac = float(fg_min_signal_frac)
 
         # vessel gating
         self.interactive_vessels = interactive_vessels
@@ -318,9 +327,20 @@ class LobuleSegmentor(BaseOperator):
         # Load multiscale handles once; discover common levels from these handles.
         multiscales = [self.load_image(i) for i in range(len(self.metadata))]
         common_levels = common_pyramid_levels(multiscales)
-        default_level = choose_default_preview_level(common_levels)
+        # Use the user-specified base_level if it exists in the pyramid,
+        # otherwise fall back to the automatic choice.
+        if self.base_level in common_levels:
+            default_level = self.base_level
+        else:
+            default_level = choose_default_preview_level(common_levels)
 
         def _title_for_md(md: Metadata, idx: int) -> str:
+            # Prefer stain name (more meaningful in napari layer list)
+            stains = getattr(md, "stains", None)
+            if stains and isinstance(stains, dict):
+                first = stains.get(0, None)
+                if first:
+                    return str(first)
             p = getattr(md, "path_original", None) or getattr(md, "path", None) or getattr(md, "name", None)
             if isinstance(p, tuple) and p:
                 p = p[0]
@@ -396,6 +416,7 @@ class LobuleSegmentor(BaseOperator):
             "level": int(default_level),
             "bg": int(self.bg_low_val),
             "clahe": int(self.clahe_bg_suppress),
+            "fg_frac": float(self.fg_min_signal_frac),
         }
 
         pending = dict(defaults)
@@ -404,6 +425,8 @@ class LobuleSegmentor(BaseOperator):
             lvl = int(pending["level"])
             bg = int(pending["bg"])
             clahe = int(pending["clahe"])
+            self.base_level = lvl
+            self.fg_min_signal_frac = float(pending["fg_frac"])
 
             raw = _get_raw_stack(lvl)
             filt = _get_filtered_stack(lvl, bg, clahe)
@@ -419,15 +442,18 @@ class LobuleSegmentor(BaseOperator):
             preview_level={"choices": common_levels},
             bg_low_val={"min": 0, "max": 255, "step": 1},
             clahe_bg_suppress={"min": 0, "max": 255, "step": 1},
+            fg_min_signal_frac={"min": 0.0, "max": 1.0, "step": 0.01},
         )
         def controls(
                 preview_level: int = int(default_level),
                 bg_low_val: int = int(self.bg_low_val),
                 clahe_bg_suppress: int = int(self.clahe_bg_suppress),
+                fg_min_signal_frac: float = float(self.fg_min_signal_frac),
         ):
             pending["level"] = int(preview_level)
             pending["bg"] = int(bg_low_val)
             pending["clahe"] = int(clahe_bg_suppress)
+            pending["fg_frac"] = float(fg_min_signal_frac)
 
         def on_update() -> None:
             _apply_update()
@@ -438,6 +464,7 @@ class LobuleSegmentor(BaseOperator):
             controls.preview_level.value = int(defaults["level"])
             controls.bg_low_val.value = int(defaults["bg"])
             controls.clahe_bg_suppress.value = int(defaults["clahe"])
+            controls.fg_min_signal_frac.value = float(defaults["fg_frac"])
 
             _apply_update()
 
@@ -496,8 +523,17 @@ class LobuleSegmentor(BaseOperator):
         stack_small = downsample_stack_to_max_side(image_stack, 2048)
         H, W, C = stack_small.shape
 
+        # Resolve quantile_kmeans auto for the checkbox default.
+        _qk_resolved = self.quantile_kmeans
+        if _qk_resolved is None:
+            _qk_resolved = bool(self.channels_pv and not self.channels_pp) or \
+                           bool(self.channels_pp and not self.channels_pv)
+
         defaults = dict(
             nonlinear_kmeans=self.nonlinear_kmeans,
+            quantile_kmeans=bool(_qk_resolved),
+            spatial_smooth=self.spatial_smooth,
+            spatial_smooth_majority=self.spatial_smooth_majority,
             alpha_pp=self.alpha_pp,
             alpha_pv=self.alpha_pv,
             pp_gamma=self.pp_gamma,
@@ -556,6 +592,9 @@ class LobuleSegmentor(BaseOperator):
 
         def _apply_update() -> None:
             self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
+            self.quantile_kmeans = bool(pending["quantile_kmeans"])
+            self.spatial_smooth = bool(pending["spatial_smooth"])
+            self.spatial_smooth_majority = float(pending["spatial_smooth_majority"])
             self.alpha_pp = float(pending["alpha_pp"])
             self.alpha_pv = float(pending["alpha_pv"])
             self.pp_gamma = float(pending["pp_gamma"])
@@ -598,6 +637,12 @@ class LobuleSegmentor(BaseOperator):
             layout="vertical",
             auto_call=True,  # stages values only
             nonlinear_kmeans={"widget_type": "CheckBox"},
+            quantile_kmeans={"widget_type": "CheckBox",
+                             "tooltip": "Rank-normalize features before KMeans for balanced cluster sizes."},
+            spatial_smooth={"widget_type": "CheckBox",
+                            "tooltip": "Majority-vote smoothing of cluster labels after KMeans."},
+            spatial_smooth_majority={"min": 0.5, "max": 1.0, "step": 0.05,
+                                     "tooltip": "Fraction of neighbours that must agree to flip a superpixel."},
             alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
             alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
             pp_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
@@ -607,6 +652,9 @@ class LobuleSegmentor(BaseOperator):
         )
         def weighting_controls(
                 nonlinear_kmeans: bool = self.nonlinear_kmeans,
+                quantile_kmeans: bool = bool(_qk_resolved),
+                spatial_smooth: bool = self.spatial_smooth,
+                spatial_smooth_majority: float = self.spatial_smooth_majority,
                 alpha_pp: float = self.alpha_pp,
                 alpha_pv: float = self.alpha_pv,
                 pp_gamma: float = self.pp_gamma,
@@ -615,6 +663,9 @@ class LobuleSegmentor(BaseOperator):
                 nl_high_pct: float = self.nl_high_pct,
         ):
             pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
+            pending["quantile_kmeans"] = bool(quantile_kmeans)
+            pending["spatial_smooth"] = bool(spatial_smooth)
+            pending["spatial_smooth_majority"] = float(spatial_smooth_majority)
             pending["alpha_pp"] = float(alpha_pp)
             pending["alpha_pv"] = float(alpha_pv)
             pending["pp_gamma"] = float(pp_gamma)
@@ -629,6 +680,9 @@ class LobuleSegmentor(BaseOperator):
             pending.update(defaults)
 
             weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
+            weighting_controls.quantile_kmeans.value = defaults["quantile_kmeans"]
+            weighting_controls.spatial_smooth.value = defaults["spatial_smooth"]
+            weighting_controls.spatial_smooth_majority.value = defaults["spatial_smooth_majority"]
             weighting_controls.alpha_pp.value = defaults["alpha_pp"]
             weighting_controls.alpha_pv.value = defaults["alpha_pv"]
             weighting_controls.pp_gamma.value = defaults["pp_gamma"]
@@ -662,10 +716,14 @@ class LobuleSegmentor(BaseOperator):
             self,
             report_path: Optional[Path] = None,
             level: Optional[int] = None,
-    ) -> Tuple[np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int], Dict[int, Any]]:
         """
         Load each image at the pyramid level defined, invert selected channels,
         harmonize shapes, and stack along the last axis -> (H, W, N).
+
+        Returns (stack, fg_maxproj, bbox, orig_shapes) where fg_maxproj is a
+        float32 (H, W) max-projection computed from the original-bitdepth data
+        BEFORE uint8 quantization and BEFORE the Otsu tissue mask.
         """
 
         lvl = int(self.base_level if level is None else level)
@@ -691,6 +749,18 @@ class LobuleSegmentor(BaseOperator):
         h_min = min(a.shape[0] for a in arrays)
         w_min = min(a.shape[1] for a in arrays)
         arrays = [a[:h_min, :w_min] for a in arrays]
+
+        # Compute a float32 max-projection BEFORE uint8 quantization.
+        # minmax_to_uint8 maps dim-but-real tissue signals (e.g. 50/50000 in
+        # 16-bit E-Cadherin) to 0 in uint8, making them indistinguishable from
+        # true background.  The float max-projection preserves these values.
+        arrays_f32 = [a.astype(np.float32) for a in arrays]
+        eps = 1e-10
+        arrays_norm = [
+            (af - float(np.nanmin(af))) / (float(np.nanmax(af)) - float(np.nanmin(af)) + eps)
+            for af in arrays_f32
+        ]
+        fg_maxproj = np.dstack(arrays_norm).max(axis=2)  # (H, W) float32, [0..1]
 
         # Normalize each channel independently to [0, 255] before stacking.
         # This prevents high-intensity channels from dominating the tissue-detection
@@ -726,6 +796,9 @@ class LobuleSegmentor(BaseOperator):
         # crop to tissue bbox
         bbox = largest_bbox(tissue_mask.astype(np.uint8))
         stack = crop_image(stack, bbox)
+        # Crop the float32 max-projection with the same bbox.
+        bx_raw, by_raw, bw_raw, bh_raw = bbox
+        fg_maxproj = fg_maxproj[by_raw:by_raw + bh_raw, bx_raw:bx_raw + bw_raw]
         # Convert bbox from (x, y, w, h) to (min_r, min_c, max_r, max_c)
         # for downstream consumers (build_mask_pyramid, to_base_full, portality crop).
         bx, by, bw, bh = bbox
@@ -776,13 +849,15 @@ class LobuleSegmentor(BaseOperator):
                 console.print("No remaining channels for perivenous or periportal detection available.", style="error")
                 raise Exception("No remaining channels for segmentation available.")
 
-        return stack, bbox, orig_shapes
+        return stack, fg_maxproj, bbox, orig_shapes
 
 
     def skeletize_kmeans(self, image_stack: np.ndarray,
                          pad=10,
                          region_size=6,
-                         report_path: Path = None) -> Tuple[np.ndarray, Tuple[List[int], list]]:
+                         report_path: Path = None,
+                         fg_maxproj: Optional[np.ndarray] = None,
+                         ) -> Tuple[np.ndarray, Tuple[List[int], list]]:
         """
         Adopts most code from zia.../clustering.py. Uses intensities of pre-defined stain-channels.
         We cluster superpixels, label centers (PP/MID/PV), then search for ring-like PP/PV regions
@@ -792,6 +867,9 @@ class LobuleSegmentor(BaseOperator):
         """
         # 1) Superpixel generation
         image_stack = pad_image(image_stack, pad)
+        if fg_maxproj is not None:
+            fg_maxproj = np.pad(fg_maxproj, ((pad, pad), (pad, pad)),
+                                mode="constant", constant_values=0.0)
 
         console.print("Generating superpixels...", style="info")
         superpixelslic = cv2.ximgproc.createSuperpixelSLIC(
@@ -815,21 +893,43 @@ class LobuleSegmentor(BaseOperator):
         counts = np.bincount(lab_flat, minlength=num_labels).astype(np.int32)
         nz = counts > 0
 
-        dark_flat = (img_flat <= 0).astype(np.uint8)
-        dark_counts = np.vstack([
-            np.bincount(lab_flat, weights=dark_flat[:, c], minlength=num_labels)
-            for c in range(C)
-        ]).T
-        dark_frac = np.divide(dark_counts, counts[:, None], where=nz[:, None])
+        # Foreground detection using fg_maxproj (float32, pre-Otsu, pre-uint8).
+        if fg_maxproj is not None:
+            tissue_full = (fg_maxproj > 0).astype(np.uint8)
+            close_se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            tissue_full = cv2.morphologyEx(tissue_full, cv2.MORPH_CLOSE, close_se)
 
-        base_fg_label_mask = ~(dark_frac > 0.5).any(axis=1)
+            tissue_flat = tissue_full.ravel().astype(np.float32)
+            signal_counts = np.bincount(
+                lab_flat, weights=tissue_flat, minlength=num_labels,
+            )
+            signal_frac = np.zeros(num_labels, dtype=np.float32)
+            np.divide(signal_counts, counts, out=signal_frac, where=nz)
+            base_fg_label_mask = signal_frac > self.fg_min_signal_frac
+        else:
+            # Fallback: max-projection across channels of the filtered stack.
+            maxproj_flat = img_flat.max(axis=1)
+            signal_flat = (maxproj_flat > 0).astype(np.float32)
+            signal_counts = np.bincount(
+                lab_flat, weights=signal_flat, minlength=num_labels,
+            )
+            signal_frac = np.zeros(num_labels, dtype=np.float32)
+            np.divide(signal_counts, counts, out=signal_frac, where=nz)
+            base_fg_label_mask = signal_frac > self.fg_min_signal_frac
 
         # Keep base_gray for display only
         base_gray = image_stack.mean(axis=2).astype(np.uint8)
 
         # IMPORTANT: use float per-pixel mean (old behavior), not uint8-cast mean
         # This matters when thresholds are very low (e.g. 3–10).
+        # When fg_maxproj is available, lift gray_flat where the Otsu mask zeroed
+        # the filtered data but raw data has signal.
         gray_flat = img_flat.mean(axis=1).astype(np.float32)
+        if fg_maxproj is not None:
+            fg_mp_flat = fg_maxproj.ravel().astype(np.float32)
+            fg_mp_scaled = fg_mp_flat * 255.0
+            mask_lift = (gray_flat <= 0) & (fg_mp_scaled > 0)
+            gray_flat[mask_lift] = fg_mp_scaled[mask_lift]
 
         # Determine pixels that are definitely outside ROI (connected to border and ==0 in all channels)
         # Pixels that are exactly 0 across all channels correspond to padded/outside ROI area.
@@ -960,6 +1060,19 @@ class LobuleSegmentor(BaseOperator):
                     out[cc_lab == cc_id] = False
             return out
 
+        # Diagnostic: save the initial FG mask BEFORE vessel punch-out
+        # but AFTER border-BG exclusion (so the ROI boundary is visible).
+        if report_path is not None:
+            diag_fg = base_fg_label_mask.copy()
+            if border_bg_sp_ids is not None and getattr(border_bg_sp_ids, "size", 0) > 0:
+                diag_fg[border_bg_sp_ids] = False
+            base_fg_sp_ids = np.nonzero(diag_fg)[0]
+            base_fg_px = np.isin(labels, base_fg_sp_ids)
+            cv2.imwrite(
+                str(report_path / "superpixels_bg_fg_before_punchout.png"),
+                bool_mask_to_uint8(base_fg_px),
+            )
+
         fg_label_mask, fg_labels, fg_pix_mask, vessel_pix_mask = compute_fg_masks(
             self.vessel_pct_low,
             self.vessel_pct_superpixel_frac,
@@ -1024,48 +1137,79 @@ class LobuleSegmentor(BaseOperator):
             plt.close(fig)
 
         # 2) Weighted KMeans over superpixel mean features
+        #    Only PV/PP channels participate; structural channels excluded.
         console.print(f"Complete. Cluster (n={self.n_clusters}) the foreground superpixels based on superpixel mean values...",
                       style="info")
 
-        X = X_means.copy()
-        C = X.shape[1]
+        # Build the subset of channels used for KMeans (PV + PP only).
+        clustering_channels = sorted(set(
+            (self.channels_pv or []) + (self.channels_pp or [])
+        ))
+        _ch_remap = {orig: new for new, orig in enumerate(clustering_channels)}
+        km_pp = [_ch_remap[c] for c in (self.channels_pp or []) if c in _ch_remap]
+        km_pv = [_ch_remap[c] for c in (self.channels_pv or []) if c in _ch_remap]
 
-        if self.nonlinear_kmeans:
-            # non-linear lifting
-            X = nonlinear_channel_weighting(
-                X,
-                self.channels_pp,
-                self.channels_pv,
-                self.pp_gamma,
-                self.pv_gamma,
-                self.nl_low_pct,
-                self.nl_high_pct,
+        X = X_means[:, clustering_channels].copy()
+        Ck = X.shape[1]
+
+        # Quantile normalization: auto-enable when only one polarity is given.
+        use_quantile = self.quantile_kmeans
+        if use_quantile is None:
+            one_polarity = bool(km_pv and not km_pp) or bool(km_pp and not km_pv)
+            use_quantile = one_polarity
+
+        if use_quantile:
+            console.print(
+                "Applying quantile normalization to KMeans features "
+                "(uniform distribution → balanced cluster sizes).",
+                style="info",
             )
+            X = quantile_normalize_features(X)
+            # Gamma/alpha weighting is counterproductive on uniform data.
+            Xw = X
+        else:
+            if self.nonlinear_kmeans:
+                X = nonlinear_channel_weighting(
+                    X,
+                    km_pp or None,
+                    km_pv or None,
+                    self.pp_gamma,
+                    self.pv_gamma,
+                    self.nl_low_pct,
+                    self.nl_high_pct,
+                )
 
-        # linear weights
-        w_feat = np.ones(C, dtype=np.float32)
-        if self.channels_pp is not None:
-            w_feat[self.channels_pp] *= self.alpha_pp
-        if self.channels_pv is not None:
-            w_feat[self.channels_pv] *= self.alpha_pv
-        Xw = X * w_feat
+            w_feat = np.ones(Ck, dtype=np.float32)
+            if km_pp:
+                for idx in km_pp:
+                    w_feat[idx] *= self.alpha_pp
+            if km_pv:
+                for idx in km_pv:
+                    w_feat[idx] *= self.alpha_pv
+            Xw = X * w_feat
 
         kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
         kmeans.fit(Xw)
 
-        centers = kmeans.cluster_centers_ / w_feat
+        # Recover original-scale centers for semantic role assignment.
+        X_orig = X_means[:, clustering_channels].copy()
+        centers = np.zeros((self.n_clusters, Ck), dtype=np.float32)
+        for ki in range(self.n_clusters):
+            mask_ki = (kmeans.labels_ == ki)
+            if np.any(mask_ki):
+                centers[ki] = X_orig[mask_ki].mean(axis=0)
         labels_k = kmeans.labels_
 
-        # 3) Assign semantic roles PP/MID/PV
-        channels_pp = self.channels_pp
-        channels_pv = self.channels_pv
-        if (channels_pp is not None) and (channels_pv is not None):
+        # 3) Assign semantic roles PP/MID/PV (using remapped indices)
+        channels_pp = km_pp
+        channels_pv = km_pv
+        if channels_pp and channels_pv:
             pp_scores = centers[:, channels_pp].mean(axis=1)
             pv_scores = centers[:, channels_pv].mean(axis=1)
             idx_pp = int(np.argmax(pp_scores))
             pv_order = np.argsort(-pv_scores)
             idx_pv = int(pv_order[0] if pv_order[0] != idx_pp else pv_order[1])
-        elif channels_pp is not None:
+        elif channels_pp:
             s = centers[:, channels_pp].mean(axis=1)
             idx_pp = int(np.argmax(s))
             idx_pv = int(np.argmin(s))
@@ -1154,10 +1298,13 @@ class LobuleSegmentor(BaseOperator):
             se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
 
             def _collect_candidates_from_mask(mask_u8: np.ndarray) -> List[
-                Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]:
+                Tuple[Tuple[int,int,int,int], np.ndarray, np.ndarray, np.ndarray, float, float]]:
                 """
-                Returns list of (hole_bool, ring_bool, contour, area, circularity)
-                from BOTH closed holes and edge-truncated arcs synthesized via erosion.
+                Returns list of (bbox, hole_roi, ring_roi, contour, area, circularity).
+                bbox = (y0, x0, y1, x1) for slicing full-res arrays.
+                hole_roi / ring_roi are small bool arrays matching the bbox crop.
+
+                Uses ROI crops for all morphological ops to avoid OOM on large images.
                 """
                 out = []
                 contours, hierarchy = cv2.findContours(mask_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -1168,6 +1315,7 @@ class LobuleSegmentor(BaseOperator):
                 # permissive minima for candidate gen (final class later)
                 min_area = min(int(min_vessel_area_pp), int(min_vessel_area_pv))
                 circ_min = float(vessel_circularity_min) * 0.9
+                margin = 2 * k + 2  # padding around bbox for dilate/erode
 
                 for i, cnt in enumerate(contours):
                     # A) CLOSED HOLES (child contours)
@@ -1180,23 +1328,29 @@ class LobuleSegmentor(BaseOperator):
                         if circ < circ_min:
                             continue
 
-                        hole_mask = np.zeros((H, W), dtype=np.uint8)
-                        cv2.drawContours(hole_mask, [cnt], -1, 255, thickness=cv2.FILLED)
-                        hole_bool = hole_mask > 0
+                        bx, by, bw, bh = cv2.boundingRect(cnt)
+                        y0 = max(by - margin, 0)
+                        x0 = max(bx - margin, 0)
+                        y1 = min(by + bh + margin, H)
+                        x1 = min(bx + bw + margin, W)
 
-                        dil = cv2.dilate(hole_mask, se)
-                        ero = cv2.erode(hole_mask, se)
-                        ring = cv2.subtract(dil, ero)
-                        ring_bool = ring > 0
-                        if not np.any(ring_bool):
+                        roi_h, roi_w = y1 - y0, x1 - x0
+                        hole_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+                        cnt_shifted = cnt - np.array([x0, y0])
+                        cv2.drawContours(hole_roi, [cnt_shifted], -1, 255, thickness=cv2.FILLED)
+
+                        dil = cv2.dilate(hole_roi, se)
+                        ero = cv2.erode(hole_roi, se)
+                        ring_roi = cv2.subtract(dil, ero)
+                        if not np.any(ring_roi > 0):
                             continue
 
-                        out.append((hole_bool, ring_bool, cnt, area, circ))
+                        out.append(((y0, x0, y1, x1), hole_roi > 0, ring_roi > 0, cnt, area, circ))
                         continue
 
                     # B) EDGE / TRUNCATED BLOBS (external contours touching border)
-                    x, y, w2, h2 = cv2.boundingRect(cnt)
-                    touches_border = (x == 0) or (y == 0) or (x + w2 == W) or (y + h2 == H)
+                    bx, by, bw, bh = cv2.boundingRect(cnt)
+                    touches_border = (bx == 0) or (by == 0) or (bx + bw == W) or (by + bh == H)
                     if not touches_border:
                         continue
 
@@ -1208,24 +1362,32 @@ class LobuleSegmentor(BaseOperator):
                     if circ_ext < circ_min:
                         continue
 
-                    ext_mask = np.zeros((H, W), dtype=np.uint8)
-                    cv2.drawContours(ext_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                    y0 = max(by - margin, 0)
+                    x0 = max(bx - margin, 0)
+                    y1 = min(by + bh + margin, H)
+                    x1 = min(bx + bw + margin, W)
+                    roi_h, roi_w = y1 - y0, x1 - x0
+
+                    ext_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+                    cnt_shifted = cnt - np.array([x0, y0])
+                    cv2.drawContours(ext_roi, [cnt_shifted], -1, 255, thickness=cv2.FILLED)
 
                     # ensure adjacency to background -> “open” ring
-                    border_contact = cv2.dilate((bg_bool.astype(np.uint8) * 255), se)
-                    if float(np.mean((border_contact > 0)[ext_mask > 0])) < 0.10:
+                    bg_roi = bg_bool[y0:y1, x0:x1].astype(np.uint8) * 255
+                    border_contact_roi = cv2.dilate(bg_roi, se)
+                    if float(np.mean((border_contact_roi > 0)[ext_roi > 0])) < 0.10:
                         continue
 
-                    inner = cv2.erode(ext_mask, se)
+                    inner = cv2.erode(ext_roi, se)
                     synth_hole = cv2.erode(inner, se)
                     ring_e = cv2.subtract(inner, synth_hole)
 
-                    hole_bool = synth_hole > 0
-                    ring_bool = ring_e > 0
-                    if not np.any(hole_bool) or not np.any(ring_bool):
+                    hole_roi_b = synth_hole > 0
+                    ring_roi_b = ring_e > 0
+                    if not np.any(hole_roi_b) or not np.any(ring_roi_b):
                         continue
 
-                    out.append((hole_bool, ring_bool, cnt, area_ext, circ_ext))
+                    out.append(((y0, x0, y1, x1), hole_roi_b, ring_roi_b, cnt, area_ext, circ_ext))
 
                 return out
 
@@ -1253,24 +1415,27 @@ class LobuleSegmentor(BaseOperator):
             candidates = _collect_candidates_from_mask(mask_all)
 
             # classify by ring-majority; collect (no reassignment yet); then group & reassign
-            candidates.sort(key=lambda t: t[3], reverse=True)  # largest first
+            candidates.sort(key=lambda t: t[4], reverse=True)  # largest area first
 
-            # We'll keep full info so we can merge later:
-            kept_items: List[Tuple[np.ndarray, np.ndarray, int, int, np.ndarray]] = []
+            # kept_items: (bbox, hole_roi, cnt, cls, zone_idx, ring_roi)
+            kept_items: List[Tuple[Tuple[int,int,int,int], np.ndarray, np.ndarray, int, int, np.ndarray]] = []
 
-            for hole_bool, ring_bool, cnt, area_c, circ_c in candidates:
+            for bbox_roi, hole_roi, ring_roi, cnt, area_c, circ_c in candidates:
+                y0, x0, y1, x1 = bbox_roi
+                cm_crop = cluster_map[y0:y1, x0:x1]
+
                 # MID-aware classification (exclude MID & BG from denominator)
-                ring_is_mid = np.isin(cluster_map, idx_mid)
-                ring_mid = ring_bool & ring_is_mid
-                ring_bg = ring_bool & (cluster_map < 0)
-                ring_eligible = ring_bool & ~(ring_mid | ring_bg)
+                ring_is_mid = np.isin(cm_crop, idx_mid)
+                ring_mid = ring_roi & ring_is_mid
+                ring_bg = ring_roi & (cm_crop < 0)
+                ring_eligible = ring_roi & ~(ring_mid | ring_bg)
                 eligible_n = int(np.count_nonzero(ring_eligible))
                 if eligible_n == 0:
                     rejected_contours.append(cnt)
                     continue
 
-                pp_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pp)))
-                pv_count = int(np.count_nonzero(ring_eligible & (cluster_map == idx_pv)))
+                pp_count = int(np.count_nonzero(ring_eligible & (cm_crop == idx_pp)))
+                pv_count = int(np.count_nonzero(ring_eligible & (cm_crop == idx_pv)))
                 pp_frac = pp_count / float(eligible_n)
                 pv_frac = pv_count / float(eligible_n)
 
@@ -1302,11 +1467,11 @@ class LobuleSegmentor(BaseOperator):
                     cx = int(M["m10"] / M["m00"]);
                     cy = int(M["m01"] / M["m00"])
                 else:
-                    x, y, w2, h2 = cv2.boundingRect(cnt)
-                    cx, cy = x + w2 // 2, y + h2 // 2
+                    bx2, by2, bw2, bh2 = cv2.boundingRect(cnt)
+                    cx, cy = bx2 + bw2 // 2, by2 + bh2 // 2
 
                 nested = False
-                for (_h, prev_cnt, _c, _z, _r) in kept_items:
+                for (_bb, _h, prev_cnt, _c, _z, _r) in kept_items:
                     if cv2.pointPolygonTest(prev_cnt, (float(cx), float(cy)), False) >= 0:
                         nested = True
                         break
@@ -1314,11 +1479,13 @@ class LobuleSegmentor(BaseOperator):
                     rejected_contours.append(cnt)
                     continue
 
-                kept_items.append((hole_bool, cnt, cls, zone_idx, ring_bool))
+                kept_items.append((bbox_roi, hole_roi, cnt, cls, zone_idx, ring_roi))
 
             # Commit: reassign SPs for each detected vessel (no grouping)
-            for hole_bool, cnt, cls, zone_idx, _ring_bool in kept_items:
-                sp_inside = np.unique(labels[hole_bool])
+            for bbox_roi, hole_roi, cnt, cls, zone_idx, _ring_roi in kept_items:
+                y0, x0, y1, x1 = bbox_roi
+                lab_crop = labels[y0:y1, x0:x1]
+                sp_inside = np.unique(lab_crop[hole_roi])
                 for sp in sp_inside:
                     assigned_by_sp_local[int(sp)] = zone_idx
                 vessel_contours.append(cnt)
@@ -1708,6 +1875,7 @@ class LobuleSegmentor(BaseOperator):
         step = 0
 
         img_stack: Optional[np.ndarray] = None
+        fg_maxproj: Optional[np.ndarray] = None
         bbox: Optional[Tuple[int, int, int, int]] = None
         orig_shapes: Optional[Dict[int, Any]] = None
         img_size_base: Optional[Tuple[int, int]] = None
@@ -1739,7 +1907,7 @@ class LobuleSegmentor(BaseOperator):
 
             if step == 1:
                 console.print("Loading images...", style="info")
-                img_stack, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
+                img_stack, fg_maxproj, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
 
                 img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
 
@@ -1795,6 +1963,7 @@ class LobuleSegmentor(BaseOperator):
                         pad=pad,
                         region_size=self.region_size,
                         report_path=report_path,
+                        fg_maxproj=fg_maxproj,
                     )
 
                 except PipelineAbort:
@@ -1840,54 +2009,47 @@ class LobuleSegmentor(BaseOperator):
         # Crop mask by padding
         mask_cropped = mask[pad:-pad, pad:-pad]
 
-        console.print("Complete. Back-mapping mask to all pyramid levels...", style="info")
+        # ---- Everything below stays at base_level until the final save ----
 
-        # Step 10: Build masks for every level
-        mask_pyramid = build_mask_pyramid_from_processed(
-            mask_cropped=mask_cropped,
-            img_size_base=img_size_base,  # ROI size at base_level (after bbox crop)
-            bbox_base=bbox,  # bbox in base_level coords
-            orig_shapes=orig_shapes,  # {level: (H,W)} from self.load_image(0)
-            base_level=self.base_level,
-        )
-
-        console.print("Complete. Creating portality map at every pyramid level...", style="info")
-
-        # Prepare vessel contours in base-level full-frame coordinates
+        # Step 10a: Build base-level full-frame mask only (no pyramid yet).
         proc_h, proc_w = mask_cropped.shape
         Hb, Wb = img_size_base
         Hfull_base, Wfull_base = orig_shapes[self.base_level]
         min_r, min_c, max_r, max_c = bbox
 
+        roi_base = cv2.resize(
+            mask_cropped.astype(np.int32), (Wb, Hb),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(np.int32)
+        mask_base_full = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
+        r0 = max(0, min_r); c0 = max(0, min_c)
+        r1 = min(Hfull_base, max_r); c1 = min(Wfull_base, max_c)
+        if (r1 - r0) != Hb or (c1 - c0) != Wb:
+            roi_base = cv2.resize(roi_base, (c1 - c0, r1 - r0),
+                                  interpolation=cv2.INTER_NEAREST).astype(np.int32)
+        mask_base_full[r0:r1, c0:c1] = roi_base
+
+        console.print("Complete. Creating portality map...", style="info")
+
+        # Step 10b: Vessel contours in base-level full-frame coordinates.
         cv_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 0]
         pf_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 1]
 
         cv_cnt_base = to_base_full(cv_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
         pf_cnt_base = to_base_full(pf_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
 
-        # Compute per-level portality
-        portality_pyramid: Dict[int, np.ndarray] = {}
-        for lvl, (Hdst, Wdst) in orig_shapes.items():
-            full_mask = mask_pyramid[lvl]
-            if lvl == self.base_level:
-                cv_lvl = cv_cnt_base
-                pf_lvl = pf_cnt_base
-                P = mask_to_portality(full_mask, cv_lvl, pf_lvl, report_path=None)
-            else:
-                cv_lvl = rescale_full(cv_cnt_base, Hfull_base, Wfull_base, Hdst, Wdst)
-                pf_lvl = rescale_full(pf_cnt_base, Hfull_base, Wfull_base, Hdst, Wdst)
-                P = mask_to_portality(full_mask, cv_lvl, pf_lvl, report_path=None)
-            portality_pyramid[lvl] = P.astype(np.float32)
+        # Step 10c: Portality at base_level only.
+        P_base = mask_to_portality(
+            mask_base_full, cv_cnt_base, pf_cnt_base, report_path=None,
+        ).astype(np.float32)
 
         # Crop base-level portality to ROI and save fixed-size PNG
-        P_base_full = portality_pyramid[self.base_level]
-        portality_cropped = P_base_full[min_r:max_r, min_c:max_c]
+        portality_cropped = P_base[min_r:max_r, min_c:max_c]
 
         cmap = plt.get_cmap("magma").copy()
         cmap.set_bad(alpha=0.0)
         Pm = np.ma.masked_invalid(portality_cropped).astype(np.float32)
 
-        # write ROI-sized portality.png so size matches other images
         plt.imsave(str(report_path / "portality.png"), Pm, cmap=cmap, vmin=0.0, vmax=1.0)
 
         # Preview after portality is available
@@ -1895,7 +2057,6 @@ class LobuleSegmentor(BaseOperator):
             orig_vis = img_stack.mean(axis=2).astype(np.uint8)
             overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
 
-            # build RGBA from the already-cropped map
             portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
             portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
 
@@ -1911,13 +2072,30 @@ class LobuleSegmentor(BaseOperator):
             )
 
             if action == "back":
-                # Back from the final preview should typically return to the last interactive stage.
-                # Assumption: step 3 = superpixels / KMeans / vessels.
                 raise PipelineBack(3)
 
             if self.confirm and action == "closed":
                 console.print("Aborted by user at final preview. No outputs written.", style="error")
                 return self.metadata
+
+        # Step 11: Build full pyramids only now (for saving).
+        console.print("Building pyramids for all levels...", style="info")
+
+        mask_pyramid: Dict[int, np.ndarray] = {}
+        portality_pyramid: Dict[int, np.ndarray] = {}
+        for lvl, (Hdst, Wdst) in orig_shapes.items():
+            if lvl == self.base_level:
+                mask_pyramid[lvl] = mask_base_full
+                portality_pyramid[lvl] = P_base
+            else:
+                mask_pyramid[lvl] = cv2.resize(
+                    mask_base_full, (Wdst, Hdst),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(np.int32)
+                portality_pyramid[lvl] = cv2.resize(
+                    P_base, (Wdst, Hdst),
+                    interpolation=cv2.INTER_LINEAR,
+                ).astype(np.float32)
 
         # Save mask pyramid
         seg_path = report_path / f"{new_uid}_seg.tiff"
@@ -1944,10 +2122,9 @@ class LobuleSegmentor(BaseOperator):
 
         console.print("Complete.", style="info")
 
-        # Memory Management
-        del (portality_pyramid, P, P_base_full, Pm, full_mask, img_stack, mask, mask_pyramid, mask_cropped,
-             line_segments, cv_cnt_base, cv_cnt_roi, cv_lvl, orig_vis, overlay_vis, pf_cnt_base, pf_cnt_roi, pf_lvl,
-             portality_cropped, portality_rgba, thinned, vessel_classes, vessel_contours)
+        del (portality_pyramid, P_base, Pm, img_stack, mask, mask_base_full, mask_pyramid, mask_cropped,
+             line_segments, cv_cnt_base, cv_cnt_roi, pf_cnt_base, pf_cnt_roi,
+             portality_cropped, thinned, vessel_classes, vessel_contours)
 
         # Return both metadata objects
         return new_meta, new_port

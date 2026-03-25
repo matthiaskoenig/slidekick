@@ -346,6 +346,37 @@ def nonlinear_channel_weighting(
     return Xo
 
 
+def quantile_normalize_features(X: np.ndarray) -> np.ndarray:
+    """
+    Replace each column of *X* with its per-column percentile rank in [0, 1].
+
+    Transforms a skewed intensity distribution into a uniform one so KMeans
+    splits the data into roughly equal-sized clusters.  Useful when only one
+    polarity (PV-only or PP-only) is available and the raw intensity gradient
+    is very steep, leaving the midzone extremely thin.
+    """
+    Xq = np.empty_like(X, dtype=np.float32)
+    N = X.shape[0]
+    if N <= 1:
+        return np.zeros_like(X, dtype=np.float32)
+    for c in range(X.shape[1]):
+        col = X[:, c]
+        order = np.argsort(col, kind="mergesort")
+        ranks = np.empty(N, dtype=np.float32)
+        ranks[order] = np.arange(1, N + 1, dtype=np.float32)
+        # average-rank for ties
+        unique_vals, inverse = np.unique(col, return_inverse=True)
+        if unique_vals.size < N:
+            mean_ranks = np.zeros(unique_vals.size, dtype=np.float64)
+            counts = np.zeros(unique_vals.size, dtype=np.int64)
+            np.add.at(mean_ranks, inverse, ranks)
+            np.add.at(counts, inverse, 1)
+            mean_ranks /= counts
+            ranks = mean_ranks[inverse].astype(np.float32)
+        Xq[:, c] = (ranks - 1.0) / max(float(N - 1), 1.0)
+    return Xq
+
+
 def to_base_full(contours_xy: List[np.ndarray],
                   pad_px: int,
                   bbox_base: Tuple[int, int, int, int],
@@ -484,13 +515,19 @@ def discover_pyramid_shapes(multiscale: Any) -> Dict[int, Tuple[int, int]]:
     Best-effort discovery of (H, W) per pyramid level.
 
     If a level fails to load, it is skipped.
+    Reads .shape lazily (zarr/dask) without loading pixel data into RAM.
     """
     out: Dict[int, Tuple[int, int]] = {}
     for lvl in discover_pyramid_levels(multiscale):
         try:
-            arr = np.asarray(load_level_from_multiscale(multiscale, lvl))
-            if arr.ndim >= 2:
+            arr = load_level_from_multiscale(multiscale, lvl)
+            # zarr / dask arrays expose .shape without loading data
+            if hasattr(arr, "shape") and len(arr.shape) >= 2:
                 out[int(lvl)] = (int(arr.shape[0]), int(arr.shape[1]))
+            else:
+                arr_np = np.asarray(arr)
+                if arr_np.ndim >= 2:
+                    out[int(lvl)] = (int(arr_np.shape[0]), int(arr_np.shape[1]))
         except Exception:
             continue
     return out
