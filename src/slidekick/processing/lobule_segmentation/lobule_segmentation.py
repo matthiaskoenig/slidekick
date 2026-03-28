@@ -169,7 +169,7 @@ class LobuleSegmentor(BaseOperator):
         self.pv_gamma = pv_gamma
         self.nl_low_pct = nl_low_pct
         self.nl_high_pct = nl_high_pct
-        self.quantile_kmeans = quantile_kmeans
+        self.quantile_kmeans = quantile_kmeans  # None = auto (single-polarity → True)
         self.spatial_smooth = bool(spatial_smooth)
         self.spatial_smooth_majority = float(spatial_smooth_majority)
         self.fg_min_signal_frac = float(fg_min_signal_frac)
@@ -426,6 +426,8 @@ class LobuleSegmentor(BaseOperator):
             bg = int(pending["bg"])
             clahe = int(pending["clahe"])
             self.base_level = lvl
+            self.bg_low_val = bg
+            self.clahe_bg_suppress = clahe
             self.fg_min_signal_frac = float(pending["fg_frac"])
 
             raw = _get_raw_stack(lvl)
@@ -524,14 +526,14 @@ class LobuleSegmentor(BaseOperator):
         H, W, C = stack_small.shape
 
         # Resolve quantile_kmeans auto for the checkbox default.
-        _qk_resolved = self.quantile_kmeans
-        if _qk_resolved is None:
-            _qk_resolved = bool(self.channels_pv and not self.channels_pp) or \
-                           bool(self.channels_pp and not self.channels_pv)
+        _qk_auto = self.quantile_kmeans
+        if _qk_auto is None:
+            _qk_auto = bool(self.channels_pv and not self.channels_pp) or \
+                        bool(self.channels_pp and not self.channels_pv)
 
         defaults = dict(
+            quantile_kmeans=bool(_qk_auto),
             nonlinear_kmeans=self.nonlinear_kmeans,
-            quantile_kmeans=bool(_qk_resolved),
             spatial_smooth=self.spatial_smooth,
             spatial_smooth_majority=self.spatial_smooth_majority,
             alpha_pp=self.alpha_pp,
@@ -543,56 +545,71 @@ class LobuleSegmentor(BaseOperator):
         )
         pending = dict(defaults)
 
-        def compute_pp_pv_images() -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        def compute_weight_previews():
+            """Returns (pp_img, pv_img).
+
+            pp_img : (H,W) float32 or None — per-pixel weighted mean of PP channels.
+            pv_img : (H,W) float32 or None — per-pixel weighted mean of PV channels.
+
+            Works directly on pixel intensities (no superpixels / KMeans) so the
+            preview is fast and avoids the FG-detection mismatch that made the
+            clustering overlay unreliable.
+            """
             flat = stack_small.reshape(-1, C).astype(np.float32)
 
-            channels_pp = [c for c in (self.channels_pp or []) if 0 <= c < C]
-            channels_pv = [c for c in (self.channels_pv or []) if 0 <= c < C]
+            # Channel subsetting (PV + PP only).
+            cl_ch = sorted(set((self.channels_pv or []) + (self.channels_pp or [])))
+            cl_ch = [c for c in cl_ch if c < C]
+            if not cl_ch:
+                cl_ch = list(range(C))
+            remap = {orig: new for new, orig in enumerate(cl_ch)}
+            km_pp = [remap[c] for c in (self.channels_pp or []) if c in remap]
+            km_pv = [remap[c] for c in (self.channels_pv or []) if c in remap]
+            Ck = len(cl_ch)
 
+            X = flat[:, cl_ch].copy()  # (N_pixels, Ck)
+
+            # Apply the same nonlinear + alpha transforms as skeletize_kmeans
+            # so the user can see how gamma / pct / alpha affect the raw signal.
             if self.nonlinear_kmeans:
                 X = nonlinear_channel_weighting(
-                    flat,
-                    channels_pp,
-                    channels_pv,
-                    self.pp_gamma,
-                    self.pv_gamma,
-                    self.nl_low_pct,
-                    self.nl_high_pct,
+                    X, km_pp or None, km_pv or None,
+                    self.pp_gamma, self.pv_gamma,
+                    self.nl_low_pct, self.nl_high_pct,
                 )
-            else:
-                X = flat
+            dual_polarity = bool(km_pp and km_pv)
+            if dual_polarity:
+                w_feat = np.ones(Ck, dtype=np.float32)
+                for idx in km_pp:
+                    w_feat[idx] *= float(self.alpha_pp)
+                for idx in km_pv:
+                    w_feat[idx] *= float(self.alpha_pv)
+                X = X * w_feat
 
-            w_feat = np.ones(X.shape[1], dtype=np.float32)
-            for idx_ch in channels_pp:
-                w_feat[idx_ch] *= float(self.alpha_pp)
-            for idx_ch in channels_pv:
-                w_feat[idx_ch] *= float(self.alpha_pv)
+            def _build(ch_indices):
+                if not ch_indices:
+                    return None
+                img = X[:, ch_indices].mean(axis=1).reshape(H, W)
+                lo, hi = float(img.min()), float(img.max())
+                if hi > lo:
+                    img = ((img - lo) / (hi - lo)).astype(np.float32)
+                return img
 
-            Xw_img = (X * w_feat).reshape(H, W, C)
-
-            pp_img: Optional[np.ndarray] = None
-            pv_img: Optional[np.ndarray] = None
-
-            if channels_pp:
-                pp_vals = Xw_img[..., channels_pp]
-                pp_float = pp_vals if pp_vals.ndim == 2 else pp_vals.mean(axis=2)
-                pp_img = minmax_to_uint8(pp_float)
-
-            if channels_pv:
-                pv_vals = Xw_img[..., channels_pv]
-                pv_float = pv_vals if pv_vals.ndim == 2 else pv_vals.mean(axis=2)
-                pv_img = minmax_to_uint8(pv_float)
-
-            return pp_img, pv_img
+            return _build(km_pp), _build(km_pv)
 
         viewer = napari.Viewer()
+
+        # Base grayscale layer for context
+        base_gray = stack_small[:, :, channels_interest].mean(axis=2).astype(np.uint8)
+        viewer.add_image(base_gray, name="base (mean)", colormap="gray",
+                         blending="translucent", opacity=0.6)
 
         pp_layer = None
         pv_layer = None
 
         def _apply_update() -> None:
-            self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
             self.quantile_kmeans = bool(pending["quantile_kmeans"])
+            self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
             self.spatial_smooth = bool(pending["spatial_smooth"])
             self.spatial_smooth_majority = float(pending["spatial_smooth_majority"])
             self.alpha_pp = float(pending["alpha_pp"])
@@ -602,32 +619,29 @@ class LobuleSegmentor(BaseOperator):
             self.nl_low_pct = float(pending["nl_low_pct"])
             self.nl_high_pct = float(pending["nl_high_pct"])
 
-            new_pp, new_pv = compute_pp_pv_images()
+            pp_img, pv_img = compute_weight_previews()
 
             nonlocal pp_layer, pv_layer
-            if new_pp is not None:
+
+            # PP weighting overlay (green, additive)
+            if pp_img is not None:
                 if pp_layer is None:
                     pp_layer = viewer.add_image(
-                        new_pp,
-                        name="PP channel (weighted)",
-                        colormap="green",
-                        blending="additive",
-                        opacity=0.5,
+                        pp_img, name="PP channels (weighted)",
+                        colormap="green", blending="additive", opacity=0.5,
                     )
                 else:
-                    pp_layer.data = new_pp
+                    pp_layer.data = pp_img
 
-            if new_pv is not None:
+            # PV weighting overlay (magenta, additive)
+            if pv_img is not None:
                 if pv_layer is None:
                     pv_layer = viewer.add_image(
-                        new_pv,
-                        name="PV channel (weighted)",
-                        colormap="magenta",
-                        blending="additive",
-                        opacity=0.5,
+                        pv_img, name="PV channels (weighted)",
+                        colormap="magenta", blending="additive", opacity=0.5,
                     )
                 else:
-                    pv_layer.data = new_pv
+                    pv_layer.data = pv_img
 
         # Initial render uses current self.* once
         pending.update(defaults)
@@ -636,9 +650,9 @@ class LobuleSegmentor(BaseOperator):
         @magicgui(
             layout="vertical",
             auto_call=True,  # stages values only
-            nonlinear_kmeans={"widget_type": "CheckBox"},
             quantile_kmeans={"widget_type": "CheckBox",
-                             "tooltip": "Rank-normalize features before KMeans for balanced cluster sizes."},
+                             "tooltip": "Rank-normalize features before KMeans (balanced zone sizes)."},
+            nonlinear_kmeans={"widget_type": "CheckBox"},
             spatial_smooth={"widget_type": "CheckBox",
                             "tooltip": "Majority-vote smoothing of cluster labels after KMeans."},
             spatial_smooth_majority={"min": 0.5, "max": 1.0, "step": 0.05,
@@ -651,8 +665,8 @@ class LobuleSegmentor(BaseOperator):
             nl_high_pct={"min": 50.0, "max": 100.0, "step": 0.5},
         )
         def weighting_controls(
+                quantile_kmeans: bool = bool(_qk_auto),
                 nonlinear_kmeans: bool = self.nonlinear_kmeans,
-                quantile_kmeans: bool = bool(_qk_resolved),
                 spatial_smooth: bool = self.spatial_smooth,
                 spatial_smooth_majority: float = self.spatial_smooth_majority,
                 alpha_pp: float = self.alpha_pp,
@@ -662,8 +676,8 @@ class LobuleSegmentor(BaseOperator):
                 nl_low_pct: float = self.nl_low_pct,
                 nl_high_pct: float = self.nl_high_pct,
         ):
-            pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
             pending["quantile_kmeans"] = bool(quantile_kmeans)
+            pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
             pending["spatial_smooth"] = bool(spatial_smooth)
             pending["spatial_smooth_majority"] = float(spatial_smooth_majority)
             pending["alpha_pp"] = float(alpha_pp)
@@ -679,8 +693,8 @@ class LobuleSegmentor(BaseOperator):
         def on_reset() -> None:
             pending.update(defaults)
 
-            weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
             weighting_controls.quantile_kmeans.value = defaults["quantile_kmeans"]
+            weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
             weighting_controls.spatial_smooth.value = defaults["spatial_smooth"]
             weighting_controls.spatial_smooth_majority.value = defaults["spatial_smooth_majority"]
             weighting_controls.alpha_pp.value = defaults["alpha_pp"]
@@ -1152,41 +1166,41 @@ class LobuleSegmentor(BaseOperator):
         X = X_means[:, clustering_channels].copy()
         Ck = X.shape[1]
 
-        # Quantile normalization: auto-enable when only one polarity is given.
+        # Quantile normalisation: resolve None → auto (single-polarity → True).
         use_quantile = self.quantile_kmeans
         if use_quantile is None:
-            one_polarity = bool(km_pv and not km_pp) or bool(km_pp and not km_pv)
-            use_quantile = one_polarity
-
+            use_quantile = bool(km_pv and not km_pp) or bool(km_pp and not km_pv)
         if use_quantile:
             console.print(
-                "Applying quantile normalization to KMeans features "
-                "(uniform distribution → balanced cluster sizes).",
+                "Applying quantile normalisation to KMeans features "
+                "(uniform distribution for balanced zone sizes).",
                 style="info",
             )
             X = quantile_normalize_features(X)
-            # Gamma/alpha weighting is counterproductive on uniform data.
-            Xw = X
-        else:
-            if self.nonlinear_kmeans:
-                X = nonlinear_channel_weighting(
-                    X,
-                    km_pp or None,
-                    km_pv or None,
-                    self.pp_gamma,
-                    self.pv_gamma,
-                    self.nl_low_pct,
-                    self.nl_high_pct,
-                )
 
+        if self.nonlinear_kmeans:
+            X = nonlinear_channel_weighting(
+                X,
+                km_pp or None,
+                km_pv or None,
+                self.pp_gamma,
+                self.pv_gamma,
+                self.nl_low_pct,
+                self.nl_high_pct,
+            )
+
+        # Alpha weighting only meaningful for dual-polarity (differential PP vs PV).
+        # For single-polarity, uniform scaling has no effect on KMeans boundaries.
+        dual_polarity = bool(km_pp and km_pv)
+        if dual_polarity:
             w_feat = np.ones(Ck, dtype=np.float32)
-            if km_pp:
-                for idx in km_pp:
-                    w_feat[idx] *= self.alpha_pp
-            if km_pv:
-                for idx in km_pv:
-                    w_feat[idx] *= self.alpha_pv
+            for idx in km_pp:
+                w_feat[idx] *= self.alpha_pp
+            for idx in km_pv:
+                w_feat[idx] *= self.alpha_pv
             Xw = X * w_feat
+        else:
+            Xw = X
 
         kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
         kmeans.fit(Xw)
