@@ -93,8 +93,6 @@ class LobuleSegmentor(BaseOperator):
                  nl_low_pct: float = 5.0,
                  nl_high_pct: float = 90.0,
                  quantile_kmeans: Optional[bool] = None,
-                 spatial_smooth: bool = False,
-                 spatial_smooth_majority: float = 0.7,
                  fg_min_signal_frac: float = 0.05,
                  # vessel gating
                  interactive_vessels: bool = True,
@@ -170,8 +168,6 @@ class LobuleSegmentor(BaseOperator):
         self.nl_low_pct = nl_low_pct
         self.nl_high_pct = nl_high_pct
         self.quantile_kmeans = quantile_kmeans  # None = auto (single-polarity → True)
-        self.spatial_smooth = bool(spatial_smooth)
-        self.spatial_smooth_majority = float(spatial_smooth_majority)
         self.fg_min_signal_frac = float(fg_min_signal_frac)
 
         # vessel gating
@@ -534,8 +530,6 @@ class LobuleSegmentor(BaseOperator):
         defaults = dict(
             quantile_kmeans=bool(_qk_auto),
             nonlinear_kmeans=self.nonlinear_kmeans,
-            spatial_smooth=self.spatial_smooth,
-            spatial_smooth_majority=self.spatial_smooth_majority,
             alpha_pp=self.alpha_pp,
             alpha_pv=self.alpha_pv,
             pp_gamma=self.pp_gamma,
@@ -610,8 +604,6 @@ class LobuleSegmentor(BaseOperator):
         def _apply_update() -> None:
             self.quantile_kmeans = bool(pending["quantile_kmeans"])
             self.nonlinear_kmeans = bool(pending["nonlinear_kmeans"])
-            self.spatial_smooth = bool(pending["spatial_smooth"])
-            self.spatial_smooth_majority = float(pending["spatial_smooth_majority"])
             self.alpha_pp = float(pending["alpha_pp"])
             self.alpha_pv = float(pending["alpha_pv"])
             self.pp_gamma = float(pending["pp_gamma"])
@@ -653,10 +645,6 @@ class LobuleSegmentor(BaseOperator):
             quantile_kmeans={"widget_type": "CheckBox",
                              "tooltip": "Rank-normalize features before KMeans (balanced zone sizes)."},
             nonlinear_kmeans={"widget_type": "CheckBox"},
-            spatial_smooth={"widget_type": "CheckBox",
-                            "tooltip": "Majority-vote smoothing of cluster labels after KMeans."},
-            spatial_smooth_majority={"min": 0.5, "max": 1.0, "step": 0.05,
-                                     "tooltip": "Fraction of neighbours that must agree to flip a superpixel."},
             alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
             alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
             pp_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
@@ -667,8 +655,6 @@ class LobuleSegmentor(BaseOperator):
         def weighting_controls(
                 quantile_kmeans: bool = bool(_qk_auto),
                 nonlinear_kmeans: bool = self.nonlinear_kmeans,
-                spatial_smooth: bool = self.spatial_smooth,
-                spatial_smooth_majority: float = self.spatial_smooth_majority,
                 alpha_pp: float = self.alpha_pp,
                 alpha_pv: float = self.alpha_pv,
                 pp_gamma: float = self.pp_gamma,
@@ -678,8 +664,6 @@ class LobuleSegmentor(BaseOperator):
         ):
             pending["quantile_kmeans"] = bool(quantile_kmeans)
             pending["nonlinear_kmeans"] = bool(nonlinear_kmeans)
-            pending["spatial_smooth"] = bool(spatial_smooth)
-            pending["spatial_smooth_majority"] = float(spatial_smooth_majority)
             pending["alpha_pp"] = float(alpha_pp)
             pending["alpha_pv"] = float(alpha_pv)
             pending["pp_gamma"] = float(pp_gamma)
@@ -695,8 +679,6 @@ class LobuleSegmentor(BaseOperator):
 
             weighting_controls.quantile_kmeans.value = defaults["quantile_kmeans"]
             weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
-            weighting_controls.spatial_smooth.value = defaults["spatial_smooth"]
-            weighting_controls.spatial_smooth_majority.value = defaults["spatial_smooth_majority"]
             weighting_controls.alpha_pp.value = defaults["alpha_pp"]
             weighting_controls.alpha_pv.value = defaults["alpha_pv"]
             weighting_controls.pp_gamma.value = defaults["pp_gamma"]
