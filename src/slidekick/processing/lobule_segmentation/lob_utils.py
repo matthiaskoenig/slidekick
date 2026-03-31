@@ -1,7 +1,8 @@
 import numpy as np
 import cv2
-from skimage.filters import threshold_multiotsu
-from skimage.morphology import closing, disk
+from scipy.ndimage import binary_fill_holes
+from skimage.filters import threshold_multiotsu, threshold_otsu
+from skimage.morphology import closing, opening, disk, remove_small_holes, remove_small_objects
 from skimage.color import label2rgb
 from typing import Tuple, Dict, List, Optional, Any, Sequence, Callable
 from collections.abc import Mapping
@@ -52,13 +53,41 @@ def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5,
 # is considered bimodal (true BG + tissue only, no microscopy artefact band).
 _MIC_BG_THRESHOLD = 0.05
 
+# Minimum relative gap between the two 3-class Otsu thresholds (fraction of
+# the intensity range).  When the thresholds are closer than this, the
+# histogram is effectively bimodal even if mic_bg_frac >= _MIC_BG_THRESHOLD.
+_MIN_THRESHOLD_GAP = 0.10
+
+
+def _is_bimodal(lbl: np.ndarray, idx_mid: int, thr_low: float, thr_high: float) -> bool:
+    """Decide whether a 3-class Otsu split really reflects 2 or 3 modes.
+
+    Two independent heuristics — either one triggering means bimodal:
+      1. The middle class contains < 5 % of pixels (it's a forced artefact).
+      2. The two Otsu thresholds are within 10 % of the 0-255 range of each
+         other, meaning the algorithm couldn't find a real valley between
+         them.
+    """
+    mic_bg_frac = float(np.sum(lbl == idx_mid)) / max(lbl.size, 1)
+    if mic_bg_frac < _MIC_BG_THRESHOLD:
+        return True
+    gap = abs(float(thr_high) - float(thr_low)) / 255.0
+    if gap < _MIN_THRESHOLD_GAP:
+        return True
+    return False
+
 
 def detect_tissue_mask_multiotsu(gray: np.ndarray,
                                  morphological_radius: int = 5,
                                  auto: bool = True,
                                  report_path: Path = None):
     """
-    Build a boolean tissue mask via 3-class multi-Otsu.
+    Build a boolean tissue mask distinguishing two cases:
+
+    Case A — trimodal: true background, microscopy/autofluorescence
+             background, and tissue.  Only the tissue class is kept.
+    Case B — bimodal:  true background and tissue only (no microscopy BG).
+             A direct 2-class Otsu is used for a cleaner split.
 
     Parameters
     ----------
@@ -67,34 +96,75 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
     morphological_radius : int
         Radius for morphological closing after thresholding.
     auto : bool
-        If True (default), automatically decide whether the histogram is
-        bimodal or trimodal based on the fraction of pixels in the middle
-        intensity class (mic_bg_frac):
-          - mic_bg_frac < _MIC_BG_THRESHOLD  → bimodal (good export): the
-            middle class is an artefact of forcing 3 classes onto 2 real
-            modes; both middle and top classes are included as tissue.
-          - mic_bg_frac >= _MIC_BG_THRESHOLD → trimodal (microscopy BG
-            present): only the top class is tissue.
-        If False, always use the legacy forced 3-class behaviour (tissue =
-        top class only), equivalent to the old multi_otsu=True path.
+        If True (default), automatically decide bimodal vs trimodal via
+        ``_is_bimodal``.  When bimodal, falls back to a direct 2-class
+        Otsu (more stable than forcing 3 classes onto 2 real modes).
+        If False, always use the forced 3-class behaviour (tissue =
+        top class only).
     report_path : Path, optional
         If provided, saves a debug PNG of the class labels.
     """
-    lbl, (i0, i1, i2) = multiotsu_split(gray, classes=3, blur_sigma=15, report_path=report_path)
-    if auto:
-        mic_bg_frac = float(np.sum(lbl == i1)) / lbl.size
-        if mic_bg_frac < _MIC_BG_THRESHOLD:
-            # Bimodal image: middle class is noise from forcing 3 onto 2 modes.
-            # Treat everything that is not true background as tissue.
-            m_tis = (lbl != i0)
-        else:
-            # Trimodal image: real microscopy background band; exclude it.
-            m_tis = (lbl == i2)
-    else:
-        # Legacy forced 3-class: tissue = top class only.
-        m_tis = (lbl == i2)
+    g = gray.astype(np.uint8)
+    g_blur = cv2.GaussianBlur(g, (0, 0), 15)
 
-    m_tis = closing(m_tis, disk(int(morphological_radius)))
+    # Always run 3-class first for the bimodal/trimodal decision.
+    thr3 = threshold_multiotsu(g_blur, classes=3)
+    lbl3 = np.digitize(gray, bins=thr3).astype(np.int32)
+    means3 = [gray[lbl3 == i].mean() if np.any(lbl3 == i) else -1 for i in range(3)]
+    order3 = np.argsort(means3)
+    idx_bg, idx_mid, idx_tis = int(order3[0]), int(order3[1]), int(order3[2])
+
+    if auto and _is_bimodal(lbl3, idx_mid, thr3[0], thr3[1]):
+        # Case B — bimodal: direct 2-class Otsu for a cleaner threshold.
+        try:
+            thr2 = threshold_otsu(g_blur)
+        except Exception:
+            thr2 = float(np.mean(gray)) - 1.0
+        m_tis = (gray > thr2)
+
+        if report_path is not None:
+            vis = np.zeros_like(g, dtype=np.uint8)
+            vis[m_tis] = 255
+            rp = Path(report_path)
+            if rp.is_dir():
+                rp = rp / "multiotsu_mask.png"
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(rp), vis)
+    else:
+        # Case A — trimodal (or forced 3-class): tissue = top class only.
+        m_tis = (lbl3 == idx_tis)
+
+        if report_path is not None:
+            vis = np.zeros_like(g, dtype=np.uint8)
+            vis[lbl3 == idx_bg] = 0
+            vis[lbl3 == idx_mid] = 128
+            vis[lbl3 == idx_tis] = 255
+            rp = Path(report_path)
+            if rp.is_dir():
+                rp = rp / "multiotsu_mask.png"
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(rp), vis)
+
+    # --- morphological cleanup ---
+    # 1) Large closing to bridge gaps within tissue (4× the base radius).
+    se_large = disk(max(int(morphological_radius) * 4, 20))
+    m_tis = closing(m_tis, se_large)
+
+    # 2) Fill all fully enclosed holes (dim zones inside tissue).
+    m_tis = binary_fill_holes(m_tis)
+
+    # 3) Remove small holes that touch the image border (binary_fill_holes
+    #    only fills holes that are completely enclosed).
+    hole_area = max(m_tis.shape[0] * m_tis.shape[1] // 20, 50000)
+    m_tis = remove_small_holes(m_tis, area_threshold=hole_area)
+
+    # 4) Drop tiny spurious foreground specks.
+    min_obj = max(m_tis.shape[0] * m_tis.shape[1] // 100, 10000)
+    m_tis = remove_small_objects(m_tis, min_size=min_obj)
+
+    # 5) Light opening to smooth ragged edges only.
+    se_small = disk(int(morphological_radius))
+    m_tis = opening(m_tis, se_small)
 
     return m_tis.astype(bool)
 
@@ -539,16 +609,19 @@ def add_napari_controls_dock(
     *,
     on_update: Optional[Callable[[], None]] = None,
     on_confirm: Optional[Callable[[], None]] = None,
+    on_apply_values: Optional[Callable[[], None]] = None,
     on_back: Optional[Callable[[], None]] = None,
     on_reset: Optional[Callable[[], None]] = None,
     on_abort: Optional[Callable[[], None]] = None,
     update_text: str = "Preview/Recalculate",
-    confirm_text: str = "Confirm and Continue",
+    confirm_text: str = "Confirm Current View",
+    apply_values_text: str = "apply slider values & continue",
     back_text: str = "Back",
     reset_text: str = "Reset Parameters",
     abort_text: str = "Abort",
     include_update: bool = True,
     include_confirm: bool = True,
+    include_apply_values: bool = True,
     include_back: bool = True,
     include_reset: bool = True,
     include_abort: bool = True,
@@ -560,10 +633,11 @@ def add_napari_controls_dock(
     Default button set (in this exact order)
     ----------------------------------------
       1) Preview/Recalculate
-      2) Confirm and Continue
-      3) Back
-      4) Reset Parameters
-      5) Abort
+      2) Confirm Current View      — uses last previewed result
+      3) Apply Slider Values & Continue — applies current slider values (even if not previewed)
+      4) Back
+      5) Reset Parameters
+      6) Abort
 
     Notes on environment compatibility
     ---------------------------------
@@ -658,6 +732,12 @@ def add_napari_controls_dock(
         widgets.append(confirm_btn)
         out["confirm"] = confirm_btn
 
+    if include_apply_values:
+        apply_values_btn = PushButton(text=str(apply_values_text))
+        _wire_button(apply_values_btn, on_apply_values)
+        widgets.append(apply_values_btn)
+        out["apply_values"] = apply_values_btn
+
     if include_back:
         back_btn = PushButton(text=str(back_text))
         _wire_button(back_btn, on_back)
@@ -689,15 +769,18 @@ def run_napari_preview_action(
     on_update: Optional[Callable[[], None]] = None,
     on_reset: Optional[Callable[[], None]] = None,
     on_confirm: Optional[Callable[[], None]] = None,
+    on_apply_values: Optional[Callable[[], None]] = None,
     on_back: Optional[Callable[[], None]] = None,
     on_abort: Optional[Callable[[], None]] = None,
     include_update: bool = True,
     include_confirm: bool = True,
+    include_apply_values: bool = True,
     include_back: bool = True,
     include_reset: bool = True,
     include_abort: bool = True,
     update_text: str = "Preview/Recalculate",
-    confirm_text: str = "Confirm and Continue",
+    confirm_text: str = "Confirm Current View",
+    apply_values_text: str = "apply slider values & continue",
     back_text: str = "Back",
     reset_text: str = "Reset Parameters",
     abort_text: str = "Abort",
@@ -706,9 +789,13 @@ def run_napari_preview_action(
     """
     Centralized napari preview runner for "button-only apply" previews.
 
-    - Wires the unified 5-button dock via add_napari_controls_dock
+    - Wires the unified 6-button dock via add_napari_controls_dock
     - Runs napari event loop
-    - Returns action in {"confirm","back","abort","closed"}
+    - Returns action in {"confirm","apply_values","back","abort","closed"}
+
+    "confirm"      — user accepted the last previewed result (current view).
+    "apply_values" — user wants to apply current slider values even if not
+                     previewed via Recalculate.
 
     Closing the viewer without pressing a button maps to:
       - "closed" if require_confirm=True
@@ -716,7 +803,7 @@ def run_napari_preview_action(
     """
     import napari
 
-    nav: Dict[str, Optional[str]] = {"action": None}  # "confirm" | "back" | "abort" | None (closed)
+    nav: Dict[str, Optional[str]] = {"action": None}
 
     def _safe_call(cb: Optional[Callable[[], None]]) -> None:
         if cb is None:
@@ -734,6 +821,11 @@ def run_napari_preview_action(
         nav["action"] = "confirm"
         viewer.close()
 
+    def _on_apply_values() -> None:
+        _safe_call(on_apply_values)
+        nav["action"] = "apply_values"
+        viewer.close()
+
     def _on_back() -> None:
         _safe_call(on_back)
         nav["action"] = "back"
@@ -749,16 +841,19 @@ def run_napari_preview_action(
         controls_widget,
         on_update=_on_update if include_update else None,
         on_confirm=_on_confirm if include_confirm else None,
+        on_apply_values=_on_apply_values if include_apply_values else None,
         on_back=_on_back if include_back else None,
         on_reset=_on_reset if include_reset else None,
         on_abort=_on_abort if include_abort else None,
         include_update=bool(include_update),
         include_confirm=bool(include_confirm),
+        include_apply_values=bool(include_apply_values),
         include_back=bool(include_back),
         include_reset=bool(include_reset),
         include_abort=bool(include_abort),
         update_text=str(update_text),
         confirm_text=str(confirm_text),
+        apply_values_text=str(apply_values_text),
         back_text=str(back_text),
         reset_text=str(reset_text),
         abort_text=str(abort_text),
@@ -857,10 +952,12 @@ def preview_images_napari(
         on_update=on_update,
         on_reset=on_reset,
         on_confirm=None,  # no state to apply
+        on_apply_values=None,
         on_back=None,     # no state to apply
         on_abort=None,    # no state to apply
         include_update=True,
         include_confirm=True,
+        include_apply_values=False,  # no sliders in image preview
         include_back=True,
         include_reset=True,
         include_abort=True,

@@ -102,6 +102,8 @@ class LobuleSegmentor(BaseOperator):
                  vessel_zone_ratio_thr_pp: float = 0.35,
                  vessel_zone_ratio_thr_pv: float = 0.55,
                  vessel_circularity_min: float = 0.12,
+                 vessel_circ_check_area_pp: int = 2000,
+                 vessel_circ_check_area_pv: int = 2000,
                  vessel_pct_low: float = 5.0,
                  vessel_pct_superpixel_frac: float = 0.7,
                  min_area_px: int = 5000):
@@ -141,6 +143,8 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_annulus_px: thickness (px) of ring-consistency check
         @param vessel_zone_ratio_thr_pv: fraction of ring that must be PV
         @param vessel_circularity_min: 4πA/P^2 gate; low keeps elongated vessels
+        @param vessel_circ_check_area_pp: PP vessels with area below this (px) are checked for circularity; vessels above pass without circularity check (large oblique cuts are expected non-circular)
+        @param vessel_circ_check_area_pv: PV vessels with area below this (px) are checked for circularity; vessels above pass without circularity check (large oblique cuts are expected non-circular)
         @param vessel_pct_low: global intensity threshold (0–255) on the per-pixel channel mean used to mark background/holes for vessel detection
         @param vessel_pct_superpixel_frac: minimal fraction of pixels below the intensity threshold inside a superpixel to mark it as background/hole
         @param min_area_px: define area threshold to filter out very small polygons (noise)
@@ -178,6 +182,8 @@ class LobuleSegmentor(BaseOperator):
         self.vessel_zone_ratio_thr_pp = vessel_zone_ratio_thr_pp
         self.vessel_zone_ratio_thr_pv = vessel_zone_ratio_thr_pv
         self.vessel_circularity_min = vessel_circularity_min
+        self.vessel_circ_check_area_pp = vessel_circ_check_area_pp
+        self.vessel_circ_check_area_pv = vessel_circ_check_area_pv
         self.vessel_pct_low = vessel_pct_low
         self.vessel_pct_superpixel_frac = vessel_pct_superpixel_frac
 
@@ -389,6 +395,17 @@ class LobuleSegmentor(BaseOperator):
             colormap="gray",
         )
 
+        def _compute_tissue_mask(filt: np.ndarray) -> np.ndarray:
+            """Compute tissue mask from filtered stack using current settings."""
+            gray = ensure_grayscale_uint8(filt)
+            morph_r = min(10, max(gray.shape) // 200)
+            if self.multi_otsu is False:
+                return detect_tissue_mask(gray, morphological_radius=morph_r)
+            return detect_tissue_mask_multiotsu(
+                gray, morphological_radius=morph_r,
+                auto=(self.multi_otsu is None),
+            )
+
         raw_layers: List[Any] = []
         filt_layers: List[Any] = []
         for c, title in enumerate(titles):
@@ -407,6 +424,15 @@ class LobuleSegmentor(BaseOperator):
                     colormap="gray",
                 )
             )
+
+        # Tissue mask overlay: shows what will be kept (True) vs removed (False)
+        tissue0 = _compute_tissue_mask(filt0)
+        tissue_layer = viewer.add_labels(
+            tissue0.astype(np.int8),
+            name="tissue mask",
+            opacity=0.3,
+            visible=False,
+        )
 
         defaults = {
             "level": int(default_level),
@@ -433,6 +459,7 @@ class LobuleSegmentor(BaseOperator):
             for c in range(raw.shape[2]):
                 raw_layers[c].data = raw[..., c]
                 filt_layers[c].data = filt[..., c]
+            tissue_layer.data = _compute_tissue_mask(filt).astype(np.int8)
 
         @magicgui(
             layout="vertical",
@@ -467,6 +494,11 @@ class LobuleSegmentor(BaseOperator):
             _apply_update()
 
         def on_confirm() -> None:
+            # Keep self.* as-is (last Recalculate or initial values).
+            # The user is confirming what they see, not unseen slider changes.
+            pass
+
+        def on_apply_values() -> None:
             _apply_update()
 
         def on_back() -> None:
@@ -479,13 +511,17 @@ class LobuleSegmentor(BaseOperator):
             on_update=on_update,
             on_reset=on_reset,
             on_confirm=on_confirm,
+            on_apply_values=on_apply_values,
             on_back=on_back,
         )
 
         if return_action:
+            # Both "confirm" and "apply_values" proceed forward
+            if action == "apply_values":
+                return "confirm"
             return action
 
-        return True if not require_confirm else (action == "confirm")
+        return True if not require_confirm else (action in ("confirm", "apply_values"))
 
     def _preview_channel_weighting(
             self,
@@ -689,6 +725,11 @@ class LobuleSegmentor(BaseOperator):
             _apply_update()
 
         def on_confirm() -> None:
+            # Keep self.* as-is (last Recalculate or initial values).
+            # The user is confirming what they see, not unseen slider changes.
+            pass
+
+        def on_apply_values() -> None:
             _apply_update()
 
         def on_back() -> None:
@@ -701,11 +742,14 @@ class LobuleSegmentor(BaseOperator):
             on_update=on_update,
             on_reset=on_reset,
             on_confirm=on_confirm,
+            on_apply_values=on_apply_values,
             on_back=on_back,
         )
 
         if return_action:
-            return action if action != "closed" else "confirm"
+            if action in ("closed", "apply_values"):
+                return "confirm"
+            return action
         return None
 
     def _load_and_invert_images_from_metadatas(
@@ -794,6 +838,7 @@ class LobuleSegmentor(BaseOperator):
         stack = crop_image(stack, bbox)
         # Crop the float32 max-projection with the same bbox.
         bx_raw, by_raw, bw_raw, bh_raw = bbox
+        fg_maxproj[~tissue_mask] = 0.0
         fg_maxproj = fg_maxproj[by_raw:by_raw + bh_raw, bx_raw:bx_raw + bw_raw]
         # Convert bbox from (x, y, w, h) to (min_r, min_c, max_r, max_c)
         # for downstream consumers (build_mask_pyramid, to_base_full, portality crop).
@@ -1257,6 +1302,8 @@ class LobuleSegmentor(BaseOperator):
                 vessel_zone_ratio_thr_pp: float,
                 vessel_zone_ratio_thr_pv: float,
                 vessel_circularity_min: float,
+                vessel_circ_check_area_pp: int,
+                vessel_circ_check_area_pv: int,
         ) -> Tuple[np.ndarray, List[int], List[np.ndarray], List[np.ndarray]]:
             """
             Run vessel detection and superpixel reassignment on top of the
@@ -1310,7 +1357,6 @@ class LobuleSegmentor(BaseOperator):
 
                 # permissive minima for candidate gen (final class later)
                 min_area = min(int(min_vessel_area_pp), int(min_vessel_area_pv))
-                circ_min = float(vessel_circularity_min) * 0.9
                 margin = 2 * k + 2  # padding around bbox for dilate/erode
 
                 for i, cnt in enumerate(contours):
@@ -1321,8 +1367,6 @@ class LobuleSegmentor(BaseOperator):
                             continue
                         peri = max(cv2.arcLength(cnt, True), 1e-6)
                         circ = float(4.0 * np.pi * area / (peri * peri))
-                        if circ < circ_min:
-                            continue
 
                         bx, by, bw, bh = cv2.boundingRect(cnt)
                         y0 = max(by - margin, 0)
@@ -1355,8 +1399,6 @@ class LobuleSegmentor(BaseOperator):
                         continue
                     peri_ext = max(cv2.arcLength(cnt, True), 1e-6)
                     circ_ext = float(4.0 * np.pi * area_ext / (peri_ext * peri_ext))
-                    if circ_ext < circ_min:
-                        continue
 
                     y0 = max(by - margin, 0)
                     x0 = max(bx - margin, 0)
@@ -1457,6 +1499,19 @@ class LobuleSegmentor(BaseOperator):
                     rejected_contours.append(cnt)
                     continue
 
+                # Class-specific circularity check for mid-sized vessels:
+                # Vessels below the circularity-check area must be sufficiently circular.
+                # Large vessels (above threshold) skip this check — oblique/non-planar
+                # cuts produce elongated cross-sections that are still valid.
+                if cls == 1 and float(area_c) < float(vessel_circ_check_area_pp):
+                    if circ_c < float(vessel_circularity_min):
+                        rejected_contours.append(cnt)
+                        continue
+                if cls == 0 and float(area_c) < float(vessel_circ_check_area_pv):
+                    if circ_c < float(vessel_circularity_min):
+                        rejected_contours.append(cnt)
+                        continue
+
                 # No nesting (centroid inside an existing kept contour of ANY class)
                 M = cv2.moments(cnt)
                 if M["m00"] > 0:
@@ -1505,6 +1560,8 @@ class LobuleSegmentor(BaseOperator):
             vessel_zone_ratio_thr_pp=self.vessel_zone_ratio_thr_pp,
             vessel_zone_ratio_thr_pv=self.vessel_zone_ratio_thr_pv,
             vessel_circularity_min=self.vessel_circularity_min,
+            vessel_circ_check_area_pp=self.vessel_circ_check_area_pp,
+            vessel_circ_check_area_pv=self.vessel_circ_check_area_pv,
         )
 
         if self.interactive_vessels:
@@ -1524,6 +1581,8 @@ class LobuleSegmentor(BaseOperator):
                 vessel_zone_ratio_thr_pp=float(self.vessel_zone_ratio_thr_pp),
                 vessel_zone_ratio_thr_pv=float(self.vessel_zone_ratio_thr_pv),
                 vessel_circularity_min=float(self.vessel_circularity_min),
+                vessel_circ_check_area_pp=int(self.vessel_circ_check_area_pp),
+                vessel_circ_check_area_pv=int(self.vessel_circ_check_area_pv),
             )
 
             def _make_zonation_rgb(cm_local: np.ndarray) -> np.ndarray:
@@ -1595,6 +1654,8 @@ class LobuleSegmentor(BaseOperator):
                 self.vessel_zone_ratio_thr_pp = float(pending["vessel_zone_ratio_thr_pp"])
                 self.vessel_zone_ratio_thr_pv = float(pending["vessel_zone_ratio_thr_pv"])
                 self.vessel_circularity_min = float(pending["vessel_circularity_min"])
+                self.vessel_circ_check_area_pp = int(pending["vessel_circ_check_area_pp"])
+                self.vessel_circ_check_area_pv = int(pending["vessel_circ_check_area_pv"])
 
             def _recompute_and_update_layers() -> None:
                 _apply_pending_to_self()
@@ -1606,7 +1667,9 @@ class LobuleSegmentor(BaseOperator):
                     f"annulus={self.vessel_annulus_px}, "
                     f"zone_thr_pp={self.vessel_zone_ratio_thr_pp:.2f}, "
                     f"zone_thr_pv={self.vessel_zone_ratio_thr_pv:.2f}, "
-                    f"circ_min={self.vessel_circularity_min:.2f}",
+                    f"circ_min={self.vessel_circularity_min:.2f}, "
+                    f"circ_area_pp={self.vessel_circ_check_area_pp}, "
+                    f"circ_area_pv={self.vessel_circ_check_area_pv}",
                     style="info",
                 )
 
@@ -1617,6 +1680,8 @@ class LobuleSegmentor(BaseOperator):
                     self.vessel_zone_ratio_thr_pp,
                     self.vessel_zone_ratio_thr_pv,
                     self.vessel_circularity_min,
+                    self.vessel_circ_check_area_pp,
+                    self.vessel_circ_check_area_pv,
                 )
 
                 zon_layer.data = _make_zonation_rgb(cm_local)
@@ -1631,6 +1696,8 @@ class LobuleSegmentor(BaseOperator):
                 self.vessel_zone_ratio_thr_pp,
                 self.vessel_zone_ratio_thr_pv,
                 self.vessel_circularity_min,
+                self.vessel_circ_check_area_pp,
+                self.vessel_circ_check_area_pv,
             )
 
             viewer = napari.Viewer()
@@ -1677,6 +1744,8 @@ class LobuleSegmentor(BaseOperator):
                 vessel_zone_ratio_thr_pp={"min": 0.0, "max": 1.0, "step": 0.01},
                 vessel_zone_ratio_thr_pv={"min": 0.0, "max": 1.0, "step": 0.01},
                 vessel_circularity_min={"min": 0.0, "max": 1.0, "step": 0.01},
+                vessel_circ_check_area_pp={"min": 0, "max": 50000, "step": 100},
+                vessel_circ_check_area_pv={"min": 0, "max": 50000, "step": 100},
             )
             def vessel_controls(
                     min_vessel_area_pp: int = int(self.min_vessel_area_pp),
@@ -1685,6 +1754,8 @@ class LobuleSegmentor(BaseOperator):
                     vessel_zone_ratio_thr_pp: float = float(self.vessel_zone_ratio_thr_pp),
                     vessel_zone_ratio_thr_pv: float = float(self.vessel_zone_ratio_thr_pv),
                     vessel_circularity_min: float = float(self.vessel_circularity_min),
+                    vessel_circ_check_area_pp: int = int(self.vessel_circ_check_area_pp),
+                    vessel_circ_check_area_pv: int = int(self.vessel_circ_check_area_pv),
             ):
                 pending["min_vessel_area_pp"] = int(min_vessel_area_pp)
                 pending["min_vessel_area_pv"] = int(min_vessel_area_pv)
@@ -1692,6 +1763,8 @@ class LobuleSegmentor(BaseOperator):
                 pending["vessel_zone_ratio_thr_pp"] = float(vessel_zone_ratio_thr_pp)
                 pending["vessel_zone_ratio_thr_pv"] = float(vessel_zone_ratio_thr_pv)
                 pending["vessel_circularity_min"] = float(vessel_circularity_min)
+                pending["vessel_circ_check_area_pp"] = int(vessel_circ_check_area_pp)
+                pending["vessel_circ_check_area_pv"] = int(vessel_circ_check_area_pv)
 
             def on_update() -> None:
                 _recompute_and_update_layers()
@@ -1704,6 +1777,8 @@ class LobuleSegmentor(BaseOperator):
                 self.vessel_zone_ratio_thr_pp = defaults["vessel_zone_ratio_thr_pp"]
                 self.vessel_zone_ratio_thr_pv = defaults["vessel_zone_ratio_thr_pv"]
                 self.vessel_circularity_min = defaults["vessel_circularity_min"]
+                self.vessel_circ_check_area_pp = defaults["vessel_circ_check_area_pp"]
+                self.vessel_circ_check_area_pv = defaults["vessel_circ_check_area_pv"]
 
                 # restore staged values
                 pending["min_vessel_area_pp"] = int(self.min_vessel_area_pp)
@@ -1712,6 +1787,8 @@ class LobuleSegmentor(BaseOperator):
                 pending["vessel_zone_ratio_thr_pp"] = float(self.vessel_zone_ratio_thr_pp)
                 pending["vessel_zone_ratio_thr_pv"] = float(self.vessel_zone_ratio_thr_pv)
                 pending["vessel_circularity_min"] = float(self.vessel_circularity_min)
+                pending["vessel_circ_check_area_pp"] = int(self.vessel_circ_check_area_pp)
+                pending["vessel_circ_check_area_pv"] = int(self.vessel_circ_check_area_pv)
 
                 # restore GUI values
                 vessel_controls.min_vessel_area_pp.value = defaults["min_vessel_area_pp"]
@@ -1720,11 +1797,21 @@ class LobuleSegmentor(BaseOperator):
                 vessel_controls.vessel_zone_ratio_thr_pp.value = defaults["vessel_zone_ratio_thr_pp"]
                 vessel_controls.vessel_zone_ratio_thr_pv.value = defaults["vessel_zone_ratio_thr_pv"]
                 vessel_controls.vessel_circularity_min.value = defaults["vessel_circularity_min"]
+                vessel_controls.vessel_circ_check_area_pp.value = defaults["vessel_circ_check_area_pp"]
+                vessel_controls.vessel_circ_check_area_pv.value = defaults["vessel_circ_check_area_pv"]
 
                 _recompute_and_update_layers()
 
             def on_confirm() -> None:
-                _recompute_and_update_layers()
+                # Do NOT recompute here. self.* already reflects the last
+                # Recalculate result, which is what the user previewed and is
+                # confirming.  Recomputing would silently apply any slider
+                # changes made AFTER the last Recalculate but BEFORE Confirm,
+                # producing a result the user never saw.
+                pass
+
+            def on_apply_values() -> None:
+                _apply_pending_to_self()
 
             def on_back() -> None:
                 _apply_pending_to_self()
@@ -1736,6 +1823,7 @@ class LobuleSegmentor(BaseOperator):
                 on_update=on_update,
                 on_reset=on_reset,
                 on_confirm=on_confirm,
+                on_apply_values=on_apply_values,
                 on_back=on_back,
             )
 
@@ -1753,6 +1841,8 @@ class LobuleSegmentor(BaseOperator):
             self.vessel_zone_ratio_thr_pp,
             self.vessel_zone_ratio_thr_pv,
             self.vessel_circularity_min,
+            self.vessel_circ_check_area_pp,
+            self.vessel_circ_check_area_pv,
         )
 
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
