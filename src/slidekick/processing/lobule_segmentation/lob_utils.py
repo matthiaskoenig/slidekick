@@ -80,91 +80,122 @@ def _is_bimodal(lbl: np.ndarray, idx_mid: int, thr_low: float, thr_high: float) 
 def detect_tissue_mask_multiotsu(gray: np.ndarray,
                                  morphological_radius: int = 5,
                                  auto: bool = True,
-                                 report_path: Path = None):
+                                 report_path: Path = None,
+                                 blur_frac: float = 0.007,
+                                 close_frac: float = 0.01,
+                                 open_frac: float = 0.003,
+                                 hole_area_frac: float = 0.05,
+                                 min_obj_frac: float = 0.01):
     """
-    Build a boolean tissue mask distinguishing two cases:
+    Build a boolean tissue mask using a two-stage approach:
 
-    Case A — trimodal: true background, microscopy/autofluorescence
-             background, and tissue.  Only the tissue class is kept.
-    Case B — bimodal:  true background and tissue only (no microscopy BG).
-             A direct 2-class Otsu is used for a cleaner split.
+    Stage 1 — Otsu thresholding to find a conservative foreground seed.
+              Uses the lowest Otsu threshold (keeps tissue + mic BG) to
+              avoid cutting into tissue.
+    Stage 2 — Flood-fill from image borders to identify the true
+              background (everything reachable from edges at low intensity).
+              This naturally preserves tissue interior and handles both
+              bimodal and trimodal cases.
+
+    All spatial parameters are expressed as fractions of image dimensions,
+    making the result resolution-invariant.
 
     Parameters
     ----------
     gray : np.ndarray
         2D uint8 grayscale image.
     morphological_radius : int
-        Radius for morphological closing after thresholding.
+        Legacy parameter, kept for API compatibility but no longer used
+        internally.
     auto : bool
-        If True (default), automatically decide bimodal vs trimodal via
-        ``_is_bimodal``.  When bimodal, falls back to a direct 2-class
-        Otsu (more stable than forcing 3 classes onto 2 real modes).
-        If False, always use the forced 3-class behaviour (tissue =
-        top class only).
+        If True (default), automatically decide bimodal vs trimodal.
     report_path : Path, optional
         If provided, saves a debug PNG of the class labels.
+    blur_frac : float
+        Gaussian sigma as fraction of min(H, W).
+    close_frac : float
+        Morphological closing disk radius as fraction of min(H, W).
+    open_frac : float
+        Morphological opening disk radius as fraction of min(H, W).
+    hole_area_frac : float
+        Holes smaller than this fraction of total image area are filled.
+    min_obj_frac : float
+        Foreground objects smaller than this fraction of total image area
+        are removed.
     """
+    H, W = gray.shape[:2]
+    dim = min(H, W)
+    area = H * W
+
     g = gray.astype(np.uint8)
-    g_blur = cv2.GaussianBlur(g, (0, 0), 15)
+    sigma = max(int(blur_frac * dim), 1)
+    g_blur = cv2.GaussianBlur(g, (0, 0), sigma)
 
-    # Always run 3-class first for the bimodal/trimodal decision.
-    thr3 = threshold_multiotsu(g_blur, classes=3)
-    lbl3 = np.digitize(gray, bins=thr3).astype(np.int32)
-    means3 = [gray[lbl3 == i].mean() if np.any(lbl3 == i) else -1 for i in range(3)]
-    order3 = np.argsort(means3)
-    idx_bg, idx_mid, idx_tis = int(order3[0]), int(order3[1]), int(order3[2])
+    # --- Stage 1: find a low threshold that includes all tissue ---
+    # Use the LOWEST multi-Otsu threshold so that tissue + microscopy BG
+    # are both above it; only true black background falls below.
+    try:
+        thr3 = threshold_multiotsu(g_blur, classes=3)
+        thr_low = float(min(thr3))
+    except Exception:
+        thr_low = float(np.mean(gray)) * 0.3
 
-    if auto and _is_bimodal(lbl3, idx_mid, thr3[0], thr3[1]):
-        # Case B — bimodal: direct 2-class Otsu for a cleaner threshold.
-        try:
-            thr2 = threshold_otsu(g_blur)
-        except Exception:
-            thr2 = float(np.mean(gray)) - 1.0
-        m_tis = (gray > thr2)
+    # --- Stage 2: flood-fill from image borders ---
+    # Create a binary image where anything above the low threshold blocks
+    # the flood.  Background (true black) is fillable.
+    # Use the blurred image for stable thresholding but mark on original.
+    blockable = (g_blur > thr_low).astype(np.uint8)
 
-        if report_path is not None:
-            vis = np.zeros_like(g, dtype=np.uint8)
-            vis[m_tis] = 255
-            rp = Path(report_path)
-            if rp.is_dir():
-                rp = rp / "multiotsu_mask.png"
-            rp.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(rp), vis)
-    else:
-        # Case A — trimodal (or forced 3-class): tissue = top class only.
-        m_tis = (lbl3 == idx_tis)
+    # OpenCV floodFill: fill from every border pixel that is NOT blocked.
+    # Value 0 = fillable, value 1 = blocked (tissue or mic BG).
+    # After filling, everything that got filled is background.
+    fill_mask = np.zeros((H + 2, W + 2), np.uint8)  # floodFill needs +2 border
+    bg_filled = blockable.copy()
+    # Seed from all border pixels
+    for c in range(W):
+        if bg_filled[0, c] == 0:
+            cv2.floodFill(bg_filled, fill_mask, (c, 0), 2)
+        if bg_filled[H - 1, c] == 0:
+            cv2.floodFill(bg_filled, fill_mask, (c, H - 1), 2)
+    for r in range(H):
+        if bg_filled[r, 0] == 0:
+            cv2.floodFill(bg_filled, fill_mask, (0, r), 2)
+        if bg_filled[r, W - 1] == 0:
+            cv2.floodFill(bg_filled, fill_mask, (W - 1, r), 2)
 
-        if report_path is not None:
-            vis = np.zeros_like(g, dtype=np.uint8)
-            vis[lbl3 == idx_bg] = 0
-            vis[lbl3 == idx_mid] = 128
-            vis[lbl3 == idx_tis] = 255
-            rp = Path(report_path)
-            if rp.is_dir():
-                rp = rp / "multiotsu_mask.png"
-            rp.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(rp), vis)
+    # Everything filled with 2 is background; everything else is tissue
+    # (including mic BG that is not connected to the border).
+    m_tis = (bg_filled != 2)
 
-    # --- morphological cleanup ---
-    # 1) Large closing to bridge gaps within tissue (4× the base radius).
-    se_large = disk(max(int(morphological_radius) * 4, 20))
-    m_tis = closing(m_tis, se_large)
+    if report_path is not None:
+        vis = np.zeros_like(g, dtype=np.uint8)
+        vis[m_tis] = 255
+        rp = Path(report_path)
+        if rp.is_dir():
+            rp = rp / "multiotsu_mask.png"
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(rp), vis)
+
+    # --- morphological cleanup (all sizes as fractions → resolution-invariant) ---
+    # 1) Large closing to bridge thin gaps at tissue edge.
+    r_close = max(int(close_frac * dim), 3)
+    m_tis = closing(m_tis, disk(r_close))
 
     # 2) Fill all fully enclosed holes (dim zones inside tissue).
     m_tis = binary_fill_holes(m_tis)
 
     # 3) Remove small holes that touch the image border (binary_fill_holes
     #    only fills holes that are completely enclosed).
-    hole_area = max(m_tis.shape[0] * m_tis.shape[1] // 20, 50000)
+    hole_area = max(int(hole_area_frac * area), 1)
     m_tis = remove_small_holes(m_tis, area_threshold=hole_area)
 
     # 4) Drop tiny spurious foreground specks.
-    min_obj = max(m_tis.shape[0] * m_tis.shape[1] // 100, 10000)
+    min_obj = max(int(min_obj_frac * area), 1)
     m_tis = remove_small_objects(m_tis, min_size=min_obj)
 
     # 5) Light opening to smooth ragged edges only.
-    se_small = disk(int(morphological_radius))
-    m_tis = opening(m_tis, se_small)
+    r_open = max(int(open_frac * dim), 1)
+    m_tis = opening(m_tis, disk(r_open))
 
     return m_tis.astype(bool)
 

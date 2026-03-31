@@ -395,15 +395,18 @@ class LobuleSegmentor(BaseOperator):
             colormap="gray",
         )
 
-        def _compute_tissue_mask(filt: np.ndarray) -> np.ndarray:
-            """Compute tissue mask from filtered stack using current settings."""
-            gray = ensure_grayscale_uint8(filt)
-            morph_r = min(10, max(gray.shape) // 200)
+        def _compute_tissue_mask(raw: np.ndarray) -> np.ndarray:
+            """Compute tissue mask from the raw stack.
+
+            Since detect_tissue_mask_multiotsu now uses fraction-based
+            parameters, the result is resolution-invariant and can be
+            computed directly on the downsampled preview stack.
+            """
+            gray = ensure_grayscale_uint8(raw)
             if self.multi_otsu is False:
-                return detect_tissue_mask(gray, morphological_radius=morph_r)
+                return detect_tissue_mask(gray, morphological_radius=5)
             return detect_tissue_mask_multiotsu(
-                gray, morphological_radius=morph_r,
-                auto=(self.multi_otsu is None),
+                gray, auto=(self.multi_otsu is None),
             )
 
         raw_layers: List[Any] = []
@@ -426,7 +429,7 @@ class LobuleSegmentor(BaseOperator):
             )
 
         # Tissue mask overlay: shows what will be kept (True) vs removed (False)
-        tissue0 = _compute_tissue_mask(filt0)
+        tissue0 = _compute_tissue_mask(raw0)
         tissue_layer = viewer.add_labels(
             tissue0.astype(np.int8),
             name="tissue mask",
@@ -459,7 +462,7 @@ class LobuleSegmentor(BaseOperator):
             for c in range(raw.shape[2]):
                 raw_layers[c].data = raw[..., c]
                 filt_layers[c].data = filt[..., c]
-            tissue_layer.data = _compute_tissue_mask(filt).astype(np.int8)
+            tissue_layer.data = _compute_tissue_mask(raw).astype(np.int8)
 
         @magicgui(
             layout="vertical",
@@ -815,17 +818,15 @@ class LobuleSegmentor(BaseOperator):
         # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
         stack_grayscale = ensure_grayscale_uint8(stack)
-        morph_r = min(10, max(stack_grayscale.shape) // 200)
         if self.multi_otsu is False:
             # Explicit 2-class override: simple Otsu, no microscopy BG handling.
-            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=morph_r)
+            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
         else:
             # multi_otsu is None (auto) or True (force 3-class legacy).
             # auto=True  → decide bimodal/trimodal from mic_bg_frac heuristic.
             # auto=False → always tissue = top class only (old multi_otsu=True behaviour).
             tissue_mask = detect_tissue_mask_multiotsu(
                 stack_grayscale,
-                morphological_radius=morph_r,
                 auto=(self.multi_otsu is None),
                 report_path=report_path,
             )
