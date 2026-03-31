@@ -131,23 +131,32 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
     sigma = max(int(blur_frac * dim), 1)
     g_blur = cv2.GaussianBlur(g, (0, 0), sigma)
 
-    # --- Stage 1: find a low threshold that includes all tissue ---
-    # Use the LOWEST multi-Otsu threshold so that tissue + microscopy BG
-    # are both above it; only true black background falls below.
+    # --- Stage 1: multi-Otsu to get two thresholds ---
+    # thr_low separates true black BG from everything else.
+    # thr_high separates microscopy BG from actual tissue.
     try:
         thr3 = threshold_multiotsu(g_blur, classes=3)
         thr_low = float(min(thr3))
+        thr_high = float(max(thr3))
     except Exception:
         thr_low = float(np.mean(gray)) * 0.3
+        thr_high = float(np.mean(gray))
+
+    # Detect bimodal vs trimodal to decide which threshold to use.
+    lbl3 = np.digitize(gray, bins=[thr_low, thr_high]).astype(np.int32)
+    means3 = [gray[lbl3 == i].mean() if np.any(lbl3 == i) else -1 for i in range(3)]
+    order3 = np.argsort(means3)
+    idx_mid = int(order3[1])
+    is_bimodal = _is_bimodal(lbl3, idx_mid, thr_low, thr_high)
 
     # --- Stage 2: flood-fill from image borders ---
-    # Create a binary image where anything above the low threshold blocks
-    # the flood.  Background (true black) is fillable.
-    # Use the blurred image for stable thresholding but mark on original.
-    blockable = (g_blur > thr_low).astype(np.uint8)
+    # Use thr_high as barrier for trimodal (mic BG gets flooded away).
+    # Use thr_low as barrier for bimodal (no mic BG to worry about).
+    flood_thr = thr_low if is_bimodal else thr_high
+    blockable = (g_blur > flood_thr).astype(np.uint8)
 
     # OpenCV floodFill: fill from every border pixel that is NOT blocked.
-    # Value 0 = fillable, value 1 = blocked (tissue or mic BG).
+    # Value 0 = fillable (BG + mic BG), value 1 = blocked (tissue).
     # After filling, everything that got filled is background.
     fill_mask = np.zeros((H + 2, W + 2), np.uint8)  # floodFill needs +2 border
     bg_filled = blockable.copy()
@@ -163,8 +172,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
         if bg_filled[r, W - 1] == 0:
             cv2.floodFill(bg_filled, fill_mask, (W - 1, r), 2)
 
-    # Everything filled with 2 is background; everything else is tissue
-    # (including mic BG that is not connected to the border).
+    # Everything filled with 2 is background; everything else is tissue.
     m_tis = (bg_filled != 2)
 
     if report_path is not None:
