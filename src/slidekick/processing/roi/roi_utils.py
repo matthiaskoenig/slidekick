@@ -1,7 +1,9 @@
 from typing import Optional, Tuple
 import numpy as np
+import cv2
+from scipy.ndimage import binary_fill_holes, label as ndi_label
 from skimage.filters import threshold_otsu
-from skimage.morphology import closing, disk
+from skimage.morphology import closing, disk, remove_small_holes, remove_small_objects
 from skimage.measure import label, regionprops
 
 
@@ -94,32 +96,76 @@ def ensure_grayscale_uint8(image: np.ndarray) -> np.ndarray:
     return np.clip(gray * 255.0, 0, 255).astype(np.uint8)
 
 
-# Compute a binary tissue mask using Otsu thresholding and morphological closing
-def detect_tissue_mask(gray: np.ndarray, morphological_radius: int) -> np.ndarray:
-    """Compute a boolean mask of tissue regions from a grayscale image.
+def detect_tissue_mask(gray: np.ndarray, morphological_radius: int,
+                       blur_frac: float = 0.007,
+                       close_frac: float = 0.01,
+                       hole_area_frac: float = 0.05,
+                       min_obj_frac: float = 0.01) -> np.ndarray:
+    """Compute a boolean mask of tissue regions via 2-class Otsu.
+
+    1. Resolution-invariant Gaussian blur.
+    2. 2-class Otsu threshold.
+    3. Small closing to bridge vessel gaps at the tissue boundary.
+    4. Border-connected BG removal (interior holes become tissue).
+    5. Fill holes + remove small objects.
 
     Parameters
     ----------
     gray : np.ndarray
         2D uint8 grayscale image.
     morphological_radius : int
-        Radius of the structuring element used for morphological closing.
-
-    Returns
-    -------
-    np.ndarray
-        Boolean mask where True indicates tissue.
+        Kept for backward compatibility; unused.
+    blur_frac : float
+        Gaussian sigma as fraction of min(H, W).
+    close_frac : float
+        Closing radius (for vessel bridging) as fraction of min(H, W).
+    hole_area_frac : float
+        Max hole area to remove, as fraction of total area.
+    min_obj_frac : float
+        Min object area to keep, as fraction of total area.
     """
-    # Use Otsu thresholding; if Otsu fails (constant image), fall back to mean
+    H, W = gray.shape[:2]
+    dim = min(H, W)
+    area = H * W
+
+    # Step 1: resolution-invariant blur
+    sigma = max(int(blur_frac * dim), 1)
+    g_blur = cv2.GaussianBlur(gray.astype(np.uint8), (0, 0), sigma)
+
+    # Step 2: 2-class Otsu
     try:
-        thresh = threshold_otsu(gray)
+        thresh = threshold_otsu(g_blur)
     except Exception:
         thresh = float(np.mean(gray)) - 1.0
+    m_tis = (gray > thresh)
 
-    binary = gray > thresh
-    selem = disk(int(morphological_radius))
-    closed = closing(binary, selem)
-    return closed.astype(bool)
+    # Step 3: small closing to bridge vessel gaps at tissue boundary
+    close_r = max(int(close_frac * dim / 2), 1)
+    if close_r >= 2:
+        se = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * close_r + 1, 2 * close_r + 1))
+        m_tis = cv2.morphologyEx(
+            m_tis.astype(np.uint8), cv2.MORPH_CLOSE, se).astype(bool)
+
+    # Step 4: border-connected BG removal
+    bg_labeled, n = ndi_label(~m_tis)
+    if n > 0:
+        border_ids = set()
+        border_ids.update(bg_labeled[0, :].ravel())
+        border_ids.update(bg_labeled[-1, :].ravel())
+        border_ids.update(bg_labeled[:, 0].ravel())
+        border_ids.update(bg_labeled[:, -1].ravel())
+        border_ids.discard(0)
+        m_tis = ~np.isin(bg_labeled, list(border_ids))
+
+    # Step 5: fill holes + remove small objects
+    m_tis = binary_fill_holes(m_tis)
+    hole_area = max(int(hole_area_frac * area), 1)
+    m_tis = remove_small_holes(m_tis, area_threshold=hole_area)
+    min_obj = max(int(min_obj_frac * area), 1)
+    m_tis = remove_small_objects(m_tis, min_size=min_obj)
+
+    return m_tis.astype(bool)
 
 
 # Find the bounding box of the largest connected component in the mask
