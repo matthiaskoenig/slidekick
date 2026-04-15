@@ -39,7 +39,7 @@ def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5,
         # Create parent dir if needed; accept file or directory path
         rp = Path(report_path)
         if rp.is_dir():
-            rp = rp / "multiotsu_mask.png"
+            rp = rp / "tissue_map.png"
         rp.parent.mkdir(parents=True, exist_ok=True)
 
         # Write as PNG; lossless and preserves 8-bit grayscale
@@ -463,6 +463,97 @@ def quantile_normalize_features(X: np.ndarray) -> np.ndarray:
     return Xq
 
 
+def build_sp_adjacency(labels: np.ndarray) -> Dict[int, List[int]]:
+    """Build superpixel adjacency dict from a SLIC label image.
+
+    For each superpixel, lists the IDs of its neighboring superpixels
+    (those sharing at least one 4-connected boundary pixel).
+    """
+    adj: Dict[int, set] = {}
+
+    # Horizontal edges: collect unique (a, b) pairs where a < b
+    diff_h = labels[:, :-1] != labels[:, 1:]
+    a_h = labels[:, :-1][diff_h]
+    b_h = labels[:, 1:][diff_h]
+    pairs_h = np.column_stack([np.minimum(a_h, b_h), np.maximum(a_h, b_h)])
+
+    # Vertical edges
+    diff_v = labels[:-1, :] != labels[1:, :]
+    a_v = labels[:-1, :][diff_v]
+    b_v = labels[1:, :][diff_v]
+    pairs_v = np.column_stack([np.minimum(a_v, b_v), np.maximum(a_v, b_v)])
+
+    all_pairs = np.vstack([pairs_h, pairs_v])
+    unique_pairs = np.unique(all_pairs, axis=0)
+
+    for a, b in unique_pairs:
+        a, b = int(a), int(b)
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    return {k: list(v) for k, v in adj.items()}
+
+
+def _build_adj_matrix(sp_ids: np.ndarray, adj: Dict[int, List[int]],
+                      weight_self: float = 1.0):
+    """Build a sparse row-normalised adjacency matrix for graph smoothing.
+
+    Returns a CSR matrix A of shape (N, N) where each row sums to 1.
+    A[i,i] = weight_self / (weight_self + deg_i), and off-diagonal
+    neighbours share the rest equally.
+    """
+    from scipy.sparse import csr_matrix
+    sp_to_row = {int(sid): i for i, sid in enumerate(sp_ids)}
+    N = len(sp_ids)
+    rows, cols, vals = [], [], []
+    for i, sid in enumerate(sp_ids):
+        nbs = [sp_to_row[nb] for nb in adj.get(int(sid), [])
+               if nb in sp_to_row]
+        denom = weight_self + len(nbs)
+        rows.append(i); cols.append(i); vals.append(weight_self / denom)
+        for j in nbs:
+            rows.append(i); cols.append(j); vals.append(1.0 / denom)
+    return csr_matrix((vals, (rows, cols)), shape=(N, N), dtype=np.float32)
+
+
+def smooth_sp_features(X: np.ndarray, sp_ids: np.ndarray,
+                       adj: Dict[int, List[int]],
+                       iterations: int = 1,
+                       weight_self: float = 1.0) -> np.ndarray:
+    """Smooth superpixel features on the adjacency graph.
+
+    Each superpixel's feature is replaced by a weighted average of
+    itself and its neighbors via sparse matrix multiplication.
+    """
+    A = _build_adj_matrix(sp_ids, adj, weight_self)
+    Xs = X.astype(np.float32).copy()
+    for _ in range(iterations):
+        Xs = A.dot(Xs)
+    return Xs
+
+
+def smooth_sp_labels(labels_k: np.ndarray, sp_ids: np.ndarray,
+                     adj: Dict[int, List[int]],
+                     iterations: int = 1) -> np.ndarray:
+    """Majority-vote smoothing of cluster labels on the adjacency graph.
+
+    For each superpixel, if the majority of its neighbors have a
+    different label, switch to the majority label.  Uses sparse
+    matrix multiplication for speed.
+    """
+    A = _build_adj_matrix(sp_ids, adj, weight_self=1.0)
+    n_clusters = int(labels_k.max()) + 1
+    N = len(sp_ids)
+    lk = labels_k.copy()
+    for _ in range(iterations):
+        one_hot = np.zeros((N, n_clusters), dtype=np.float32)
+        one_hot[np.arange(N), lk] = 1.0
+        votes = A.dot(one_hot)
+        lk = np.argmax(votes, axis=1).astype(labels_k.dtype)
+    return lk
+
+
+
 def to_base_full(contours_xy: List[np.ndarray],
                   pad_px: int,
                   bbox_base: Tuple[int, int, int, int],
@@ -631,7 +722,7 @@ def add_napari_controls_dock(
     on_abort: Optional[Callable[[], None]] = None,
     update_text: str = "Preview/Recalculate",
     confirm_text: str = "Confirm Current View",
-    apply_values_text: str = "apply slider values & continue",
+    apply_values_text: str = "continue and apply current values without preview",
     back_text: str = "Back",
     reset_text: str = "Reset Parameters",
     abort_text: str = "Abort",
@@ -796,7 +887,7 @@ def run_napari_preview_action(
     include_abort: bool = True,
     update_text: str = "Preview/Recalculate",
     confirm_text: str = "Confirm Current View",
-    apply_values_text: str = "apply slider values & continue",
+    apply_values_text: str = "continue and apply current values without preview",
     back_text: str = "Back",
     reset_text: str = "Reset Parameters",
     abort_text: str = "Abort",

@@ -192,4 +192,7 @@ dependencies = [
     "geojson>=3.2.0",
     "czifile>=2019.7.2.1",
     "pyvips[binary]>=3.0.0",
+    "optuna>=4.8.0",
+    "scikit-fmm>=2025.6.23",
+    "higra>=0.6.13",
 ]

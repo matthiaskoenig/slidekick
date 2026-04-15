@@ -26,6 +26,7 @@ from slidekick.processing.lobule_segmentation.lob_utils import (
     downsample_stack_to_max_side, holes_from_fg_mask,
     bool_mask_to_uint8, minmax_to_uint8, border_connected_mask,
     render_cluster_gray, nonlinear_channel_weighting, quantile_normalize_features,
+    build_sp_adjacency, smooth_sp_features, smooth_sp_labels,
     to_base_full, rescale_full,
     common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
     discover_pyramid_shapes, preview_images_napari,
@@ -86,27 +87,28 @@ class LobuleSegmentor(BaseOperator):
                  # nonlinear KMeans
                  interactive_weighting: bool = True,
                  nonlinear_kmeans: bool = True,
-                 alpha_pv: float = 2.0,
-                 alpha_pp: float = 3.0,
-                 pp_gamma: float = 0.65,
-                 pv_gamma: float = 0.75,
-                 nl_low_pct: float = 5.0,
-                 nl_high_pct: float = 90.0,
-                 quantile_kmeans: Optional[bool] = None,
+                 alpha_pv: float = 3.93,
+                 alpha_pp: float = 2.15,
+                 pp_gamma: float = 0.69,
+                 pv_gamma: float = 1.63,
+                 nl_low_pct: float = 6.5,
+                 nl_high_pct: float = 90.2,
+                 quantile_kmeans: Optional[bool] = True,
                  fg_min_signal_frac: float = 0.05,
                  # vessel gating
                  interactive_vessels: bool = True,
-                 min_vessel_area_pp: int = 200,
-                 min_vessel_area_pv: int = 200,
-                 vessel_annulus_px: int = 5,
-                 vessel_zone_ratio_thr_pp: float = 0.35,
-                 vessel_zone_ratio_thr_pv: float = 0.55,
+                 min_vessel_area_pp: int = 56,
+                 min_vessel_area_pv: int = 56,
+                 vessel_annulus_px: int = 6,
+                 vessel_zone_ratio_thr_pp: float = 0.52,
+                 vessel_zone_ratio_thr_pv: float = 0.21,
                  vessel_circularity_min: float = 0.12,
                  vessel_circ_check_area_pp: int = 2000,
                  vessel_circ_check_area_pv: int = 2000,
                  vessel_pct_low: float = 5.0,
                  vessel_pct_superpixel_frac: float = 0.7,
-                 min_area_px: int = 5000):
+                 min_area_px: int = 5000,
+                 pp_close_radius: int = 8):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -148,6 +150,9 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_pct_low: global intensity threshold (0–255) on the per-pixel channel mean used to mark background/holes for vessel detection
         @param vessel_pct_superpixel_frac: minimal fraction of pixels below the intensity threshold inside a superpixel to mark it as background/hole
         @param min_area_px: define area threshold to filter out very small polygons (noise)
+        @param pp_close_radius: radius (px) for morphological closing of the PP zone mask
+            before skeletonization.  0 = disabled.  A small value (e.g. 5–15) bridges
+            narrow gaps in the PP zone that would otherwise fragment the skeleton.
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
@@ -171,7 +176,7 @@ class LobuleSegmentor(BaseOperator):
         self.pv_gamma = pv_gamma
         self.nl_low_pct = nl_low_pct
         self.nl_high_pct = nl_high_pct
-        self.quantile_kmeans = quantile_kmeans  # None = auto (single-polarity → True)
+        self.quantile_kmeans = quantile_kmeans  # False default; None = auto (single-polarity → True)
         self.fg_min_signal_frac = float(fg_min_signal_frac)
 
         # vessel gating
@@ -189,6 +194,7 @@ class LobuleSegmentor(BaseOperator):
 
         # lobule generation
         self.min_area_px = min_area_px
+        self.pp_close_radius = int(pp_close_radius)
 
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -566,6 +572,11 @@ class LobuleSegmentor(BaseOperator):
             _qk_auto = bool(self.channels_pv and not self.channels_pp) or \
                         bool(self.channels_pp and not self.channels_pv)
 
+        # Detect single vs dual polarity for widget visibility and defaults
+        _has_pp = bool(self.channels_pp)
+        _has_pv = bool(self.channels_pv)
+        _dual = _has_pp and _has_pv
+
         defaults = dict(
             quantile_kmeans=bool(_qk_auto),
             nonlinear_kmeans=self.nonlinear_kmeans,
@@ -576,6 +587,7 @@ class LobuleSegmentor(BaseOperator):
             nl_low_pct=self.nl_low_pct,
             nl_high_pct=self.nl_high_pct,
         )
+
         pending = dict(defaults)
 
         def compute_weight_previews():
@@ -710,6 +722,18 @@ class LobuleSegmentor(BaseOperator):
             pending["nl_low_pct"] = float(nl_low_pct)
             pending["nl_high_pct"] = float(nl_high_pct)
 
+        # Hide irrelevant widgets for single-polarity mode.
+        # Alpha weights only affect dual-polarity (single channel ⇒ uniform
+        # scaling has no effect on KMeans boundaries).  The gamma for the
+        # absent polarity is also meaningless.
+        if not _dual:
+            weighting_controls.alpha_pp.visible = False
+            weighting_controls.alpha_pv.visible = False
+            if not _has_pp:
+                weighting_controls.pp_gamma.visible = False
+            if not _has_pv:
+                weighting_controls.pv_gamma.visible = False
+
         def on_update() -> None:
             _apply_update()
 
@@ -718,10 +742,13 @@ class LobuleSegmentor(BaseOperator):
 
             weighting_controls.quantile_kmeans.value = defaults["quantile_kmeans"]
             weighting_controls.nonlinear_kmeans.value = defaults["nonlinear_kmeans"]
-            weighting_controls.alpha_pp.value = defaults["alpha_pp"]
-            weighting_controls.alpha_pv.value = defaults["alpha_pv"]
-            weighting_controls.pp_gamma.value = defaults["pp_gamma"]
-            weighting_controls.pv_gamma.value = defaults["pv_gamma"]
+            if _dual:
+                weighting_controls.alpha_pp.value = defaults["alpha_pp"]
+                weighting_controls.alpha_pv.value = defaults["alpha_pv"]
+            if _has_pp:
+                weighting_controls.pp_gamma.value = defaults["pp_gamma"]
+            if _has_pv:
+                weighting_controls.pv_gamma.value = defaults["pv_gamma"]
             weighting_controls.nl_low_pct.value = defaults["nl_low_pct"]
             weighting_controls.nl_high_pct.value = defaults["nl_high_pct"]
 
@@ -899,6 +926,7 @@ class LobuleSegmentor(BaseOperator):
                          region_size=6,
                          report_path: Path = None,
                          fg_maxproj: Optional[np.ndarray] = None,
+                         precomputed_sp: Optional[dict] = None,
                          ) -> Tuple[np.ndarray, Tuple[List[int], list]]:
         """
         Adopts most code from zia.../clustering.py. Uses intensities of pre-defined stain-channels.
@@ -913,18 +941,25 @@ class LobuleSegmentor(BaseOperator):
             fg_maxproj = np.pad(fg_maxproj, ((pad, pad), (pad, pad)),
                                 mode="constant", constant_values=0.0)
 
-        console.print("Generating superpixels...", style="info")
-        superpixelslic = cv2.ximgproc.createSuperpixelSLIC(
-            image_stack, algorithm=cv2.ximgproc.MSLIC, region_size=region_size
-        )
-        superpixelslic.iterate(num_iterations=10)
+        if precomputed_sp is not None:
+            labels = precomputed_sp["labels"]
+            num_labels = precomputed_sp["num_labels"]
+            superpixel_mask = precomputed_sp.get("mask", np.zeros_like(labels, dtype=np.uint8))
+        else:
+            console.print("Generating superpixels...", style="info")
+            superpixelslic = cv2.ximgproc.createSuperpixelSLIC(
+                image_stack, algorithm=cv2.ximgproc.MSLIC, region_size=region_size
+            )
+            superpixelslic.iterate(num_iterations=10)
 
-        superpixel_mask = superpixelslic.getLabelContourMask(thick_line=False)
-        labels = superpixelslic.getLabels()
-        num_labels = superpixelslic.getNumberOfSuperpixels()
+            superpixel_mask = superpixelslic.getLabelContourMask(thick_line=False)
+            labels = superpixelslic.getLabels()
+            num_labels = superpixelslic.getNumberOfSuperpixels()
 
         if report_path is not None:
             cv2.imwrite(str(report_path / "superpixels.png"), superpixel_mask)
+
+        sp_adj = build_sp_adjacency(labels)
 
         merged = image_stack.astype(float)
 
@@ -1194,6 +1229,18 @@ class LobuleSegmentor(BaseOperator):
         X = X_means[:, clustering_channels].copy()
         Ck = X.shape[1]
 
+        # Single-polarity: smooth superpixel features on the adjacency graph
+        # to reduce noise at zone boundaries.  With only one gradient (e.g.
+        # PV-only), KMeans boundaries are noisy because the signal is
+        # continuous.  Graph smoothing averages each superpixel's feature
+        # with its neighbours, producing cleaner zone transitions.
+        dual_polarity = bool(km_pp and km_pv)
+
+        if not dual_polarity:
+            sp_ids = np.array(fg_keys, dtype=np.int32)
+            X = smooth_sp_features(X, sp_ids, sp_adj,
+                                   iterations=2, weight_self=0.5)
+
         # Quantile normalisation: resolve None → auto (single-polarity → True).
         use_quantile = self.quantile_kmeans
         if use_quantile is None:
@@ -1219,7 +1266,6 @@ class LobuleSegmentor(BaseOperator):
 
         # Alpha weighting only meaningful for dual-polarity (differential PP vs PV).
         # For single-polarity, uniform scaling has no effect on KMeans boundaries.
-        dual_polarity = bool(km_pp and km_pv)
         if dual_polarity:
             w_feat = np.ones(Ck, dtype=np.float32)
             for idx in km_pp:
@@ -1230,38 +1276,115 @@ class LobuleSegmentor(BaseOperator):
         else:
             Xw = X
 
-        kmeans = KMeans(n_clusters=self.n_clusters, n_init=20)
+        # Over-clustering: use more internal KMeans clusters than the final
+        # 3 zones, then merge by intensity rank.  This gives finer control
+        # over zone proportions — e.g. more MID clusters expand the midzone
+        # at the expense of PP, improving the distance-thirds zonation model.
+        # The split (n_pv / n_mid / n_pp) controls how many fine clusters
+        # are allocated to each zone.
+        if self.n_clusters == 3:
+            # K=7, split 1/4/2 — portality score 0.955, mIoU 0.737
+            K_INTERNAL = 7
+            SPLIT_PV, SPLIT_MID, SPLIT_PP = 1, 4, 2
+        else:
+            K_INTERNAL = self.n_clusters
+            SPLIT_PV = SPLIT_PP = 1
+            SPLIT_MID = max(self.n_clusters - 2, 1)
+
+        kmeans = KMeans(n_clusters=K_INTERNAL, n_init=20)
         kmeans.fit(Xw)
 
         # Recover original-scale centers for semantic role assignment.
         X_orig = X_means[:, clustering_channels].copy()
-        centers = np.zeros((self.n_clusters, Ck), dtype=np.float32)
-        for ki in range(self.n_clusters):
-            mask_ki = (kmeans.labels_ == ki)
-            if np.any(mask_ki):
-                centers[ki] = X_orig[mask_ki].mean(axis=0)
         labels_k = kmeans.labels_
 
-        # 3) Assign semantic roles PP/MID/PV (using remapped indices)
-        channels_pp = km_pp
-        channels_pv = km_pv
-        if channels_pp and channels_pv:
-            pp_scores = centers[:, channels_pp].mean(axis=1)
-            pv_scores = centers[:, channels_pv].mean(axis=1)
-            idx_pp = int(np.argmax(pp_scores))
-            pv_order = np.argsort(-pv_scores)
-            idx_pv = int(pv_order[0] if pv_order[0] != idx_pp else pv_order[1])
-        elif channels_pp:
-            s = centers[:, channels_pp].mean(axis=1)
-            idx_pp = int(np.argmax(s))
-            idx_pv = int(np.argmin(s))
-        else:
-            s = centers[:, channels_pv].mean(axis=1)
-            idx_pv = int(np.argmax(s))
-            idx_pp = int(np.argmin(s))
+        if K_INTERNAL > self.n_clusters:
+            # Over-clustered: rank fine clusters by signal intensity, merge.
+            # Use PV channel if available, else PP channel (inverted).
+            pp_only = bool(km_pp and not km_pv)
+            if pp_only:
+                # Rank by PP channel (highest PP = PP zone)
+                rank_ch = km_pp[0]
+            else:
+                # Rank by PV channel (highest PV = PV zone)
+                rank_ch = km_pv[0]
 
-        idx_mid = [i for i in range(self.n_clusters) if i not in [idx_pp, idx_pv]]
-        sorted_label_idx = np.array([idx_pp, *idx_mid, idx_pv], dtype=int)
+            fine_centers = np.zeros(K_INTERNAL, dtype=np.float32)
+            for ki in range(K_INTERNAL):
+                mk = (labels_k == ki)
+                if np.any(mk):
+                    fine_centers[ki] = X_orig[mk, rank_ch].mean()
+
+            rank = np.argsort(-fine_centers)  # highest signal first
+            zone_remap = np.zeros(K_INTERNAL, dtype=np.int32)
+            if pp_only:
+                for c in rank[:SPLIT_PP]:
+                    zone_remap[c] = 0  # PP (highest PP signal)
+                for c in rank[SPLIT_PP:SPLIT_PP + SPLIT_MID]:
+                    zone_remap[c] = 1  # MID
+                for c in rank[SPLIT_PP + SPLIT_MID:]:
+                    zone_remap[c] = 2  # PV
+            else:
+                for c in rank[:SPLIT_PV]:
+                    zone_remap[c] = 2  # PV (highest PV signal)
+                for c in rank[SPLIT_PV:SPLIT_PV + SPLIT_MID]:
+                    zone_remap[c] = 1  # MID
+                for c in rank[SPLIT_PV + SPLIT_MID:]:
+                    zone_remap[c] = 0  # PP
+            labels_k = zone_remap[labels_k]
+
+            # Majority-vote smoothing (single-polarity only — dual already
+            # has clean boundaries from opposing gradients).
+            if not dual_polarity:
+                sp_ids = np.array(fg_keys, dtype=np.int32)
+                labels_k = smooth_sp_labels(labels_k, sp_ids, sp_adj,
+                                            iterations=1)
+
+            # Compute centers on the 3 merged zones
+            centers = np.zeros((3, Ck), dtype=np.float32)
+            for zi in range(3):
+                mk = (labels_k == zi)
+                if np.any(mk):
+                    centers[zi] = X_orig[mk].mean(axis=0)
+
+            # Fixed role assignment: 0=PP, 1=MID, 2=PV
+            idx_pp, idx_pv = 0, 2
+            idx_mid = [1]
+            sorted_label_idx = np.array([0, 1, 2], dtype=int)
+        else:
+            # Non-standard n_clusters: fall back to direct KMeans assignment
+            centers = np.zeros((self.n_clusters, Ck), dtype=np.float32)
+            for ki in range(self.n_clusters):
+                mask_ki = (labels_k == ki)
+                if np.any(mask_ki):
+                    centers[ki] = X_orig[mask_ki].mean(axis=0)
+
+            # Single-polarity: majority-vote smoothing
+            if not dual_polarity:
+                sp_ids = np.array(fg_keys, dtype=np.int32)
+                labels_k = smooth_sp_labels(labels_k, sp_ids, sp_adj,
+                                            iterations=1)
+
+            # Assign semantic roles PP/MID/PV
+            channels_pp = km_pp
+            channels_pv = km_pv
+            if channels_pp and channels_pv:
+                pp_scores = centers[:, channels_pp].mean(axis=1)
+                pv_scores = centers[:, channels_pv].mean(axis=1)
+                idx_pp = int(np.argmax(pp_scores))
+                pv_order = np.argsort(-pv_scores)
+                idx_pv = int(pv_order[0] if pv_order[0] != idx_pp else pv_order[1])
+            elif channels_pp:
+                s = centers[:, channels_pp].mean(axis=1)
+                idx_pp = int(np.argmax(s))
+                idx_pv = int(np.argmin(s))
+            else:
+                s = centers[:, channels_pv].mean(axis=1)
+                idx_pv = int(np.argmax(s))
+                idx_pp = int(np.argmin(s))
+
+            idx_mid = [i for i in range(self.n_clusters) if i not in [idx_pp, idx_pv]]
+            sorted_label_idx = np.array([idx_pp, *idx_mid, idx_pv], dtype=int)
 
         # Map each foreground superpixel id -> cluster id
         superpixel_kmeans_map = {sp: km for sp, km in zip(fg_keys, labels_k)}
@@ -1846,6 +1969,36 @@ class LobuleSegmentor(BaseOperator):
             self.vessel_circ_check_area_pv,
         )
 
+        # Optional morphological closing of the PP zone to bridge narrow gaps
+        # before skeletonization.  Only pixels that were MID (not PV or BG) are
+        # eligible to be flipped to PP — this preserves the PV holes that define
+        # the lobule centres.
+        if self.pp_close_radius > 0:
+            console.print(
+                f"Morphological closing of PP zone (radius={self.pp_close_radius} px)...",
+                style="info",
+            )
+            pp_mask = (cluster_map_final == idx_pp) & fg_pix_mask
+            ksize = 2 * self.pp_close_radius + 1
+            se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            pp_closed = cv2.morphologyEx(
+                pp_mask.astype(np.uint8), cv2.MORPH_CLOSE, se
+            ).astype(bool)
+            # Only flip MID → PP (never flip PV or BG)
+            mid_mask = np.zeros_like(fg_pix_mask, dtype=bool)
+            for mid_idx in idx_mid:
+                mid_mask |= (cluster_map_final == mid_idx)
+            mid_mask &= fg_pix_mask
+            flippable = pp_closed & mid_mask & ~pp_mask
+            cluster_map_final[flippable] = idx_pp
+            n_flipped = int(flippable.sum())
+            if n_flipped > 0:
+                console.print(
+                    f"  PP closing flipped {n_flipped:,} MID → PP pixels "
+                    f"({100 * n_flipped / fg_pix_mask.sum():.1f}% of foreground)",
+                    style="info",
+                )
+
         template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
         template[~fg_pix_mask] = 0
 
@@ -1894,10 +2047,17 @@ class LobuleSegmentor(BaseOperator):
         class_0_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0]
         class_1_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 1]
 
+        # CV vessels: fill with max gray → become 0 (dark holes) after inversion
         cv2.drawContours(template, class_0_contours, -1, 255, thickness=cv2.FILLED)
-        cv2.drawContours(template, class_1_contours, -1, 0, thickness=cv2.FILLED)
+        # PP vessels: fill with max gray too → dark holes after inversion, then
+        # draw thin boundary outline so they act as lobule separators without
+        # creating large bright blobs that attract the skeleton.
+        cv2.drawContours(template, class_1_contours, -1, 255, thickness=cv2.FILLED)
 
         template = 255 - template
+
+        # Re-draw PP vessel outlines as bright boundary lines (skeleton seeds)
+        cv2.drawContours(template, class_1_contours, -1, 255, thickness=2)
 
         template = cv2.medianBlur(template, 5)
 
@@ -2222,15 +2382,15 @@ if __name__ == "__main__":
     from slidekick import DATA_PATH
 
     image_paths = [DATA_PATH / "reg_n_sep" / "noise.tiff",
-                   DATA_PATH / "reg_n_sep" / "periportal.tiff",
+                   #DATA_PATH / "reg_n_sep" / "periportal.tiff",
                    DATA_PATH / "reg_n_sep" / "perivenous.tiff",
                    ]
 
     metadata_for_segmentation = [Metadata(path_original=image_path, path_storage=image_path) for image_path in image_paths]
 
     Segmentor = LobuleSegmentor(metadata_for_segmentation,
-                                channels_pp=1,
-                                channels_pv=2,
+                                #channels_pp=1,
+                                channels_pv=1,
                                 base_level=0,
                                 region_size=25,
                                 adaptive_histonorm=True)
