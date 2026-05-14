@@ -1,7 +1,7 @@
 """Portality mapping for lobule segmentation.
 
 Computes a continuous portality value for each pixel inside segmented lobule
-instances.  Values are in [0, 1] where:
+instances. Values are in [0, 1] where:
 
 - 0.0  — portal vessels and instance boundaries
 - 1.0  — central veins
@@ -10,17 +10,10 @@ instances.  Values are in [0, 1] where:
 The formula is ``P = d_PB / (d_PB + d_CV)`` where *PB* is the union of
 portal vessels and the instance boundary, and *d* denotes the Euclidean
 distance transform.
-
-Contours are OpenCV-style ``(x, y)`` arrays from ``cv2.findContours``.
 """
 
-from pathlib import Path
-
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import numpy.ma as ma
-from scipy.ndimage import distance_transform_edt as edt
+from scipy.ndimage import distance_transform_edt as edt, gaussian_filter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,178 +27,165 @@ _DIVISION_GUARD: float = 1e-8
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _edt_to_set(target: np.ndarray) -> np.ndarray:
-    """Euclidean distance to the nearest True pixel in *target*.
-
-    Parameters
-    ----------
-    target : np.ndarray
-        2-D boolean mask.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 distance array.  +inf if *target* is all-False,
-        zeros if all-True.
-    """
-    target = target.astype(bool, copy=False)
-    h, w = target.shape
-    if not np.any(target):
-        return np.full((h, w), np.inf, dtype=np.float32)
-    if np.all(target):
-        return np.zeros((h, w), dtype=np.float32)
-    return edt(~target).astype(np.float32)
-
-
-def _rasterize_contours(
-    shape: tuple[int, int],
-    contours: list[np.ndarray],
+def _find_cv_seed(
+    region: np.ndarray,
+    pb: np.ndarray,
+    pv_stain: np.ndarray | None,
+    *,
+    seed_radius: int = 5,
+    smooth_sigma: float = 10.0,
+    min_intensity_span: float = 1e-3,
 ) -> np.ndarray:
-    """Rasterize polygon contours to a filled boolean mask.
+    """Locate a surrogate central-vein seed when no CV annotation is present.
+
+    Tries three strategies in order:
+
+    1. **PV-stain intensity peak** — the smoothed maximum of *pv_stain* inside
+       *region*. A central vein typically appears bright in the PV channel.
+       Skipped when *pv_stain* is ``None`` or the stain is nearly flat.
+    2. **Furthest-from-portal-boundary pixel** — the point inside *region* with
+       the maximum Euclidean distance to *pb* (the portal boundary). This is
+       the geometric centre of the lobule, equivalent to the medial axis peak.
+    3. **Centroid** — a single pixel at the region centroid, used only when both
+       strategies above yield an empty set (degenerate region).
 
     Parameters
     ----------
-    shape : tuple[int, int]
-        ``(H, W)`` of the output mask.
-    contours : list[np.ndarray]
-        OpenCV-style ``(x, y)`` contours with shape ``(N, 2)``
-        or ``(N, 1, 2)``.
+    region : np.ndarray
+        Boolean mask of the lobule (2-D, same shape as the label image).
+    pb : np.ndarray
+        Boolean mask of the portal boundary for this lobule
+        (lobule boundary ∪ portal vessels within the lobule).
+    pv_stain : np.ndarray or None
+        Float32 PV-channel image aligned with *region*.
+    seed_radius : int
+        Radius in pixels of the disk placed around the chosen seed point.
+    smooth_sigma : float
+        Gaussian smoothing sigma (px) applied to *pv_stain* in strategy 1.
+    min_intensity_span : float
+        Minimum smoothed peak-to-min difference required to trust the stain
+        peak. Below this value the stain is treated as flat and strategy 1
+        is skipped.
 
     Returns
     -------
     np.ndarray
-        Boolean mask.
-
-    Raises
-    ------
-    ValueError
-        If a contour does not have shape ``(N, 2)`` after squeezing.
+        Boolean mask of seed pixels, intersected with *region*.
     """
-    h, w = shape
-    if not contours:
-        return np.zeros((h, w), dtype=bool)
-    polys: list[np.ndarray] = []
-    for c in contours:
-        c = np.asarray(c)
-        c = np.squeeze(c)
-        if c.ndim != 2 or c.shape[1] != 2:
-            raise ValueError("Contour must be shaped (N, 2).")
-        polys.append(c.astype(np.int32))
-    canvas = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(canvas, polys, 1)
-    return canvas.astype(bool)
+    h, w = region.shape
 
+    def _disk(cy: int, cx: int) -> np.ndarray:
+        y0, y1 = max(0, cy - seed_radius), min(h, cy + seed_radius + 1)
+        x0, x1 = max(0, cx - seed_radius), min(w, cx + seed_radius + 1)
+        yg, xg = np.mgrid[y0:y1, x0:x1]
+        in_disk = (yg - cy) ** 2 + (xg - cx) ** 2 <= seed_radius ** 2
+        out = np.zeros((h, w), dtype=bool)
+        out[yg[in_disk], xg[in_disk]] = True
+        return out & region
 
-def _instance_boundary(labels: np.ndarray) -> np.ndarray:
-    """8-connected boundary detection for labeled or binary masks.
+    # Strategy 1: smoothed PV-stain intensity peak
+    if pv_stain is not None:
+        smoothed = gaussian_filter(
+            np.where(region, pv_stain.astype(np.float32), 0.0),
+            sigma=smooth_sigma,
+        )
+        vals = smoothed[region]
+        if float(vals.max() - vals.min()) > min_intensity_span:
+            masked = np.where(region, smoothed, -np.inf)
+            cy, cx = np.unravel_index(int(np.argmax(masked)), (h, w))
+            seed = _disk(cy, cx)
+            if seed.any():
+                return seed
 
-    A foreground pixel is on the boundary if it touches background or a
-    different label in its 8-neighborhood.
+    # Strategy 2: pixel maximally far from the portal boundary
+    d_from_pb = edt(~pb).astype(np.float32)
+    d_in = np.where(region, d_from_pb, -np.inf)
+    cy, cx = np.unravel_index(int(np.argmax(d_in)), (h, w))
+    seed = _disk(cy, cx)
+    if seed.any():
+        return seed
 
-    Parameters
-    ----------
-    labels : np.ndarray
-        2-D integer label image.
-
-    Returns
-    -------
-    np.ndarray
-        Boolean boundary mask.
-    """
-    lab = labels.astype(np.int32, copy=False)
-    h, w = lab.shape
-    pad = np.pad(lab, 1, mode="constant", constant_values=-1)
-    center = pad[1: h + 1, 1: w + 1]
-    boundary = np.zeros((h, w), dtype=bool)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dx == 0 and dy == 0:
-                continue
-            neigh = pad[1 + dy: h + 1 + dy, 1 + dx: w + 1 + dx]
-            boundary |= (center > 0) & (
-                (neigh != center) | (neigh == -1)
-            )
-    return boundary
+    # Strategy 3: centroid (degenerate fallback)
+    ys, xs = np.where(region)
+    out = np.zeros((h, w), dtype=bool)
+    out[int(ys.mean()), int(xs.mean())] = True
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def mask_to_portality(
-    mask: np.ndarray,
-    cv_contours: list[np.ndarray],
-    pf_contours: list[np.ndarray],
-    report_path: Path | str | None = None,
+def lobule_portality(
+    labels: np.ndarray,
+    cv_mask: np.ndarray,
+    pf_mask: np.ndarray,
+    pv_stain: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Compute the portality map for a labeled lobule mask.
+    """Per-lobule portality: ``p = d_pb / (d_pb + d_cv)`` per lobule.
+
+    For each lobule, only that lobule's own central vein and boundary
+    (+ portal vessels within it) contribute to the distances. This matches
+    the definition in König et al. (2024) and avoids the global-EDT artefact
+    where adjacent CVs pull portality values near inter-lobule boundaries.
 
     Parameters
     ----------
-    mask : np.ndarray
-        2-D integer label image (0 = background, >0 = instance id).
-    cv_contours : list[np.ndarray]
-        Central-vein contours in OpenCV ``(x, y)`` format.
-    pf_contours : list[np.ndarray]
-        Portal-field (periportal vessel) contours.
-    report_path : Path | str | None
-        If given, writes ``portality.png`` using the magma colormap.
+    labels : np.ndarray
+        2-D integer label image (0 = background, >0 = lobule id).
+    cv_mask : np.ndarray
+        Boolean mask of central-vein pixels.
+    pf_mask : np.ndarray
+        Boolean mask of portal-field pixels.
+    pv_stain : np.ndarray or None
+        Float32 PV-channel image aligned with *labels*, used as the first
+        fallback when a lobule contains no annotated central vein. The
+        smoothed intensity peak of this channel is taken as a surrogate CV
+        (central veins are typically bright in the PV channel).
+        When ``None`` the fallback skips straight to the geometric strategy.
 
     Returns
     -------
     np.ndarray
-        Float32 portality map with NaN outside instances.
-
-    Raises
-    ------
-    ValueError
-        If *mask* is not 2-D.
+        Float32 portality map, NaN outside lobules.
+        0.0 = lobule boundary / portal vessel, 1.0 = central vein.
     """
-    if mask.ndim != 2:
-        raise ValueError("mask must be 2D (H, W).")
+    if labels.ndim != 2:
+        raise ValueError("labels must be 2D (H, W).")
+    h, w = labels.shape
+    portality = np.full((h, w), np.nan, dtype=np.float32)
+    cv_mask = cv_mask.astype(bool)
+    pf_mask = pf_mask.astype(bool)
 
-    h, w = mask.shape
-    labels = mask.astype(np.int32, copy=False)
-    inside = labels > 0
+    for label_id in np.unique(labels):
+        if label_id == 0:
+            continue
+        region = labels == label_id
+        if region.sum() < 10:
+            continue
 
-    cv_mask = _rasterize_contours((h, w), cv_contours) & inside
-    pf_mask = _rasterize_contours((h, w), pf_contours) & inside
-    boundary = _instance_boundary(labels) & inside
-    pb_mask = (pf_mask | boundary) & inside
+        # 4-connected boundary: pixels inside this lobule adjacent to a
+        # different label or to background.
+        boundary = np.zeros((h, w), dtype=bool)
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            shifted = np.roll(np.roll(labels, -dy, 0), -dx, 1)
+            boundary |= region & (shifted != label_id)
 
-    d_cv = _edt_to_set(cv_mask)
-    d_pb = _edt_to_set(pb_mask)
+        # Portal boundary: this lobule's edge + portal vessels within it.
+        pb = boundary | (pf_mask & region)
 
-    P = (d_pb / (d_pb + d_cv + _DIVISION_GUARD)).astype(np.float32)
-    P[pb_mask] = 0.0
-    P[cv_mask] = 1.0
-    P[~inside] = np.nan
+        # Central vein within this lobule; use structured fallback if none.
+        cv_in = cv_mask & region
+        if not cv_in.any():
+            cv_in = _find_cv_seed(region, pb, pv_stain)
 
-    if report_path is not None:
-        _write_portality_report(P, report_path)
+        d_pb = edt(~pb).astype(np.float32)
+        d_cv = edt(~cv_in).astype(np.float32)
 
-    return P
+        P = (d_pb / (d_pb + d_cv + _DIVISION_GUARD)).astype(np.float32)
+        portality[region] = P[region]
 
-
-def _write_portality_report(
-    P: np.ndarray,
-    report_path: Path | str,
-) -> None:
-    """Save a magma-coloured portality PNG.
-
-    Parameters
-    ----------
-    P : np.ndarray
-        Float32 portality map.
-    report_path : Path | str
-        Output directory.
-    """
-    outdir = Path(report_path)
-    outdir.mkdir(parents=True, exist_ok=True)
-    png_path = outdir / "portality.png"
-    cmap = plt.get_cmap("magma").copy()
-    cmap.set_bad(alpha=0.0)
-    arr = ma.masked_invalid(P).astype(np.float32)
-    plt.imsave(
-        png_path.as_posix(), arr, cmap=cmap, vmin=0.0, vmax=1.0,
-    )
+    # Hard-clamp vessel pixels for unambiguous downstream use.
+    portality[cv_mask & (labels > 0)] = 1.0
+    portality[pf_mask & (labels > 0)] = 0.0
+    return portality

@@ -18,16 +18,14 @@ from slidekick import OUTPUT_PATH
 from slidekick.io import save_tif
 
 from slidekick.processing.roi.roi_utils import largest_bbox, ensure_grayscale_uint8, crop_image, detect_tissue_mask
-from slidekick.processing.lobule_segmentation.get_segments import segment_thinned_image
-from slidekick.processing.lobule_segmentation.segments_to_mask import process_segments_to_mask
-from slidekick.processing.lobule_segmentation.portality import mask_to_portality
+from slidekick.processing.lobule_segmentation.portality import lobule_portality
 from slidekick.processing.lobule_segmentation.lob_utils import (
-    detect_tissue_mask_multiotsu, overlay_mask, pad_image, build_mask_pyramid_from_processed,
+    detect_tissue_mask_multiotsu, overlay_mask, pad_image,
     downsample_stack_to_max_side, holes_from_fg_mask,
     bool_mask_to_uint8, minmax_to_uint8, border_connected_mask,
     render_cluster_gray, nonlinear_channel_weighting, quantile_normalize_features,
     build_sp_adjacency, smooth_sp_features, smooth_sp_labels,
-    to_base_full, rescale_full,
+    to_base_full,
     common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
     discover_pyramid_shapes, preview_images_napari,
     run_napari_preview_action,
@@ -108,7 +106,18 @@ class LobuleSegmentor(BaseOperator):
                  vessel_pct_low: float = 5.0,
                  vessel_pct_superpixel_frac: float = 0.7,
                  min_area_px: int = 5000,
-                 pp_close_radius: int = 8):
+                 pp_close_radius: int = 8,
+                 # Higra seeded watershed parameters
+                 blob_sigma: float = 52.0,
+                 peak_min_dist: int = 120,
+                 peak_thresh_pct: float = 52.0,
+                 valley_sigma: float = 12.0,
+                 cluster_merge_sigma: float = 0.0,
+                 interactive_smoothing: bool = True,
+                 boundary_smooth_sigma: float = 20.0,
+                 boundary_smooth_valley_pct: float = 90.0,
+                 boundary_smooth_valley_band_px: int = 2,
+                 ):
         """
         @param metadata: List or single metadata object to load and use for lobule segmentation. All objects used should be single channel and either periportal or pericentrally expressed.
         @param channel_selection: Number of Metadata objects that should be inverted. Channels with stronger, i.e., brighter expression / absorpotion perincentrally should be inverted. If None, invert none.
@@ -119,13 +128,13 @@ class LobuleSegmentor(BaseOperator):
         @param confirm: whether to confirm the segmentation
         @param base_level: Pyramid level to load
         @param multi_otsu: tissue detection mode.
-            None (default) — auto-detect: runs 3-class multi-Otsu and checks the fraction of
+            None (default) - auto-detect: runs 3-class multi-Otsu and checks the fraction of
             pixels in the middle intensity class (mic_bg_frac). If mic_bg_frac < 5 % the
             histogram is treated as bimodal (good export, no microscopy artefact) and both
             middle and top classes become tissue. If mic_bg_frac >= 5 % the histogram is
             trimodal (microscopy background present) and only the top class is tissue.
-            True — force 3-class behaviour (tissue = top class only, old default).
-            False — force 2-class simple Otsu (no microscopy background handling).
+            True - force 3-class behaviour (tissue = top class only, old default).
+            False - force 2-class simple Otsu (no microscopy background handling).
         @param region_size: average size of superpixels for SLIC in pixels
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
@@ -149,10 +158,29 @@ class LobuleSegmentor(BaseOperator):
         @param vessel_circ_check_area_pv: PV vessels with area below this (px) are checked for circularity; vessels above pass without circularity check (large oblique cuts are expected non-circular)
         @param vessel_pct_low: global intensity threshold (0–255) on the per-pixel channel mean used to mark background/holes for vessel detection
         @param vessel_pct_superpixel_frac: minimal fraction of pixels below the intensity threshold inside a superpixel to mark it as background/hole
-        @param min_area_px: define area threshold to filter out very small polygons (noise)
+        @param min_area_px: define area threshold to filter out very small lobule regions (noise)
         @param pp_close_radius: radius (px) for morphological closing of the PP zone mask
-            before skeletonization.  0 = disabled.  A small value (e.g. 5–15) bridges
-            narrow gaps in the PP zone that would otherwise fragment the skeleton.
+            before vessel classification. 0 = disabled. A small value (e.g. 5–15) bridges
+            narrow gaps in the PP zone.
+        @param blob_sigma: Gaussian sigma for PV-peak detection in the Higra watershed seeding
+            (should approximate the lobule radius in pixels).
+        @param peak_min_dist: minimum pixel distance between kept peaks (NMS radius) for
+            Higra watershed seeding.
+        @param peak_thresh_pct: percentile brightness threshold for interior PV peaks.
+        @param valley_sigma: Gaussian sigma for the valley-smoothed field used as Higra
+            watershed edge weights. Larger values produce smoother lobule boundaries.
+        @param cluster_merge_sigma: coarse-scale sigma for basin-merging in seed detection;
+            0 or None disables merging.
+        @param interactive_smoothing: when both *preview* and this flag are True, an
+            interactive napari step is shown after the watershed so the user can tune
+            *boundary_smooth_sigma* and *boundary_smooth_valley_pct* with live feedback.
+            Pressing Back in the final review returns to this step.
+        @param boundary_smooth_sigma: Gaussian radius (pixels) for post-watershed boundary
+            smoothing. 0 disables. See ``segment_lobules`` for details.
+        @param boundary_smooth_valley_pct: percentile of the inverted-PV distribution above
+            which a pixel is frozen during smoothing (default 90 = top 10 % are valleys).
+        @param boundary_smooth_valley_band_px: dilation radius (pixels) applied around frozen
+            valley pixels; prevents smoothed boundaries from crossing real valleys (default 2).
         """
         self.throw_out_ratio = throw_out_ratio
         self.preview = preview
@@ -195,6 +223,17 @@ class LobuleSegmentor(BaseOperator):
         # lobule generation
         self.min_area_px = min_area_px
         self.pp_close_radius = int(pp_close_radius)
+
+        # Higra seeded watershed
+        self.blob_sigma = float(blob_sigma)
+        self.peak_min_dist = int(peak_min_dist)
+        self.peak_thresh_pct = float(peak_thresh_pct)
+        self.valley_sigma = float(valley_sigma)
+        self.cluster_merge_sigma = float(cluster_merge_sigma)
+        self.interactive_smoothing = bool(interactive_smoothing)
+        self.boundary_smooth_sigma = float(boundary_smooth_sigma)
+        self.boundary_smooth_valley_pct = float(boundary_smooth_valley_pct)
+        self.boundary_smooth_valley_band_px = int(boundary_smooth_valley_band_px)
 
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -593,8 +632,8 @@ class LobuleSegmentor(BaseOperator):
         def compute_weight_previews():
             """Returns (pp_img, pv_img).
 
-            pp_img : (H,W) float32 or None — per-pixel weighted mean of PP channels.
-            pv_img : (H,W) float32 or None — per-pixel weighted mean of PV channels.
+            pp_img : (H,W) float32 or None - per-pixel weighted mean of PP channels.
+            pv_img : (H,W) float32 or None - per-pixel weighted mean of PV channels.
 
             Works directly on pixel intensities (no superpixels / KMeans) so the
             preview is fast and avoids the FG-detection mismatch that made the
@@ -614,7 +653,7 @@ class LobuleSegmentor(BaseOperator):
 
             X = flat[:, cl_ch].copy()  # (N_pixels, Ck)
 
-            # Apply the same nonlinear + alpha transforms as skeletize_kmeans
+            # Apply the same nonlinear + alpha transforms as _classify_vessels_and_zones
             # so the user can see how gamma / pct / alpha affect the raw signal.
             if self.nonlinear_kmeans:
                 X = nonlinear_channel_weighting(
@@ -724,7 +763,7 @@ class LobuleSegmentor(BaseOperator):
 
         # Hide irrelevant widgets for single-polarity mode.
         # Alpha weights only affect dual-polarity (single channel ⇒ uniform
-        # scaling has no effect on KMeans boundaries).  The gamma for the
+        # scaling has no effect on KMeans boundaries). The gamma for the
         # absent polarity is also meaningless.
         if not _dual:
             weighting_controls.alpha_pp.visible = False
@@ -823,7 +862,7 @@ class LobuleSegmentor(BaseOperator):
         # Compute a float32 max-projection BEFORE uint8 quantization.
         # minmax_to_uint8 maps dim-but-real tissue signals (e.g. 50/50000 in
         # 16-bit E-Cadherin) to 0 in uint8, making them indistinguishable from
-        # true background.  The float max-projection preserves these values.
+        # true background. The float max-projection preserves these values.
         arrays_f32 = [a.astype(np.float32) for a in arrays]
         eps = 1e-10
         arrays_norm = [
@@ -921,19 +960,53 @@ class LobuleSegmentor(BaseOperator):
         return stack, fg_maxproj, bbox, orig_shapes
 
 
-    def skeletize_kmeans(self, image_stack: np.ndarray,
-                         pad=10,
-                         region_size=6,
-                         report_path: Path = None,
-                         fg_maxproj: Optional[np.ndarray] = None,
-                         precomputed_sp: Optional[dict] = None,
-                         ) -> Tuple[np.ndarray, Tuple[List[int], list]]:
-        """
-        Adopts most code from zia.../clustering.py. Uses intensities of pre-defined stain-channels.
-        We cluster superpixels, label centers (PP/MID/PV), then search for ring-like PP/PV regions
-        and reassign enclosed superpixels as vessels to the surrounding class. Saves zonation overlay
-        with vessel outlines (central=cyan, portal=magenta), then thinning. Adds refinement:
-        distance-based filling and histogram cutoffs guided by vessels.
+    def _classify_vessels_and_zones(
+        self,
+        image_stack: np.ndarray,
+        pad: int = 10,
+        region_size: int = 6,
+        report_path: Path = None,
+        fg_maxproj: Optional[np.ndarray] = None,
+        precomputed_sp: Optional[dict] = None,
+    ) -> Tuple[List[int], list, np.ndarray, np.ndarray]:
+        """Classify superpixels into zones and detect vessel contours.
+
+        Runs SLIC superpixel generation, weighted K-Means clustering, and
+        ring-consistency vessel detection. Returns the classified vessel
+        contours together with boolean masks for the tissue region and vessel
+        holes - ready for consumption by the Higra seeded watershed.
+
+        Parameters
+        ----------
+        image_stack:
+            Filtered (H, W, C) uint8 image stack (pre-padding is applied
+            internally via *pad*).
+        pad:
+            Number of pixels added on each side before processing (and
+            implicitly cropped by the caller afterwards).
+        region_size:
+            Average superpixel radius in pixels for SLIC.
+        report_path:
+            Optional directory for diagnostic PNG outputs.
+        fg_maxproj:
+            Optional float32 foreground max-projection used for tissue
+            detection. When *None* the method falls back to a per-pixel
+            max-projection of the filtered channels.
+        precomputed_sp:
+            Optional pre-computed superpixel dict (keys: ``labels``,
+            ``num_labels``, ``mask``). Skips SLIC when provided.
+
+        Returns
+        -------
+        vessel_classes : list of int
+            Per-contour class label (0 = central vein, 1 = portal vein).
+        vessel_contours : list of np.ndarray
+            Vessel contours in OpenCV format, aligned with *vessel_classes*.
+        tissue_mask : np.ndarray
+            Boolean mask (H, W) of the foreground tissue region (including
+            vessel interiors).
+        vessel_holes : np.ndarray
+            Boolean mask (H, W) marking all vessel interiors.
         """
         # 1) Superpixel generation
         image_stack = pad_image(image_stack, pad)
@@ -1230,10 +1303,10 @@ class LobuleSegmentor(BaseOperator):
         Ck = X.shape[1]
 
         # Single-polarity: smooth superpixel features on the adjacency graph
-        # to reduce noise at zone boundaries.  With only one gradient (e.g.
+        # to reduce noise at zone boundaries. With only one gradient (e.g.
         # PV-only), KMeans boundaries are noisy because the signal is
-        # continuous.  Graph smoothing averages each superpixel's feature
-        # with its neighbours, producing cleaner zone transitions.
+        # continuous. Graph smoothing averages each superpixel's feature
+        # with its neighbors, producing cleaner zone transitions.
         dual_polarity = bool(km_pp and km_pv)
 
         if not dual_polarity:
@@ -1277,15 +1350,17 @@ class LobuleSegmentor(BaseOperator):
             Xw = X
 
         # Over-clustering: use more internal KMeans clusters than the final
-        # 3 zones, then merge by intensity rank.  This gives finer control
-        # over zone proportions — e.g. more MID clusters expand the midzone
+        # 3 zones, then merge by intensity rank. This gives finer control
+        # over zone proportions - e.g. more MID clusters expand the midzone
         # at the expense of PP, improving the distance-thirds zonation model.
         # The split (n_pv / n_mid / n_pp) controls how many fine clusters
         # are allocated to each zone.
         if self.n_clusters == 3:
-            # K=7, split 1/4/2 — portality score 0.955, mIoU 0.737
-            K_INTERNAL = 7
-            SPLIT_PV, SPLIT_MID, SPLIT_PP = 1, 4, 2
+            # K=6, split 1/3/2 - sweep_midzone best: mid≈41%, pp_cc≈81% (dual)
+            # Expands midzone toward the distance-thirds target (~33%) while
+            # keeping PP zone connected for skeletonization.
+            K_INTERNAL = 6
+            SPLIT_PV, SPLIT_MID, SPLIT_PP = 1, 3, 2
         else:
             K_INTERNAL = self.n_clusters
             SPLIT_PV = SPLIT_PP = 1
@@ -1333,7 +1408,7 @@ class LobuleSegmentor(BaseOperator):
                     zone_remap[c] = 0  # PP
             labels_k = zone_remap[labels_k]
 
-            # Majority-vote smoothing (single-polarity only — dual already
+            # Majority-vote smoothing (single-polarity only - dual already
             # has clean boundaries from opposing gradients).
             if not dual_polarity:
                 sp_ids = np.array(fg_keys, dtype=np.int32)
@@ -1625,7 +1700,7 @@ class LobuleSegmentor(BaseOperator):
 
                 # Class-specific circularity check for mid-sized vessels:
                 # Vessels below the circularity-check area must be sufficiently circular.
-                # Large vessels (above threshold) skip this check — oblique/non-planar
+                # Large vessels (above threshold) skip this check - oblique/non-planar
                 # cuts produce elongated cross-sections that are still valid.
                 if cls == 1 and float(area_c) < float(vessel_circ_check_area_pp):
                     if circ_c < float(vessel_circularity_min):
@@ -1929,7 +2004,7 @@ class LobuleSegmentor(BaseOperator):
             def on_confirm() -> None:
                 # Do NOT recompute here. self.* already reflects the last
                 # Recalculate result, which is what the user previewed and is
-                # confirming.  Recomputing would silently apply any slider
+                # confirming. Recomputing would silently apply any slider
                 # changes made AFTER the last Recalculate but BEFORE Confirm,
                 # producing a result the user never saw.
                 pass
@@ -1970,8 +2045,8 @@ class LobuleSegmentor(BaseOperator):
         )
 
         # Optional morphological closing of the PP zone to bridge narrow gaps
-        # before skeletonization.  Only pixels that were MID (not PV or BG) are
-        # eligible to be flipped to PP — this preserves the PV holes that define
+        # before skeletonization. Only pixels that were MID (not PV or BG) are
+        # eligible to be flipped to PP - this preserves the PV holes that define
         # the lobule centres.
         if self.pp_close_radius > 0:
             console.print(
@@ -1998,9 +2073,6 @@ class LobuleSegmentor(BaseOperator):
                     f"({100 * n_flipped / fg_pix_mask.sum():.1f}% of foreground)",
                     style="info",
                 )
-
-        template = render_cluster_gray(cluster_map_final, sorted_label_idx, self.n_clusters)
-        template[~fg_pix_mask] = 0
 
         # Zonation + vessel overlay
         if report_path is not None:
@@ -2034,73 +2106,35 @@ class LobuleSegmentor(BaseOperator):
             cv2.imwrite(str(report_path / "zonation_overlay.png"), overlay)
             cv2.imwrite(str(report_path / "zonation_rgb.png"), zonation_rgb)
 
-        # approximate tissue outline from current stack: largest external contour of nonzero region
+        # Approximate tissue outline from the tissue boolean mask.
         tissue_u8 = (tissue_bool.astype(np.uint8) * 255)
         cnts, _ = cv2.findContours(tissue_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         tissue_boundary = max(cnts, key=cv2.contourArea) if cnts else np.array(
             [[[0, 0]], [[W - 1, 0]], [[W - 1, H - 1]], [[0, H - 1]]], dtype=np.int32
         )
 
-        # FROM HERE: ZIA again
-        # shades of gray, n clusters + 2 for background
-
-        class_0_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0]
-        class_1_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 1]
-
-        # CV vessels: fill with max gray → become 0 (dark holes) after inversion
-        cv2.drawContours(template, class_0_contours, -1, 255, thickness=cv2.FILLED)
-        # PP vessels: fill with max gray too → dark holes after inversion, then
-        # draw thin boundary outline so they act as lobule separators without
-        # creating large bright blobs that attract the skeleton.
-        cv2.drawContours(template, class_1_contours, -1, 255, thickness=cv2.FILLED)
-
-        template = 255 - template
-
-        # Re-draw PP vessel outlines as bright boundary lines (skeleton seeds)
-        cv2.drawContours(template, class_1_contours, -1, 255, thickness=2)
-
-        template = cv2.medianBlur(template, 5)
-
-        if report_path is not None:
-            cv2.imwrite(str(report_path / "grayscale.png"), template)
-
-        tissue_mask = np.zeros_like(template, dtype=np.uint8)
+        # Build tissue_mask: fill the largest tissue contour.
+        tissue_mask = np.zeros((H, W), dtype=np.uint8)
         cv2.drawContours(tissue_mask, [tissue_boundary], -1, 255, thickness=cv2.FILLED)
         tissue_mask = tissue_mask.astype(bool)
 
-        template[~tissue_mask] = 0
-        cv2.drawContours(template, [tissue_boundary], -1, 255, thickness=1)
+        # Build vessel_holes: fill all vessel contour interiors into a single bool mask.
+        vessel_holes = np.zeros((H, W), dtype=np.uint8)
+        cv2.drawContours(vessel_holes, vessel_contours, -1, 255, thickness=cv2.FILLED)
+        vessel_holes = vessel_holes.astype(bool)
 
         if report_path is not None:
-            out_template = np.zeros(shape=(merged.shape[0], merged.shape[1], 4)).astype(np.uint8)
+            class_0_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0]
+            class_1_contours = [cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 1]
+            out_template = np.zeros(shape=(H, W, 4), dtype=np.uint8)
             cv2.drawContours(out_template, class_0_contours, -1, (255, 255, 0, 127), thickness=cv2.FILLED)
             cv2.drawContours(out_template, class_0_contours, -1, (255, 255, 0, 255), thickness=2)
-
             cv2.drawContours(out_template, class_1_contours, -1, (255, 0, 255, 127), thickness=cv2.FILLED)
             cv2.drawContours(out_template, class_1_contours, -1, (255, 0, 255, 255), thickness=2)
-
             cv2.drawContours(out_template, [tissue_boundary], -1, (255, 255, 255, 255), thickness=3)
+            cv2.imwrite(str(report_path / "classified_vessels.png"), out_template)
 
-            cv2.imwrite(str(report_path / f"classified_vessels.png"), out_template)
-            cv2.imwrite(str(report_path / f"final_clustered_map.png"), template)
-
-        console.print("Complete. Run thinning algorithm...", style="info")
-        thinned = cv2.ximgproc.thinning(template.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
-
-        # drawing the vessels on the mask and thin again to prevent pixel accumulations the segmentation can't handle
-
-        #cv2.drawContours(thinned, class_0_contours, -1, 0, thickness=cv2.FILLED)
-        #cv2.drawContours(thinned, class_0_contours, -1, 255, thickness=1)
-
-        #cv2.drawContours(thinned, class_1_contours, -1, 0, thickness=cv2.FILLED)
-        #cv2.drawContours(thinned, class_1_contours, -1, 255, thickness=1, )
-
-        thinned = cv2.ximgproc.thinning(thinned.reshape(template.shape[0], template.shape[1], 1).astype(np.uint8))
-
-        if report_path is not None:
-            cv2.imwrite(str(report_path / "thinned.png"), thinned)
-
-        return thinned, (vessel_classes, vessel_contours)
+        return vessel_classes, vessel_contours, tissue_mask, vessel_holes
 
 
     def apply(self) -> Tuple[Metadata, Metadata]:
@@ -2205,7 +2239,7 @@ class LobuleSegmentor(BaseOperator):
                     self.region_size = region_size
 
                 try:
-                    thinned, (vessel_classes, vessel_contours) = self.skeletize_kmeans(
+                    vessel_classes, vessel_contours, tissue_mask, vessel_holes = self._classify_vessels_and_zones(
                         img_stack,
                         pad=pad,
                         region_size=self.region_size,
@@ -2237,93 +2271,248 @@ class LobuleSegmentor(BaseOperator):
                 # Successful completion of the interactive portion.
                 break
 
-        console.print("Complete. Creating lines segments from skeleton...", style="info")
+        console.print("Complete. Running Higra seeded watershed...", style="info")
 
-        # Steps 8: segments
-        line_segments = segment_thinned_image(thinned, report_path=report_path)
-
-        console.print("Complete. Creating segmentation mask...", style="info")
-
-        # Step 9: Creating lobule and vessel polygons from line segments and vessel contours
-        mask = process_segments_to_mask(
-            line_segments,
-            thinned.shape,
-            cv_contours=[cnt for cnt, class_ in zip(vessel_contours, vessel_classes) if class_ == 0],
-            report_path=report_path,
-            min_area_px=self.min_area_px,
+        from slidekick.processing.lobule_segmentation.higra_segment import (
+            segment_lobules,
+            _masked_smooth as _higra_masked_smooth,
+            _smooth_labels_valley_aware as _higra_smooth_labels,
         )
 
-        # Crop mask by padding
-        mask_cropped = mask[pad:-pad, pad:-pad]
+        pv_channel_idx = self.channels_pv[0] if self.channels_pv else 0
+        _pv_raw = img_stack[:, :, pv_channel_idx].astype(np.float32)
+        pv_stain = np.pad(_pv_raw, ((pad, pad), (pad, pad)), mode="constant", constant_values=0.0)
 
-        # ---- Everything below stays at base_level until the final save ----
+        # Run watershed without smoothing; smoothing is applied interactively below.
+        mask_raw = segment_lobules(
+            tissue_mask, vessel_holes, pv_stain,
+            blob_sigma=self.blob_sigma,
+            peak_min_dist=self.peak_min_dist,
+            peak_thresh_pct=self.peak_thresh_pct,
+            valley_sigma=self.valley_sigma,
+            cluster_merge_sigma=self.cluster_merge_sigma,
+            min_area_px=self.min_area_px,
+            boundary_smooth_sigma=0,  # applied interactively below
+        )
 
-        # Step 10a: Build base-level full-frame mask only (no pyramid yet).
-        proc_h, proc_w = mask_cropped.shape
-        Hb, Wb = img_size_base
-        Hfull_base, Wfull_base = orig_shapes[self.base_level]
-        min_r, min_c, max_r, max_c = bbox
+        # Reconstruct the inverted PV field (same formula as inside segment_lobules)
+        # so the interactive smoothing step can call _higra_smooth_labels directly.
+        _fg_ws = tissue_mask & ~vessel_holes
+        _smoothed_ws = _higra_masked_smooth(pv_stain, tissue_mask, self.valley_sigma)
+        _mx_ws = float(_smoothed_ws[tissue_mask].max()) if tissue_mask.any() else 1.0
+        _inverted_ws = (_mx_ws - _smoothed_ws).astype(np.float32)
+        _inverted_ws[~tissue_mask] = _mx_ws
 
-        roi_base = cv2.resize(
-            mask_cropped.astype(np.int32), (Wb, Hb),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(np.int32)
-        mask_base_full = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
-        r0 = max(0, min_r); c0 = max(0, min_c)
-        r1 = min(Hfull_base, max_r); c1 = min(Wfull_base, max_c)
-        if (r1 - r0) != Hb or (c1 - c0) != Wb:
-            roi_base = cv2.resize(roi_base, (c1 - c0, r1 - r0),
-                                  interpolation=cv2.INTER_NEAREST).astype(np.int32)
-        mask_base_full[r0:r1, c0:c1] = roi_base
+        # === Interactive boundary-smoothing + final-review loop ===
+        # Runs once normally; re-iterates when the user presses Back from the
+        # final review to re-adjust the smoothing parameters.
+        _show_smoothing_preview = True
 
-        console.print("Complete. Creating portality map...", style="info")
+        while True:
 
-        # Step 10b: Vessel contours in base-level full-frame coordinates.
-        cv_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 0]
-        pf_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 1]
+            # -------------------------------------------------------------------
+            # A. Interactive boundary-smoothing preview (napari)
+            # -------------------------------------------------------------------
+            if _show_smoothing_preview and self.preview and self.interactive_smoothing:
+                _smooth_defaults = dict(
+                    boundary_smooth_sigma=self.boundary_smooth_sigma,
+                    boundary_smooth_valley_pct=self.boundary_smooth_valley_pct,
+                )
+                _smooth_pending = dict(_smooth_defaults)
 
-        cv_cnt_base = to_base_full(cv_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
-        pf_cnt_base = to_base_full(pf_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
+                def _apply_smooth_pending_to_self() -> None:
+                    self.boundary_smooth_sigma = float(_smooth_pending["boundary_smooth_sigma"])
+                    self.boundary_smooth_valley_pct = float(_smooth_pending["boundary_smooth_valley_pct"])
 
-        # Step 10c: Portality at base_level only.
-        P_base = mask_to_portality(
-            mask_base_full, cv_cnt_base, pf_cnt_base, report_path=None,
-        ).astype(np.float32)
+                def _compute_smooth_overlay_vis() -> np.ndarray:
+                    _s = float(_smooth_pending["boundary_smooth_sigma"])
+                    _v = float(_smooth_pending["boundary_smooth_valley_pct"])
+                    _m = (
+                        _higra_smooth_labels(
+                            mask_raw, _inverted_ws, _fg_ws,
+                            sigma=_s, valley_pct=_v,
+                            valley_band_px=self.boundary_smooth_valley_band_px,
+                        )
+                        if _s > 0 else mask_raw
+                    )
+                    return overlay_mask(img_stack, _m[pad:-pad, pad:-pad], alpha=0.5)
 
-        # Crop base-level portality to ROI and save fixed-size PNG
-        portality_cropped = P_base[min_r:max_r, min_c:max_c]
+                _smooth_viewer = napari.Viewer()
+                _smooth_seg_layer = _smooth_viewer.add_image(
+                    _compute_smooth_overlay_vis(),
+                    name="Segmentation (smoothed)",
+                    rgb=True,
+                )
 
-        cmap = plt.get_cmap("magma").copy()
-        cmap.set_bad(alpha=0.0)
-        Pm = np.ma.masked_invalid(portality_cropped).astype(np.float32)
+                @magicgui(
+                    layout="vertical",
+                    auto_call=True,
+                    boundary_smooth_sigma={
+                        "min": 0.0, "max": 80.0, "step": 1.0,
+                        "label": "Smooth sigma (px)  [0 = off]",
+                        "tooltip": "Gaussian radius for boundary rounding. Larger = smoother curves. 0 disables smoothing entirely.",
+                    },
+                    boundary_smooth_valley_pct={
+                        "min": 50.0, "max": 99.0, "step": 1.0,
+                        "label": "Freeze valley pct",
+                        "tooltip": "Top N% of inverted-PV pixels are frozen (real boundaries stay). Higher = more frozen.",
+                    },
+                )
+                def smooth_controls(
+                    boundary_smooth_sigma: float = float(self.boundary_smooth_sigma),
+                    boundary_smooth_valley_pct: float = float(self.boundary_smooth_valley_pct),
+                ):
+                    _smooth_pending["boundary_smooth_sigma"] = float(boundary_smooth_sigma)
+                    _smooth_pending["boundary_smooth_valley_pct"] = float(boundary_smooth_valley_pct)
 
-        plt.imsave(str(report_path / "portality.png"), Pm, cmap=cmap, vmin=0.0, vmax=1.0)
+                def on_smooth_update() -> None:
+                    console.print(
+                        f"Smoothing: sigma={_smooth_pending['boundary_smooth_sigma']:.0f} px, "
+                        f"valley_pct={_smooth_pending['boundary_smooth_valley_pct']:.0f}",
+                        style="info",
+                    )
+                    _smooth_seg_layer.data = _compute_smooth_overlay_vis()
 
-        # Preview after portality is available
-        if self.preview:
-            orig_vis = img_stack.mean(axis=2).astype(np.uint8)
-            overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
+                def on_smooth_reset() -> None:
+                    self.boundary_smooth_sigma = _smooth_defaults["boundary_smooth_sigma"]
+                    self.boundary_smooth_valley_pct = _smooth_defaults["boundary_smooth_valley_pct"]
+                    _smooth_pending.update(_smooth_defaults)
+                    smooth_controls.boundary_smooth_sigma.value = _smooth_defaults["boundary_smooth_sigma"]
+                    smooth_controls.boundary_smooth_valley_pct.value = _smooth_defaults["boundary_smooth_valley_pct"]
+                    _smooth_seg_layer.data = _compute_smooth_overlay_vis()
 
-            portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
-            portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
+                def on_smooth_confirm() -> None:
+                    pass  # last Recalculate result is what was previewed; don't recompute
 
-            action = preview_images_napari(
-                [orig_vis, overlay_vis, portality_rgba],
-                titles=["Original", "Segmentation Overlay", "Portality"],
-                require_confirm=self.confirm,
-                return_action=True,
-                include_confirm=True,
-                include_back=True,
-                confirm_text="Confirm and finish",
-                back_text="Back",
-            )
+                def on_smooth_apply_values() -> None:
+                    _apply_smooth_pending_to_self()
 
-            if action == "back":
-                raise PipelineBack(3)
+                _smooth_action = run_napari_preview_action(
+                    _smooth_viewer,
+                    smooth_controls,
+                    require_confirm=False,
+                    on_update=on_smooth_update,
+                    on_reset=on_smooth_reset,
+                    on_confirm=on_smooth_confirm,
+                    on_apply_values=on_smooth_apply_values,
+                    include_back=False,  # no back-to-vessels from smoothing step
+                )
 
-            if self.confirm and action == "closed":
-                console.print("Aborted by user at final preview. No outputs written.", style="error")
-                return self.metadata
+                if _smooth_action == "abort":
+                    console.print("Aborted by user at smoothing step.", style="error")
+                    return self.metadata
+
+            _show_smoothing_preview = False
+
+            # -------------------------------------------------------------------
+            # B. Apply confirmed smoothing parameters
+            # -------------------------------------------------------------------
+            if self.boundary_smooth_sigma > 0:
+                mask = _higra_smooth_labels(
+                    mask_raw, _inverted_ws, _fg_ws,
+                    sigma=self.boundary_smooth_sigma,
+                    valley_pct=self.boundary_smooth_valley_pct,
+                    valley_band_px=self.boundary_smooth_valley_band_px,
+                )
+            else:
+                mask = mask_raw
+
+            # Crop mask by padding
+            mask_cropped = mask[pad:-pad, pad:-pad]
+
+            # ----------------------------------------------------------------
+            # C. Base-level full-frame mask + portality
+            # ----------------------------------------------------------------
+
+            # Step 10a: Build base-level full-frame mask only (no pyramid yet).
+            proc_h, proc_w = mask_cropped.shape
+            Hb, Wb = img_size_base
+            Hfull_base, Wfull_base = orig_shapes[self.base_level]
+            min_r, min_c, max_r, max_c = bbox
+
+            roi_base = cv2.resize(
+                mask_cropped.astype(np.int32), (Wb, Hb),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.int32)
+            mask_base_full = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
+            r0 = max(0, min_r); c0 = max(0, min_c)
+            r1 = min(Hfull_base, max_r); c1 = min(Wfull_base, max_c)
+            if (r1 - r0) != Hb or (c1 - c0) != Wb:
+                roi_base = cv2.resize(roi_base, (c1 - c0, r1 - r0),
+                                      interpolation=cv2.INTER_NEAREST).astype(np.int32)
+            mask_base_full[r0:r1, c0:c1] = roi_base
+
+            console.print("Complete. Creating portality map...", style="info")
+
+            # Step 10b: Vessel contours in base-level full-frame coordinates.
+            cv_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 0]
+            pf_cnt_roi = [c for c, k in zip(vessel_contours, vessel_classes) if k == 1]
+
+            cv_cnt_base = to_base_full(cv_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
+            pf_cnt_base = to_base_full(pf_cnt_roi, pad, bbox, (proc_h, proc_w), (Hb, Wb))
+
+            # Step 10c: Portality at base_level only.
+            _canvas_cv = np.zeros((Hfull_base, Wfull_base), dtype=np.uint8)
+            _canvas_pf = np.zeros((Hfull_base, Wfull_base), dtype=np.uint8)
+            for c in cv_cnt_base:
+                cv2.fillPoly(_canvas_cv, [c.reshape(-1, 1, 2).astype(np.int32)], 1)
+            for c in pf_cnt_base:
+                cv2.fillPoly(_canvas_pf, [c.reshape(-1, 1, 2).astype(np.int32)], 1)
+
+            # Build PV stain in full-frame coordinates for the CV-fallback in
+            # lobule_portality (lobules without an annotated CV use the PV
+            # intensity peak as a surrogate central vein).
+            _pv_roi = cv2.resize(_pv_raw, (c1 - c0, r1 - r0),
+                                 interpolation=cv2.INTER_LINEAR)
+            _pv_full = np.zeros((Hfull_base, Wfull_base), dtype=np.float32)
+            _pv_full[r0:r1, c0:c1] = _pv_roi
+
+            P_base = lobule_portality(
+                mask_base_full,
+                _canvas_cv.astype(bool),
+                _canvas_pf.astype(bool),
+                pv_stain=_pv_full,
+            ).astype(np.float32)
+
+            # Crop base-level portality to ROI and save fixed-size PNG
+            portality_cropped = P_base[min_r:max_r, min_c:max_c]
+
+            cmap = plt.get_cmap("magma").copy()
+            cmap.set_bad(alpha=0.0)
+            Pm = np.ma.masked_invalid(portality_cropped).astype(np.float32)
+
+            plt.imsave(str(report_path / "portality.png"), Pm, cmap=cmap, vmin=0.0, vmax=1.0)
+
+            # ----------------------------------------------------------------
+            # D. Final review preview
+            # ----------------------------------------------------------------
+            if self.preview:
+                overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
+
+                portality_rgba = (cmap(Pm) * 255).astype(np.uint8)
+                portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
+
+                action = preview_images_napari(
+                    [overlay_vis, portality_rgba],
+                    titles=["Segmentation Overlay", "Portality"],
+                    require_confirm=self.confirm,
+                    return_action=True,
+                    include_confirm=True,
+                    include_back=True,
+                    confirm_text="Confirm and finish",
+                    back_text="Back to smoothing",
+                )
+
+                if action == "back":
+                    # Return to smoothing preview so user can tweak sigma / valley_pct.
+                    _show_smoothing_preview = True
+                    continue
+
+                if self.confirm and action == "closed":
+                    console.print("Aborted by user at final preview. No outputs written.", style="error")
+                    return self.metadata
+
+            break  # confirmed (or no preview)
 
         # Step 11: Build full pyramids only now (for saving).
         console.print("Building pyramids for all levels...", style="info")
@@ -2370,8 +2559,8 @@ class LobuleSegmentor(BaseOperator):
         console.print("Complete.", style="info")
 
         del (portality_pyramid, P_base, Pm, img_stack, mask, mask_base_full, mask_pyramid, mask_cropped,
-             line_segments, cv_cnt_base, cv_cnt_roi, pf_cnt_base, pf_cnt_roi,
-             portality_cropped, thinned, vessel_classes, vessel_contours)
+             cv_cnt_base, cv_cnt_roi, pf_cnt_base, pf_cnt_roi,
+             portality_cropped, vessel_classes, vessel_contours)
 
         # Return both metadata objects
         return new_meta, new_port

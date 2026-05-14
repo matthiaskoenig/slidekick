@@ -54,7 +54,7 @@ def multiotsu_split(gray: np.ndarray, classes: int = 3, blur_sigma: float = 1.5,
 _MIC_BG_THRESHOLD = 0.05
 
 # Minimum relative gap between the two 3-class Otsu thresholds (fraction of
-# the intensity range).  When the thresholds are closer than this, the
+# the intensity range). When the thresholds are closer than this, the
 # histogram is effectively bimodal even if mic_bg_frac >= _MIC_BG_THRESHOLD.
 _MIN_THRESHOLD_GAP = 0.10
 
@@ -83,7 +83,7 @@ def _morphological_cleanup(m_tis: np.ndarray, dim: int, area: int,
     """Resolution-invariant morphological cleanup for tissue masks.
 
     Optional median filter smooths salt-and-pepper noise at the boundary
-    without filling concavities or eroding thin peninsulas.  Skipped
+    without filling concavities or eroding thin peninsulas. Skipped
     when *median_frac* is 0.
     """
     # 1) Optional median filter for boundary smoothing.
@@ -169,7 +169,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
             m_tis.astype(np.uint8), cv2.MORPH_CLOSE, se).astype(bool)
 
     #   Label all non-tissue components; only those touching the image
-    #   border are real background.  Interior holes (vessels) survive.
+    #   border are real background. Interior holes (vessels) survive.
     bg_labeled, n = ndi_label(~m_tis)
     if n > 0:
         border_ids = set()
@@ -256,56 +256,6 @@ def holes_from_fg_mask(fg_pix_mask: np.ndarray, border_exclude: Optional[np.ndar
     if border_exclude is not None:
         holes &= ~border_exclude.astype(bool)
     return holes
-
-
-def build_mask_pyramid_from_processed(
-    mask_cropped: np.ndarray,
-    img_size_base: Tuple[int, int],            # (Hb, Wb) cropped ROI at base_level (AFTER bbox crop, BEFORE padding)
-    bbox_base: Tuple[int, int, int, int],      # (min_r, min_c, max_r, max_c) in base_level coords
-    orig_shapes: Dict[int, Tuple[int, int]],   # {level: (H,W)} full-frame shapes at each level
-    base_level: int,                           # the level used to load/crop
-) -> Dict[int, np.ndarray]:
-    """
-    0) mask_cropped: mask with padding already stripped (so shape == processed ROI size without pad)
-    1) Resize mask_cropped from processed-ROI size -> base-level ROI size (img_size_base)
-    2) Paste into a full-size base_level canvas at bbox_base
-    3) Resample that base canvas to every level in orig_shapes (NEAREST to preserve labels)
-    Returns {level: full_mask_at_level}
-    """
-    # Step 1: processed ROI -> base-level ROI
-    Hb, Wb = int(img_size_base[0]), int(img_size_base[1])      # target ROI size at base_level
-    if Hb <= 0 or Wb <= 0 or mask_cropped.size == 0:
-        return {lvl: np.zeros(orig_shapes[lvl], dtype=np.int32) for lvl in orig_shapes}
-
-    roi_base = cv2.resize(
-        mask_cropped.astype(np.int32),
-        (Wb, Hb),  # (width, height)
-        interpolation=cv2.INTER_NEAREST
-    ).astype(np.int32)
-
-    # Step 2: paste into full-size base canvas at bbox
-    Hfull_base, Wfull_base = orig_shapes[base_level]
-    min_r, min_c, max_r, max_c = bbox_base
-    canvas_base = np.zeros((Hfull_base, Wfull_base), dtype=np.int32)
-    # Safety clamp (in case of off-by-one)
-    min_r = max(0, min_r); min_c = max(0, min_c)
-    max_r = min(Hfull_base, max_r); max_c = min(Wfull_base, max_c)
-    if (max_r - min_r) != Hb or (max_c - min_c) != Wb:
-        # If bbox dims and img_size_base mismatch by 1 px, reconcile by resize
-        Hb2, Wb2 = (max_r - min_r), (max_c - min_c)
-        roi_base = cv2.resize(roi_base, (Wb2, Hb2), interpolation=cv2.INTER_NEAREST).astype(np.int32)
-    canvas_base[min_r:max_r, min_c:max_c] = roi_base
-
-    # Step 3: build pyramid by resizing base canvas to each level
-    out = {}
-    for lvl, (Hdst, Wdst) in orig_shapes.items():
-        if lvl == base_level:
-            out[lvl] = canvas_base.copy()
-        else:
-            out[lvl] = cv2.resize(
-                canvas_base, (Wdst, Hdst), interpolation=cv2.INTER_NEAREST
-            ).astype(np.int32)
-    return out
 
 
 def pad_image(image_stack: np.ndarray, pad: int) -> np.ndarray:
@@ -437,7 +387,7 @@ def quantile_normalize_features(X: np.ndarray) -> np.ndarray:
     Replace each column of *X* with its per-column percentile rank in [0, 1].
 
     Transforms a skewed intensity distribution into a uniform one so KMeans
-    splits the data into roughly equal-sized clusters.  Useful when only one
+    splits the data into roughly equal-sized clusters. Useful when only one
     polarity (PV-only or PP-only) is available and the raw intensity gradient
     is very steep, leaving the midzone extremely thin.
     """
@@ -538,7 +488,7 @@ def smooth_sp_labels(labels_k: np.ndarray, sp_ids: np.ndarray,
     """Majority-vote smoothing of cluster labels on the adjacency graph.
 
     For each superpixel, if the majority of its neighbors have a
-    different label, switch to the majority label.  Uses sparse
+    different label, switch to the majority label. Uses sparse
     matrix multiplication for speed.
     """
     A = _build_adj_matrix(sp_ids, adj, weight_self=1.0)
@@ -570,22 +520,6 @@ def to_base_full(contours_xy: List[np.ndarray],
         pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 2)
         pts[:, 0] = (pts[:, 0] - float(pad_px)) * sx + float(min_c)
         pts[:, 1] = (pts[:, 1] - float(pad_px)) * sy + float(min_r)
-        out.append(pts.reshape(-1, 1, 2).astype(np.int32))
-    return out
-
-
-def rescale_full(contours_xy: List[np.ndarray],
-                  Hsrc: int, Wsrc: int, Hdst: int, Wdst: int) -> List[np.ndarray]:
-    # scale contours from a full-frame source size to a full-frame destination size
-    if not contours_xy:
-        return []
-    sx = float(Wdst) / float(max(Wsrc, 1))
-    sy = float(Hdst) / float(max(Hsrc, 1))
-    out: List[np.ndarray] = []
-    for cnt in contours_xy:
-        pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 2)
-        pts[:, 0] *= sx
-        pts[:, 1] *= sy
         out.append(pts.reshape(-1, 1, 2).astype(np.int32))
     return out
 
@@ -708,6 +642,100 @@ def discover_pyramid_shapes(multiscale: Any) -> Dict[int, Tuple[int, int]]:
         except Exception:
             continue
     return out
+
+
+def lobule_miou(
+    gt_labels: np.ndarray,
+    pred_labels: np.ndarray,
+    fg: np.ndarray,
+    tissue: Optional[np.ndarray] = None,
+    tissue_margin_px: int = 10,
+    min_gt_px: int = 100,
+    min_interior_px: int = 50,
+) -> float:
+    """Mean IoU of matched lobule instances (greedy best-match per GT lobule).
+
+    For lobules that touch the tissue boundary the comparison is restricted to
+    *interior* pixels — those at least *tissue_margin_px* away from the tissue
+    edge. Tissue-boundary pixels are excluded because their assignment to a
+    lobule is determined by where the tissue happens to end, not by real lobule
+    structure, so including them penalises otherwise correct predictions.
+
+    Parameters
+    ----------
+    gt_labels : np.ndarray
+        2-D integer GT label image (0 = background).
+    pred_labels : np.ndarray
+        2-D integer predicted label image (0 = background).
+    fg : np.ndarray
+        Boolean foreground mask (tissue, excluding vessel holes).
+    tissue : np.ndarray or None
+        Boolean tissue mask. When provided, pixels within
+        *tissue_margin_px* of the tissue edge are excluded from the IoU
+        evaluation of boundary-touching lobules. When ``None`` the original
+        (full foreground) regions are used for all lobules.
+    tissue_margin_px : int
+        Minimum distance from the tissue boundary for a pixel to count as
+        "interior". Only applied to lobules whose GT region touches the tissue
+        edge.
+    min_gt_px : int
+        Minimum number of fg pixels a GT lobule must have to be included.
+    min_interior_px : int
+        Minimum number of interior pixels a boundary lobule must have after
+        erosion; lobules below this threshold are skipped.
+
+    Returns
+    -------
+    float
+        Mean per-lobule IoU in [0, 1]. Returns 0.0 if no eligible GT
+        lobules exist.
+    """
+    from scipy.ndimage import distance_transform_edt as _edt
+
+    gt_ids = np.unique(gt_labels[fg])
+    gt_ids = gt_ids[gt_ids > 0]
+    if len(gt_ids) == 0 or not np.any(pred_labels[fg] > 0):
+        return 0.0
+
+    # Pre-compute interior mask once if tissue is provided.
+    if tissue is not None:
+        d_tissue = _edt(tissue.astype(bool)).astype(np.float32)
+        interior_mask = d_tissue >= float(tissue_margin_px)
+    else:
+        interior_mask = None
+
+    ious: List[float] = []
+    for gl in gt_ids:
+        gt_r = (gt_labels == gl) & fg
+        if gt_r.sum() < min_gt_px:
+            continue
+
+        # Determine evaluation region: interior-only for boundary lobules.
+        if interior_mask is not None:
+            gt_eval = gt_r & interior_mask
+            if gt_eval.sum() < min_interior_px:
+                # Lobule is almost entirely at the tissue boundary — skip.
+                continue
+        else:
+            gt_eval = gt_r
+
+        # Best-matching predicted region (plurality vote inside gt_eval).
+        pred_in = pred_labels[gt_eval]
+        pred_in = pred_in[pred_in > 0]
+        if len(pred_in) == 0:
+            ious.append(0.0)
+            continue
+        best = np.bincount(pred_in).argmax()
+        pred_r = (pred_labels == best) & fg
+
+        # Restrict prediction to the same evaluation region.
+        pred_eval = pred_r & (interior_mask if interior_mask is not None else np.ones_like(gt_r))
+
+        inter = int((gt_eval & pred_eval).sum())
+        union = int((gt_eval | pred_eval).sum())
+        ious.append(inter / max(union, 1))
+
+    return float(np.mean(ious)) if ious else 0.0
 
 
 def add_napari_controls_dock(
