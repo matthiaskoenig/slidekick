@@ -735,8 +735,8 @@ class LobuleSegmentor(BaseOperator):
             quantile_kmeans={"widget_type": "CheckBox",
                              "tooltip": "Rank-normalize features before KMeans (balanced zone sizes)."},
             nonlinear_kmeans={"widget_type": "CheckBox"},
-            alpha_pp={"min": 0.0, "max": 5.0, "step": 0.01},
-            alpha_pv={"min": 0.0, "max": 5.0, "step": 0.01},
+            alpha_pp={"min": 0.0, "max": 15.0, "step": 0.01},
+            alpha_pv={"min": 0.0, "max": 15.0, "step": 0.01},
             pp_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
             pv_gamma={"min": 0.1, "max": 5.0, "step": 0.01},
             nl_low_pct={"min": 0.0, "max": 50.0, "step": 0.5},
@@ -1034,11 +1034,9 @@ class LobuleSegmentor(BaseOperator):
 
         sp_adj = build_sp_adjacency(labels)
 
-        merged = image_stack.astype(float)
-
         H, W, C = image_stack.shape
         lab_flat = labels.ravel()
-        img_flat = merged.reshape(-1, C).astype(np.float32)
+        img_flat = image_stack.reshape(-1, C).astype(np.float32)
 
         counts = np.bincount(lab_flat, minlength=num_labels).astype(np.int32)
         nz = counts > 0
@@ -1066,9 +1064,6 @@ class LobuleSegmentor(BaseOperator):
             signal_frac = np.zeros(num_labels, dtype=np.float32)
             np.divide(signal_counts, counts, out=signal_frac, where=nz)
             base_fg_label_mask = signal_frac > self.fg_min_signal_frac
-
-        # Keep base_gray for display only
-        base_gray = image_stack.mean(axis=2).astype(np.uint8)
 
         # IMPORTANT: use float per-pixel mean (old behavior), not uint8-cast mean
         # This matters when thresholds are very low (e.g. 3–10).
@@ -2353,7 +2348,7 @@ class LobuleSegmentor(BaseOperator):
                         "tooltip": "Gaussian radius for boundary rounding. Larger = smoother curves. 0 disables smoothing entirely.",
                     },
                     boundary_smooth_valley_pct={
-                        "min": 50.0, "max": 99.0, "step": 1.0,
+                        "min": 40.0, "max": 99.0, "step": 1.0,
                         "label": "Freeze valley pct",
                         "tooltip": "Top N% of inverted-PV pixels are frozen (real boundaries stay). Higher = more frozen.",
                     },

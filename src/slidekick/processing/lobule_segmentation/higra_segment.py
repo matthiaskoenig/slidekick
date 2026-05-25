@@ -311,7 +311,7 @@ def _seeds_from_cv_mask(
     angles = np.linspace(0, 2 * np.pi, 32, endpoint=False)
 
     for comp_id in range(1, n_cv + 1):
-        ys, xs = np.where(labeled_cv == comp_id)
+        ys = np.where(labeled_cv == comp_id)[0]
         if len(ys) < min_cv_area:               # skip noise pixels / tiny artefacts
             continue
 
@@ -322,8 +322,7 @@ def _seeds_from_cv_mask(
         # anchor so that portality flows outward from the correct origin.
         comp_mask = (labeled_cv == comp_id)
         _dt_cv = _edt(comp_mask)
-        _flat  = int(np.argmax(_dt_cv))
-        cy, cx = int(_flat // W), int(_flat % W)
+        cy, cx = divmod(int(np.argmax(_dt_cv)), W)
 
         # Inscribed-circle radius (EDT value at the centre) is more accurate
         # than the area-based approximation, especially for elongated CVs.

@@ -503,7 +503,6 @@ def smooth_sp_labels(labels_k: np.ndarray, sp_ids: np.ndarray,
     return lk
 
 
-
 def to_base_full(contours_xy: List[np.ndarray],
                   pad_px: int,
                   bbox_base: Tuple[int, int, int, int],
