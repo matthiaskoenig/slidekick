@@ -652,6 +652,8 @@ def lobule_miou(
     tissue_margin_px: int = 10,
     min_gt_px: int = 100,
     min_interior_px: int = 50,
+    penalize_fp: bool = False,
+    min_pred_px: int = 100,
 ) -> float:
     """Mean IoU of matched lobule instances (greedy best-match per GT lobule).
 
@@ -683,6 +685,16 @@ def lobule_miou(
     min_interior_px : int
         Minimum number of interior pixels a boundary lobule must have after
         erosion; lobules below this threshold are skipped.
+    penalize_fp : bool
+        When True, predicted lobules that are never selected as the best
+        match for any GT lobule are treated as false positives: each one
+        contributes an IoU of 0.0 to the mean (provided it has at least
+        *min_pred_px* foreground pixels).  This prevents a high mean IoU
+        from being achieved by predicting only a few well-placed lobules
+        while leaving large tissue areas unaccounted for.
+    min_pred_px : int
+        Minimum foreground pixel count for an unmatched predicted lobule to
+        be counted as a false positive (only used when *penalize_fp* is True).
 
     Returns
     -------
@@ -705,6 +717,8 @@ def lobule_miou(
         interior_mask = None
 
     ious: List[float] = []
+    matched_pred_ids: set = set()
+
     for gl in gt_ids:
         gt_r = (gt_labels == gl) & fg
         if gt_r.sum() < min_gt_px:
@@ -725,7 +739,8 @@ def lobule_miou(
         if len(pred_in) == 0:
             ious.append(0.0)
             continue
-        best = np.bincount(pred_in).argmax()
+        best = int(np.bincount(pred_in).argmax())
+        matched_pred_ids.add(best)
         pred_r = (pred_labels == best) & fg
 
         # Restrict prediction to the same evaluation region.
@@ -734,6 +749,15 @@ def lobule_miou(
         inter = int((gt_eval & pred_eval).sum())
         union = int((gt_eval | pred_eval).sum())
         ious.append(inter / max(union, 1))
+
+    # Penalise unmatched predicted lobules (false positives).
+    if penalize_fp:
+        pred_ids = np.unique(pred_labels[fg])
+        pred_ids = pred_ids[pred_ids > 0]
+        pred_counts = np.bincount(pred_labels[fg].ravel())
+        for pid in pred_ids:
+            if pid not in matched_pred_ids and int(pred_counts[pid]) >= min_pred_px:
+                ious.append(0.0)
 
     return float(np.mean(ious)) if ious else 0.0
 

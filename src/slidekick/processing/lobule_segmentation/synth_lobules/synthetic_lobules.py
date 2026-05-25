@@ -21,6 +21,7 @@ import cv2
 from dataclasses import dataclass, field
 from scipy.ndimage import distance_transform_edt as edt
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import label as _ndlabel, binary_dilation as _nddilate, generate_binary_structure as _ndstruct
 from scipy.spatial import Voronoi
 from skimage.draw import polygon as ski_polygon
 
@@ -88,11 +89,11 @@ PP_JITTER_FRAC = 0.10         # jitter around vertex as fraction of hex side
 # from GT (lobules merge into one super-lobule). Portality floor at that
 # edge rises proportionally (max floor when v=0, zero floor at threshold).
 # Portal vessels that become interior after merging are removed.
-FUSION_THRESHOLD   = 0.46              # v < threshold → merge in GT
-#                                        with v_power=3: P(fuse) = 0.46^3 ≈ 9.7% per edge
+FUSION_THRESHOLD   = 0.41              # v < threshold → merge in GT
+#                                        with v_power=3: P(fuse) = 0.41^3 ≈ 6.9% per edge
+#                                        4-connected adjacency detects ~94 pairs for 47 lobules
+#                                        → expected ~6-7 fused edges per image
 FUSION_V_POWER     = 3.0               # v = U^(1/power): skews toward 1
-#                                        P(v<0.1) = 0.1^3 = 0.001 (< 0.1% of edges)
-#                                        P(v<threshold) = threshold^power ≈ 10% of edges fuse
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +114,11 @@ FUSION_V_POWER     = 3.0               # v = U^(1/power): skews toward 1
 #
 _CALIB_JSON = Path(__file__).resolve().parent / "synth_calibration_from_gt.json"
 _CALIB: dict | None = None
+
+# Module-level geometry cache: avoids recomputing the same (seed, hex_side)
+# geometry when generate_all_instances is called multiple times (e.g. once for
+# the convexity probe and once for the full stain generation).
+_GEOM_CACHE: dict = {}   # key: (seed, hex_side) → geom dict
 
 
 def load_gt_calibration(path: Path | str | None = None) -> dict | None:
@@ -415,8 +421,12 @@ class SyntheticInstance:
     pv_stain_raw: np.ndarray = field(repr=False)       # (H,W) float32 before uint8 conversion
     pp_stain_raw: np.ndarray = field(repr=False, default=None)
     fused_pairs: list = field(repr=False, default_factory=list)
-    # list of (label_a, label_b, valley_floor) for lobules whose shared
-    # boundary was artificially bridged (portality raised to valley_floor)
+    # list of (label_a, label_b, v_e) for fused pairs
+    fused_boundary_mask: np.ndarray = field(repr=False, default=None)
+    # (H,W) bool — pixels on either side of every fused Voronoi edge;
+    # None when there are no fusions.  Used by visualize_instances to
+    # overlay the suppressed PP zone and by callers that need to know
+    # where a shared boundary was artificially removed from GT.
 
     @property
     def fg(self):
@@ -995,8 +1005,19 @@ def _polygon_self_intersects(pts):
 def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
     """Build connected lobule labels from Voronoi + boundary perturbation.
 
-    Each Voronoi edge gets 5 intermediate points shifted slightly.
-    If perturbation causes self-intersection, the edge stays straight.
+    Each Voronoi ridge is perturbed exactly once using a deterministic per-ridge
+    sub-rng (derived from a single value consumed from the main rng).  Both
+    adjacent polygons reuse the same pre-computed perturbed points — one forward,
+    the other reversed — so their shared boundary is identical and no mismatch
+    strip exists between them.  This eliminates interlocking without affecting the
+    main rng state for the junction-smoothing loop that follows.
+
+    Gaps at polygon vertices (where ≥3 polygons meet) are filled using the
+    original EDT-from-existing-region approach, which interpolates the nearby
+    curved boundaries and preserves the organic shape appearance.
+
+    If a polygon self-intersects after perturbation, it falls back to its
+    straight (unperturbed) Voronoi cell.
 
     Returns (labels, kept_ids) where labels is (H,W) int32.
     """
@@ -1022,6 +1043,25 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
 
     n_real = len(centers)
 
+    # Pre-compute ONE perturbed edge per Voronoi ridge using a per-ridge
+    # deterministic sub-rng.  Consuming exactly 1 value from the main rng
+    # (for _ridge_seed) keeps the junction-smoothing loop below on a
+    # consistent rng trajectory regardless of the number of ridges.
+    ridge_pts: dict = {}
+    ridge_by_verts: dict = {}
+    _ridge_seed = int(rng.integers(2 ** 32))
+    for k, (v_p, v_q) in enumerate(vor.ridge_vertices):
+        if v_p < 0 or v_q < 0:
+            continue
+        ridge_by_verts[(min(v_p, v_q), max(v_p, v_q))] = k
+        _sub = np.random.default_rng(
+            _ridge_seed ^ (int(min(v_p, v_q)) * 1_000_003
+                           + int(max(v_p, v_q)) * 999_983)
+        )
+        ridge_pts[k] = _perturb_edge(
+            jittered_vertices[v_p], jittered_vertices[v_q], _sub, hex_side
+        )
+
     # For each real region, build a perturbed polygon
     labels = np.zeros((h, w), dtype=np.int32)
 
@@ -1035,17 +1075,26 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
             continue
         verts = jittered_vertices[region]
 
-        # Try perturbing each edge; if result self-intersects, retry with
-        # that edge unperturbed
+        # Assemble polygon from the pre-computed shared ridge points.
         perturbed_pts = []
-        for i in range(len(verts)):
-            p0 = verts[i]
-            p1 = verts[(i + 1) % len(verts)]
-            edge_pts = _perturb_edge(p0, p1, rng, hex_side)
-            perturbed_pts.append(edge_pts[:-1])  # skip last (= next start)
+        for i in range(len(region)):
+            v_i = region[i]
+            v_j = region[(i + 1) % len(region)]
+            key = (min(v_i, v_j), max(v_i, v_j))
+            k = ridge_by_verts.get(key)
+            if k is not None:
+                pts = ridge_pts[k]               # v_p → v_q, includes endpoints
+                rp = vor.ridge_vertices[k][0]
+                if v_i == rp:
+                    edge_pts = pts[:-1]           # forward, drop last
+                else:
+                    edge_pts = pts[::-1][:-1]     # reversed
+            else:
+                edge_pts = jittered_vertices[[v_i]]   # infinite ridge fallback
+            perturbed_pts.append(edge_pts)
         poly = np.vstack(perturbed_pts)
 
-        # Check for self-intersection on the raw perturbed polygon first.
+        # Check for self-intersection; fall back to straight cell if needed.
         if _polygon_self_intersects(poly):
             poly = verts.copy()
             n_rejected += 1
@@ -1130,11 +1179,13 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
         nearest = np.argmin(dists, axis=1) + 1  # label_id = idx + 1
         labels[oy, ox] = nearest.astype(np.int32)
 
-    # Step 4: fill gaps (coverage == 0 inside tissue) with nearest-centre
+    # Step 4: fill gaps (coverage == 0 inside tissue) with nearest-region EDT.
+    # With shared-ridge perturbation, gaps only arise at polygon vertices
+    # (where 3+ polygons meet) and at the tissue boundary — never between
+    # adjacent polygon interiors.  EDT-from-existing-region correctly
+    # interpolates these tiny vertex gaps following the local curved shapes.
     gap = tissue & (labels == 0)
     if np.any(gap):
-        # For each centre, compute EDT from its current region
-        # Then assign gap pixels to nearest centre
         min_d = np.full((h, w), np.inf, dtype=np.float64)
         for idx in range(n_real):
             label_id = idx + 1
@@ -1157,9 +1208,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
         else:
             kept_ids.append(label_id)
 
-    # Re-fill any holes left behind by the discard step so the tissue has
-    # no spurious unlabelled cutouts. Each gap pixel gets the nearest
-    # remaining lobule label.
+    # Re-fill any holes left behind by the discard step (EDT from kept regions).
     gap2 = tissue & (labels == 0)
     if np.any(gap2) and kept_ids:
         min_d2 = np.full((h, w), np.inf, dtype=np.float64)
@@ -1168,6 +1217,30 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
             closer = gap2 & (d < min_d2)
             labels[closer] = label_id
             min_d2[closer] = d[closer]
+
+    # Step 5: enforce simply-connected labels.
+    # Despite shared ridge perturbation, straight-polygon fallbacks can leave
+    # tiny disconnected slivers.  Absorb every secondary component of each
+    # label into its dominant 8-connected neighbour — regardless of size —
+    # so the final GT has no interlocking regions.
+    _conn8 = _ndstruct(2, 2)
+    for label_id in list(kept_ids):
+        _cc_map, _n_cc = _ndlabel(labels == label_id, structure=_conn8)
+        if _n_cc <= 1:
+            continue
+        _sizes = np.bincount(_cc_map.ravel())      # index 0 = not this label
+        _main_cc = int(np.argmax(_sizes[1:]) + 1)  # largest component
+        for _cc_id in range(1, _n_cc + 1):
+            if _cc_id == _main_cc:
+                continue
+            _frag = _cc_map == _cc_id
+            # Dilate 1 px to find touching neighbours
+            _nbr = _nddilate(_frag, structure=_conn8) & (labels > 0) & ~_frag
+            if _nbr.any():
+                _vals, _cnts = np.unique(labels[_nbr], return_counts=True)
+                labels[_frag] = _vals[np.argmax(_cnts)]
+            else:
+                labels[_frag] = 0
 
     return labels, kept_ids
 
@@ -1392,10 +1465,11 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
 
     Returns
     -------
-    labels      : (H,W) int32,   merged — fused lobules share smallest ID
-    kept_ids    : list, updated to only contain root super-lobule IDs
-    portal_mask : (H,W) bool,    interior vessels removed
-    fused_edges : list of (id_a, id_b, v_e) for fused pairs
+    labels               : (H,W) int32, merged — fused lobules share smallest ID
+    kept_ids             : list, updated to only contain root super-lobule IDs
+    portal_mask          : (H,W) bool, interior vessels removed
+    fused_edges          : list of (id_a, id_b, v_e) for fused pairs
+    fused_boundary_mask  : (H,W) bool, pixels on either side of every fused edge
     """
     labels      = labels.copy()
     portal_mask = portal_mask.copy()
@@ -1424,13 +1498,38 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
 
     # --- 3. Sample v for each pair; classify as fused or not ---
     # v = U^(1/power): skewed toward 1. P(v < t) = t^power.
-    # power=3, threshold=0.46 -> P(fuse) ≈ 10%.
-    fused_edges = []
-    for id_a, id_b in adjacent:
+    # Each lobule may participate in AT MOST ONE fusion (no chains A-B-C).
+    # Sort candidates by v ascending so the "most fused" edges get first pick,
+    # then skip any pair where either lobule is already committed.
+    candidates = []
+    for id_a, id_b in sorted(adjacent):   # sorted for reproducibility
         u   = float(rng.uniform(0.0, 1.0))
         v_e = u ** (1.0 / v_power)
         if v_e < threshold:
-            fused_edges.append((id_a, id_b, v_e))
+            candidates.append((v_e, id_a, id_b))
+
+    candidates.sort()                      # ascending v_e: strongest fusions first
+    already_fused: set = set()
+    fused_edges = []
+    for v_e, id_a, id_b in candidates:
+        if id_a in already_fused or id_b in already_fused:
+            continue                        # one of them is already in a super-lobule
+        fused_edges.append((id_a, id_b, v_e))
+        already_fused.add(id_a)
+        already_fused.add(id_b)
+
+    # --- 3b. Pixel mask of fused boundaries (BEFORE label merging) ---
+    # Marks every pixel on either side of a fused Voronoi edge.
+    # Returned so the caller can suppress PP stain there:
+    # no portal tract at a fused boundary → PP signal should be absent.
+    fused_boundary_mask = np.zeros((h, w), dtype=bool)
+    for id_a, id_b, _ in fused_edges:
+        for dy, dx in ((0, 1), (1, 0)):
+            la = labels[:h - dy if dy else h, :w - dx if dx else w]
+            lb = labels[dy:, dx:]
+            bnd = ((la == id_a) & (lb == id_b)) | ((la == id_b) & (lb == id_a))
+            fused_boundary_mask[:h - dy if dy else h, :w - dx if dx else w] |= bnd
+            fused_boundary_mask[dy:, dx:] |= bnd
 
     # --- 4. Merge GT labels via union-find ---
     parent = {i: i for i in kept}
@@ -1482,7 +1581,7 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
         interior = ~has_pos | (nl_min == nl_max)
         portal_mask[pm_ys[interior], pm_xs[interior]] = False
 
-    return labels, new_kept, portal_mask, fused_edges
+    return labels, new_kept, portal_mask, fused_edges, fused_boundary_mask
 
 
 # ---------------------------------------------------------------------------
@@ -1930,21 +2029,69 @@ def _generate_geometry(seed, hex_side):
     # Randomly fuse adjacent lobule pairs:
     #   v < FUSION_THRESHOLD → merge in GT, remove interior portal vessels
     #   v >= FUSION_THRESHOLD → keep separate, full dark valley
-    labels, kept_ids, portal_mask, fused_pairs = apply_boundary_fusion(
+    _n_orig = len(kept_ids)
+    labels, kept_ids, portal_mask, fused_pairs, fused_boundary_mask = apply_boundary_fusion(
         labels, kept_ids, portal_mask, hex_side, rng)
     vessel_holes = central_mask | portal_mask   # recompute after portal removal
 
     # Recompute portality on merged labels so fused edges become interior:
     # portality flows naturally across them (two CVs, no forced zero at shared edge).
+    _n_fused  = len(fused_pairs)
+    _n_final  = len(kept_ids)
+    _n_super  = _n_fused          # each fused edge creates one super-lobule from two originals
+    _n_unchanged = _n_final - _n_super
     if fused_pairs:
         portality = compute_portality(labels, central_mask, portal_mask, kept_ids)
         pp_portality = _smooth_pp_portality(
             compute_pp_portality(labels, central_mask, portal_mask, kept_ids), hex_side)
-        print(f"    fused {len(fused_pairs)} edge(s) -> "
-              f"{len(kept_ids)} super-lobules", flush=True)
+
+        # Suppress PP stain at fused edges: a fused boundary has no portal tract
+        # → the PP marker should show no ring there.  Blend pp_portality toward
+        # 1.0 (= "far from portal" → PP shape ≈ 0) over a Gaussian zone centred
+        # on the boundary pixels.  sigma ≈ 15 % of hex_side ≈ half a portal-ring width.
+        if fused_boundary_mask.any():
+            suppress_sigma = max(8.0, hex_side * 0.15)
+            fused_weight = gaussian_filter(
+                fused_boundary_mask.astype(np.float32), sigma=suppress_sigma)
+            fused_max = float(fused_weight.max())
+            if fused_max > 0:
+                fused_weight = np.clip(fused_weight / fused_max, 0.0, 1.0)
+            # Apply only inside tissue (NaN pixels stay NaN).
+            valid_pp = ~np.isnan(pp_portality)
+            pp_portality[valid_pp] = (
+                pp_portality[valid_pp] * (1.0 - fused_weight[valid_pp])
+                + 1.0 * fused_weight[valid_pp]
+            )
+
+        print(f"    {_n_orig} lobules | {_n_fused} edge(s) fused → "
+              f"{_n_unchanged} unchanged + {_n_super} super-lobule(s)", flush=True)
+    else:
+        print(f"    {_n_orig} lobules | no fusions", flush=True)
 
     # Now zero out vessel pixels from labels (they're holes, not lobule tissue)
     labels[vessel_holes] = 0
+
+    # Post-vessel fragment absorption:
+    # Vessel holes can punch through a lobule edge and disconnect a corner
+    # sliver from its main body.  These slivers are NOT independent lobules —
+    # absorb each one into its dominant neighbour using the Voronoi topology.
+    # Uses 8-connected components; threshold = 10 % of a full hex cell area.
+    _frag_thr = int(0.10 * hex_side ** 2)
+    _conn8    = _ndstruct(2, 2)               # 8-connectivity structuring element
+    _cc_map, _n_cc = _ndlabel(labels > 0, structure=_conn8)
+    if _n_cc > 0:
+        _sizes = np.bincount(_cc_map.ravel())   # index 0 = background
+        for _cc_id in range(1, _n_cc + 1):
+            if _sizes[_cc_id] >= _frag_thr:
+                continue
+            _frag = _cc_map == _cc_id
+            # 1-px dilation to find adjacent non-zero pixels outside the fragment
+            _nbr_mask = _nddilate(_frag, structure=_conn8) & (labels > 0) & ~_frag
+            if _nbr_mask.any():
+                _nbr_vals, _counts = np.unique(labels[_nbr_mask], return_counts=True)
+                labels[_frag] = _nbr_vals[np.argmax(_counts)]   # dominant neighbour
+            else:
+                labels[_frag] = 0   # isolated island — treat as background
 
     # Per-lobule expression heterogeneity (calibrated range)
     lobule_expr_map = generate_lobule_expression_map(labels, kept_ids, rng)
@@ -1986,7 +2133,7 @@ def _generate_geometry(seed, hex_side):
         central_mask=central_mask, portal_mask=portal_mask,
         vessel_holes=vessel_holes, gt_centers=gt_centers,
         portality=portality, pp_portality=pp_portality,
-        fused_pairs=fused_pairs, rng=rng,
+        fused_pairs=fused_pairs, fused_boundary_mask=fused_boundary_mask, rng=rng,
         lobule_expr_map=lobule_expr_map,
         lobule_base_map=lobule_base_map,
         lobule_k_map=lobule_k_map,
@@ -2029,13 +2176,22 @@ def generate_all_instances(
 
     for seed in seeds:
         for hex_side in hex_sides:
-            if verbose:
-                print(f"  Generating geometry: seed={seed}, hex_side={hex_side}...",
-                      end="", flush=True)
-            geom = _generate_geometry(seed, hex_side)
-            if verbose:
-                n_lob = len(geom["kept_ids"])
-                print(f"  {n_lob} lobules", flush=True)
+            _key = (seed, hex_side)
+            if _key in _GEOM_CACHE:
+                geom = _GEOM_CACHE[_key]
+                if verbose:
+                    n_lob = len(geom["kept_ids"])
+                    print(f"  Reusing cached geometry: seed={seed}, hex_side={hex_side}"
+                          f"  ({n_lob} lobules)", flush=True)
+            else:
+                if verbose:
+                    print(f"  Generating geometry: seed={seed}, hex_side={hex_side}...",
+                          end="", flush=True)
+                geom = _generate_geometry(seed, hex_side)
+                _GEOM_CACHE[_key] = geom
+                if verbose:
+                    n_lob = len(geom["kept_ids"])
+                    print(f"  {n_lob} lobules", flush=True)
 
             for pv_type, pp_type in zip(pv_stain_types, pp_stain_types):
                 for noise_level in noise_levels:
@@ -2052,26 +2208,34 @@ def generate_all_instances(
                         lobule_k_map=geom.get("lobule_k_map"),
                         cv_offset_map=geom.get("cv_offset_map"),
                         fold_map=geom["fold_map"])
-                    pp_raw = generate_stain(
-                        geom["pp_portality"], geom["tissue"], geom["vessel_holes"],
-                        stain_rng, stain_type=pp_type,
-                        noise_level=noise_level, channel="pp",
-                        lobule_expr_map=geom["lobule_expr_map"],
-                        fold_map=geom["fold_map"])
+
+                    # pp_type="none" → no PP stain; segmentation must rely on PV alone.
+                    # A zero array is used in the image stack so shape stays consistent.
+                    if pp_type == "none":
+                        pp_raw = None
+                        pp_u8  = np.zeros((IMG, IMG), dtype=np.uint8)
+                    else:
+                        pp_raw = generate_stain(
+                            geom["pp_portality"], geom["tissue"], geom["vessel_holes"],
+                            stain_rng, stain_type=pp_type,
+                            noise_level=noise_level, channel="pp",
+                            lobule_expr_map=geom["lobule_expr_map"],
+                            fold_map=geom["fold_map"])
 
                     # Match real per-channel p95 (uint8, inside tissue);
                     # ranges from GT-calibration fallbacks.
                     target_p95_cyp1 = float(stain_rng.uniform(*_CAL_CYP1_P95_RANGE))
-                    target_p95_cyp3 = float(stain_rng.uniform(*_CAL_CYP3_P95_RANGE))
                     # Real p05 inside annotated lobules is ≈ 2 for both
                     # CYPs. Drop the floor so the dark end of the curve
                     # lines up.
                     pv_u8 = _match_channel_stats(
                         pv_raw, geom["tissue"], geom["vessel_holes"],
                         target_p95=target_p95_cyp1, target_p05=2.0)
-                    pp_u8 = _match_channel_stats(
-                        pp_raw, geom["tissue"], geom["vessel_holes"],
-                        target_p95=target_p95_cyp3, target_p05=1.0)
+                    if pp_raw is not None:
+                        target_p95_cyp3 = float(stain_rng.uniform(*_CAL_CYP3_P95_RANGE))
+                        pp_u8 = _match_channel_stats(
+                            pp_raw, geom["tissue"], geom["vessel_holes"],
+                            target_p95=target_p95_cyp3, target_p05=1.0)
 
                     # Structural noise channel (nuclear + membrane channels merged).
                     # Target mean/std ranges come from GT calibration.
@@ -2084,7 +2248,8 @@ def generate_all_instances(
 
                     if ENABLE_SCANBOX:
                         pv_u8 = _add_scanbox(geom["tissue"], pv_u8, geom["vessel_holes"])
-                        pp_u8 = _add_scanbox(geom["tissue"], pp_u8, geom["vessel_holes"])
+                        if pp_raw is not None:
+                            pp_u8 = _add_scanbox(geom["tissue"], pp_u8, geom["vessel_holes"])
                         no_u8 = _add_scanbox(geom["tissue"], no_u8, geom["vessel_holes"])
 
                     for mode in modes:
@@ -2106,8 +2271,10 @@ def generate_all_instances(
                             gt_centers=geom["gt_centers"],
                             image_stack=stack,
                             pv_stain_raw=pv_raw,
-                            pp_stain_raw=pp_raw if mode == "dual" else None,
+                            # pp_stain_raw=None for pp_type="none" AND for "single" mode
+                            pp_stain_raw=pp_raw if (mode == "dual" and pp_raw is not None) else None,
                             fused_pairs=geom.get("fused_pairs", []),
+                            fused_boundary_mask=geom.get("fused_boundary_mask"),
                         )
                         instances.append(inst)
 
@@ -2175,93 +2342,150 @@ def save_instance_as_tiff(instance, path, pyramid_factors=None):
 # ---------------------------------------------------------------------------
 #  Visualization helper — shared by viz_synth.py and the __main__ block
 # ---------------------------------------------------------------------------
-def visualize_instances(instances, out_path, title_suffix: str = ""):
-    """Render a multi-row figure (one 2-row block per instance) showing
-    GT labels, portality, vessel overlay and the three uint8 channels."""
+def visualize_instances(instances, out_path, title_suffix: str = "",
+                        thumb_px: int = 512):
+    """Render a figure with one row per instance.
+
+    Each row has 4 panels:
+        GT labels (coloured) | GT portality | PV stain | PP stain (or grey "no PP")
+
+    Images are downsampled to *thumb_px* on the longer side before display so
+    that large canvases (4000 px) don't bloat the output file.
+
+    Parameters
+    ----------
+    instances : list of SyntheticInstance
+    out_path  : str or Path — destination PNG
+    title_suffix : str — optional suptitle suffix
+    thumb_px  : int — max edge length for each panel thumbnail
+    """
     import matplotlib.pyplot as plt
     import numpy.ma as ma
     from pathlib import Path
 
+    import cv2 as _cv2  # local import; cv2 is already a hard dep of the module
+
+    def _thumb(arr, interp=_cv2.INTER_AREA):
+        """Downsample *arr* to at most thumb_px on the long edge, preserve dtype."""
+        h, w = arr.shape[:2]
+        scale = thumb_px / max(h, w)
+        if scale >= 1.0:
+            return arr
+        nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+        if arr.ndim == 2:
+            return _cv2.resize(arr, (nw, nh), interpolation=interp)
+        # 3-channel float/uint8
+        return _cv2.resize(arr, (nw, nh), interpolation=interp)
+
     cmap_p = plt.get_cmap("magma").copy()
     cmap_p.set_bad("black")
 
-    n_rows = 2 * len(instances)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(18, 6 * n_rows))
-    if n_rows == 2:
-        axes = np.array(axes).reshape(2, 3)
+    N_COLS  = 4
+    n_inst  = len(instances)
+    cell_in = thumb_px / 100        # cell size in inches (100 dpi reference)
+    fig, axes = plt.subplots(
+        n_inst, N_COLS,
+        figsize=(N_COLS * cell_in, n_inst * cell_in),
+        squeeze=False,
+    )
 
     for si, inst in enumerate(instances):
-        is_dual = inst.mode == "dual"
-        pv = inst.image_stack[..., 0]
-        if is_dual:
-            pp = inst.image_stack[..., 1]
-            no = inst.image_stack[..., 2] if inst.image_stack.shape[-1] >= 3 else None
-        else:  # single mode: ch0=PV, ch1=noise (no PP)
-            pp = None
-            no = inst.image_stack[..., 1] if inst.image_stack.shape[-1] >= 2 else None
+        pv_ch = inst.image_stack[..., 0]  # always present
+        # PP: present if pp_stain_raw is not None (None for pp_type="none")
+        has_pp = inst.pp_stain_raw is not None
+        pp_ch  = inst.image_stack[..., 1] if (has_pp and inst.image_stack.shape[-1] >= 2) else None
 
-        n = inst.gt_labels.max() + 1
-        rng_c = np.random.default_rng(0)
-        cols = rng_c.random((n, 3)).astype(np.float32)
-        cols[0] = [0, 0, 0]
-        rgb_lab = cols[inst.gt_labels]
-        rgb_lab[~inst.tissue] = [0.12, 0.12, 0.12]
+        # ── Thumbnail all source arrays ───────────────────────────────────────
+        pv_t  = _thumb(pv_ch)
+        lab_t = _thumb(inst.gt_labels.astype(np.int32), _cv2.INTER_NEAREST)
+        por_t = _thumb(inst.gt_portality.astype(np.float32), _cv2.INTER_NEAREST)
+        tis_t = _thumb(inst.tissue.astype(np.uint8), _cv2.INTER_NEAREST).astype(bool)
 
-        ves = np.zeros((*inst.tissue.shape, 3), dtype=np.uint8)
-        ves[inst.tissue & ~inst.vessel_holes] = [40, 40, 40]
-        ves[inst.central_mask] = [0, 230, 230]
-        ves[inst.portal_mask] = [230, 0, 230]
-
-        comp = np.zeros((*inst.tissue.shape, 3), dtype=np.uint8)
-        comp[..., 0] = pv
-        if pp is not None:
-            comp[..., 1] = pp
-        if no is not None:
-            comp[..., 2] = no
-
-        n_gt_lob = len(np.unique(inst.gt_labels[inst.gt_labels > 0]))
-        fuse_note = (f"  [{len(inst.fused_pairs)} edges fused]"
-                     if inst.fused_pairs else "")
-        r0 = si * 2
-        axes[r0, 0].imshow((rgb_lab * 255).astype(np.uint8))
-        axes[r0, 0].set_title(
-            f"seed={inst.seed} hex={inst.hex_side} mode={inst.mode} GT labels "
-            f"({n_gt_lob} super-lobules){fuse_note}")
-
-        axes[r0, 1].imshow(ma.masked_invalid(inst.gt_portality), cmap=cmap_p,
-                           vmin=0, vmax=1)
-        axes[r0, 1].set_title("Portality")
-
-        axes[r0, 2].imshow(ves)
-        axes[r0, 2].set_title("Vessels (CV cyan, PP magenta)")
-
-        axes[r0 + 1, 0].imshow(pv, cmap="hot", vmin=0, vmax=255)
-        axes[r0 + 1, 0].set_title(
-            f"PV (PV marker)  p99={np.percentile(pv[inst.tissue], 99):.0f}")
-
-        if pp is not None:
-            axes[r0 + 1, 1].imshow(pp, cmap="hot", vmin=0, vmax=255)
-            axes[r0 + 1, 1].set_title(
-                f"PP (PP marker)  p99={np.percentile(pp[inst.tissue], 99):.0f}")
+        # ── Fused boundary overlay (thumbnailed, dilated 1px for visibility) ─
+        has_fused = (inst.fused_boundary_mask is not None
+                     and inst.fused_boundary_mask.any())
+        if has_fused:
+            fbm_t = _thumb(inst.fused_boundary_mask.astype(np.uint8),
+                           _cv2.INTER_NEAREST).astype(bool)
+            # Dilate 1 px so the 1-px boundary line is visible at small size
+            kern = np.ones((3, 3), np.uint8)
+            fbm_t = _cv2.dilate(fbm_t.astype(np.uint8), kern).astype(bool)
         else:
-            axes[r0 + 1, 1].imshow(no if no is not None else pv,
-                                    cmap="gray", vmin=0, vmax=255)
-            axes[r0 + 1, 1].set_title("Noise / nuclear channel (no PP in single mode)")
+            fbm_t = None
 
-        axes[r0 + 1, 2].imshow(comp)
-        mode_label = "RGB (R=PV, G=PP, B=noise)" if is_dual else "RGB (R=PV, B=noise)"
-        axes[r0 + 1, 2].set_title(mode_label)
+        # ── Panel 0: GT labels (random colour per lobule) ─────────────────────
+        n_ids = int(lab_t.max()) + 1
+        rng_c = np.random.default_rng(0)
+        cols  = rng_c.random((n_ids, 3)).astype(np.float32)
+        cols[0] = [0.0, 0.0, 0.0]
+        rgb_lab = cols[lab_t]
+        rgb_lab[~tis_t] = [0.10, 0.10, 0.10]
+        rgb_lab_u8 = (rgb_lab * 255).astype(np.uint8)
+        # Overlay fused boundaries as white dashed line
+        if fbm_t is not None:
+            rgb_lab_u8[fbm_t] = [255, 255, 255]
+
+        n_gt_lob  = len(np.unique(inst.gt_labels[inst.gt_labels > 0]))
+        fuse_note = f" [{len(inst.fused_pairs)} fused]" if inst.fused_pairs else ""
+        ax = axes[si, 0]
+        ax.imshow(rgb_lab_u8)
+        ax.set_title(
+            f"s{inst.seed} h{inst.hex_side} {inst.stain_type}\n"
+            f"GT labels  {n_gt_lob} lobules{fuse_note}",
+            fontsize=6, pad=2,
+        )
+
+        # ── Panel 1: GT portality ─────────────────────────────────────────────
+        ax = axes[si, 1]
+        ax.imshow(ma.masked_invalid(por_t), cmap=cmap_p, vmin=0, vmax=1)
+        ax.set_title("GT portality", fontsize=6, pad=2)
+
+        # ── Panel 2: PV stain ─────────────────────────────────────────────────
+        ax = axes[si, 2]
+        ax.imshow(pv_t, cmap="hot", vmin=0, vmax=255)
+        p99_pv = float(np.percentile(pv_ch[inst.tissue], 99))
+        ax.set_title(f"PV  p99={p99_pv:.0f}", fontsize=6, pad=2)
+
+        # ── Panel 3: PP stain (or grey placeholder when pp_type="none") ───────
+        ax = axes[si, 3]
+        if pp_ch is not None:
+            pp_t   = _thumb(pp_ch)
+            p99_pp = float(np.percentile(pp_ch[inst.tissue], 99))
+            # Convert hot-colormap image to RGB so we can overlay fused boundary
+            pp_norm = np.clip(pp_t.astype(np.float32) / 255.0, 0, 1)
+            import matplotlib.cm as _cm
+            pp_rgb_f = _cm.hot(pp_norm)[..., :3]          # (H,W,3) float [0,1]
+            pp_rgb_u8 = (pp_rgb_f * 255).astype(np.uint8)
+            if fbm_t is not None:
+                pp_rgb_u8[fbm_t] = [0, 180, 255]          # cyan = suppressed zone
+            ax.imshow(pp_rgb_u8)
+            fuse_pp_note = "  (cyan=suppressed)" if fbm_t is not None else ""
+            ax.set_title(f"PP  p99={p99_pp:.0f}{fuse_pp_note}", fontsize=6, pad=2)
+        else:
+            # Show a dark grey canvas with centred text
+            blank = np.full(pv_t.shape[:2], 30, dtype=np.uint8)
+            blank_rgb = np.stack([blank, blank, blank], axis=-1)
+            if fbm_t is not None:
+                blank_rgb[fbm_t] = [0, 180, 255]          # cyan = where PP would be suppressed
+            ax.imshow(blank_rgb)
+            ax.text(0.5, 0.5, "no PP", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=8, color="white")
+            fuse_pp_note = "  (cyan=fused edge)" if fbm_t is not None else ""
+            ax.set_title(f"PP  (none){fuse_pp_note}", fontsize=6, pad=2)
 
     for ax in axes.ravel():
         ax.axis("off")
+
+    suptitle = f"Synthetic instances — {n_inst} total"
     if title_suffix:
-        fig.suptitle(title_suffix, fontsize=14)
-    fig.tight_layout()
+        suptitle += f"  {title_suffix}"
+    fig.suptitle(suptitle, fontsize=9, y=1.002)
+    fig.tight_layout(rect=[0, 0, 1, 1])
+
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=130, bbox_inches="tight")
-    import matplotlib.pyplot as _plt
-    _plt.close(fig)
+    fig.savefig(out, dpi=100, bbox_inches="tight")
+    plt.close(fig)
     return out
 
 
