@@ -28,7 +28,7 @@ from skimage.draw import polygon as ski_polygon
 # ---------------------------------------------------------------------------
 #  Constants
 # ---------------------------------------------------------------------------
-# Canvas size — chosen to roughly match the SMALLER real multiplexed fluorescence images
+# Canvas size - chosen to roughly match the SMALLER real multiplexed fluorescence images
 # at level 2 (~1800–3000 px). Synthetic pixel scale therefore ≈ real level-2
 # pixel scale, so pipeline parameters (min_vessel_area, ridge_width, ...)
 # transfer between synthetic and real without rescaling.
@@ -36,14 +36,15 @@ IMG = 1600
 SCAN_GRAY = 8
 SCAN_MARGIN = 20
 
-# Vessel sizes — calibrated to real CV detections at level 2.
-# Upper bounds bumped (CV up to ~24 px, PP up to ~14 px) and shapes are
-# drawn as irregular blobs rather than perfect ellipses.
-CV_RX = (4, 24)
-CV_RY = (4, 24)
+# Vessel sizes - calibrated to real CV detections at level 2.
+# CV aspect ratios are now independent (rx != ry) to simulate oblique sections
+# where the vessel appears elongated.  Blob noise is also wider so circularity
+# spans a realistic range (0.2–0.6) matching real slides.
+CV_RX = (4, 16)               # minor semi-axis
+CV_RY = (4, 24)               # major semi-axis - moderate elongation
 CV_DROPOUT = 0.15             # 15% of lobules have no central vein
 PV_SIGMA_FRAC = 1 / 4         # exponential half-max for PV sharp stain (faster decay)
-PP_RX = (3, 14)
+PP_RX = (2, 10)               # portal vessels: slightly more variable sizes
 PP_RY = (3, 14)
 
 # Expression heterogeneity: per-lobule brightness multiplier range
@@ -51,7 +52,7 @@ LOBULE_EXPR_MIN = 0.35        # weakest lobule retains 35% of max expression
 LOBULE_EXPR_MAX = 1.0
 
 # Global brightness variability: real images differ 2-3x in mean intensity.
-# The PP marker channel in particular varies whole-slide mean from 27 → 97 across the 7
+# The PP marker channel in particular varies whole-slide mean from 27 -> 97 across the 7
 # real slides, so we allow a large multiplier.
 GLOBAL_BRIGHTNESS_MIN = 0.35
 GLOBAL_BRIGHTNESS_MAX = 1.00
@@ -69,15 +70,15 @@ FOLD_INTENSITY = 0.7          # relative brightness of fold
 ENABLE_SCANBOX = False
 ENABLE_ILLUMINATION = True
 
-# Boundary perturbation — Gaussian-bump curved edges.
+# Boundary perturbation - Gaussian-bump curved edges.
 # 7 intermediate control points per edge give a smooth organic curve.
 # Displacement follows a single Gaussian bump (amplitude, center, width
 # sampled randomly per edge), then a Gaussian-1D smoothing pass is applied
 # to 90% of edges for continuity ("Stetigkeit"); 10% remain unsmoothed.
-PERTURB_N_PTS = 7             # intermediate control points per edge
-PERTURB_ORTHO_FRAC = 0.58     # max orthogonal shift as fraction of edge length
+PERTURB_N_PTS = 20            # intermediate control points per edge (smoother curves)
+PERTURB_ORTHO_FRAC = 0.22     # max orthogonal shift as fraction of edge length (was 0.58)
 PERTURB_ALONG_FRAC = 0.04     # max along-edge shift (endpoint shift only)
-VERTEX_JITTER_FRAC = 0.10     # max shift of Voronoi corners as fraction of hex side
+VERTEX_JITTER_FRAC = 0.06     # max shift of Voronoi corners as fraction of hex side (was 0.10)
 
 # Portal triad: 1-3 vessels per vertex, 30% chance of missing entirely
 PP_TRIAD_MAX = 4
@@ -89,10 +90,10 @@ PP_JITTER_FRAC = 0.10         # jitter around vertex as fraction of hex side
 # from GT (lobules merge into one super-lobule). Portality floor at that
 # edge rises proportionally (max floor when v=0, zero floor at threshold).
 # Portal vessels that become interior after merging are removed.
-FUSION_THRESHOLD   = 0.41              # v < threshold → merge in GT
+FUSION_THRESHOLD   = 0.41              # v < threshold -> merge in GT
 #                                        with v_power=3: P(fuse) = 0.41^3 ≈ 6.9% per edge
 #                                        4-connected adjacency detects ~94 pairs for 47 lobules
-#                                        → expected ~6-7 fused edges per image
+#                                        -> expected ~6-7 fused edges per image
 FUSION_V_POWER     = 3.0               # v = U^(1/power): skews toward 1
 
 
@@ -118,7 +119,7 @@ _CALIB: dict | None = None
 # Module-level geometry cache: avoids recomputing the same (seed, hex_side)
 # geometry when generate_all_instances is called multiple times (e.g. once for
 # the convexity probe and once for the full stain generation).
-_GEOM_CACHE: dict = {}   # key: (seed, hex_side) → geom dict
+_GEOM_CACHE: dict = {}   # key: (seed, hex_side) -> geom dict
 
 
 def load_gt_calibration(path: Path | str | None = None) -> dict | None:
@@ -170,7 +171,7 @@ if _calib is not None:
     _epp = _rec.get("lobule_expr_pp", [0.50, 1.50])
     _CAL_LOBULE_EXPR_PV = (float(_epv[0]), float(_epv[1]))
     _CAL_LOBULE_EXPR_PP = (float(_epp[0]), float(_epp[1]))
-    # Per-lobule PV shape diversity (base, k) — sampled per lobule
+    # Per-lobule PV shape diversity (base, k) - sampled per lobule
     _pbr = _rec.get("pv_base_range", [0.11, 0.22])
     _pkr = _rec.get("pv_k_range",    [6.5, 16.5])
     _CAL_PV_BASE_RANGE = (float(_pbr[0]), float(_pbr[1]))
@@ -184,7 +185,7 @@ if _calib is not None:
         _CAL_HILL_PV = (0.16, 3.0, 0.6)
     # Replace the global-brightness range with something tied to the real
     # per-slide mean spread. Real slides vary absolute brightness ~3×, so
-    # the old 0.35–1.0 multiplier stays sensible — but make sure we stay
+    # the old 0.35–1.0 multiplier stays sensible - but make sure we stay
     # inside the measured p95 envelope via the CYP p95 match downstream.
     GLOBAL_BRIGHTNESS_MIN = 0.6
     GLOBAL_BRIGHTNESS_MAX = 1.0
@@ -243,7 +244,7 @@ _CELL_LOGNORMAL_CORR  = 2.0                # correlation length (px)
 
 
 # ---------------------------------------------------------------------------
-#  Tissue outline generation — fully procedural, no stored templates.
+#  Tissue outline generation - fully procedural, no stored templates.
 #
 #  Parameters derived by fitting 60 real liver tissue sections
 #  (tissue_outline_analysis.py). Edit the constants below to tune the
@@ -251,11 +252,11 @@ _CELL_LOGNORMAL_CORR  = 2.0                # correlation length (px)
 # ---------------------------------------------------------------------------
 
 # Number of EFD harmonics generated from scratch before fractal extension.
-# Higher → smoother base shape before fine detail is added.
+# Higher -> smoother base shape before fine detail is added.
 TISSUE_N_HARM = 60
 
 # Power-law exponent for harmonic amplitudes k ≥ 6: A(k) ∝ k^slope.
-# More negative → smoother edges; less negative → rougher.
+# More negative -> smoother edges; less negative -> rougher.
 # Measured mean from 60 real sections was -1.47 (k=5..50 fit). We use -1.1
 # so that higher-harmonic amplitudes remain large enough to be visible at
 # practical canvas sizes (400–4000 px), giving genuine resolution-dependent
@@ -268,12 +269,12 @@ TISSUE_SLOPE_STD  =  0.18
 # real sections; k=6..10 are boosted 1.5× relative to the measured medians
 # so the power-law tail is large enough to produce visible pixel-level texture.
 TISSUE_AMP_ENVELOPE = (
-    1.000,   # k=1  — normalization reference
-    0.502,   # k=2  — coarse shape
-    0.592,   # k=3  — coarse shape (higher than k=2 in real liver sections)
-    0.181,   # k=4  — intermediate
-    0.130,   # k=5  — transition to power-law tail
-    0.153,   # k=6  — ×1.5 vs measured median
+    1.000,   # k=1  - normalization reference
+    0.502,   # k=2  - coarse shape
+    0.592,   # k=3  - coarse shape (higher than k=2 in real liver sections)
+    0.181,   # k=4  - intermediate
+    0.130,   # k=5  - transition to power-law tail
+    0.153,   # k=6  - ×1.5 vs measured median
     0.111,   # k=7
     0.104,   # k=8
     0.068,   # k=9
@@ -282,7 +283,7 @@ TISSUE_AMP_ENVELOPE = (
 
 # Per-harmonic amplitude standard deviation (Gaussian noise added per shape).
 TISSUE_AMP_STD = (
-    0.000,   # k=1  — fixed
+    0.000,   # k=1  - fixed
     0.150,   # k=2
     0.180,   # k=3
     0.080,   # k=4
@@ -328,7 +329,7 @@ def _fd_to_contour(fd, n_harm, N, dc, scale, angle):
 
 
 # Feature size (pixels) used to decide how many harmonics are needed at a
-# given canvas resolution. Smaller → more harmonics → finer boundary detail.
+# given canvas resolution. Smaller -> more harmonics -> finer boundary detail.
 _FRACTAL_FEATURE_PX = 8
 # Hard cap on the number of harmonics after fractal extension.
 _FRACTAL_N_HARM_MAX = 800
@@ -417,13 +418,16 @@ class SyntheticInstance:
     portal_mask: np.ndarray = field(repr=False)
     vessel_holes: np.ndarray = field(repr=False)
     gt_centers: np.ndarray = field(repr=False)        # (N,2) float64 (x,y)
-    image_stack: np.ndarray = field(repr=False)        # (H,W,C) uint8 — the input to the pipeline
+    image_stack: np.ndarray = field(repr=False)        # (H,W,C) uint8 - the input to the pipeline
     pv_stain_raw: np.ndarray = field(repr=False)       # (H,W) float32 before uint8 conversion
     pp_stain_raw: np.ndarray = field(repr=False, default=None)
+    shading_field: np.ndarray = field(repr=False, default=None)
+    # (H,W) float32 in [0.5, 1.0] - the multiplicative flatfield-degradation
+    # field applied to pv_stain_raw and pp_stain_raw.  Stored for preview.
     fused_pairs: list = field(repr=False, default_factory=list)
     # list of (label_a, label_b, v_e) for fused pairs
     fused_boundary_mask: np.ndarray = field(repr=False, default=None)
-    # (H,W) bool — pixels on either side of every fused Voronoi edge;
+    # (H,W) bool - pixels on either side of every fused Voronoi edge;
     # None when there are no fusions.  Used by visualize_instances to
     # overlay the suppressed PP zone and by callers that need to know
     # where a shared boundary was artificially removed from GT.
@@ -458,7 +462,7 @@ def fragmented_tissue(size, rng, target_frac=0.22, n_islands=None):
     """Multi-island irregular tissue mask mimicking real multiplexed fluorescence slices.
 
     Real sections are fragmented into many irregular clumps, not a single
-    compact blob — tissue fraction across the 7 real images is 0.17–0.29,
+    compact blob - tissue fraction across the 7 real images is 0.17–0.29,
     split across 3–8 disconnected islands of varying size.
 
     Parameters
@@ -581,7 +585,7 @@ def tissue_from_outline(size: int, rng, target_frac: float | None = None) -> np.
 
     Builds Elliptic Fourier Descriptors (EFD) from scratch using statistics
     measured from 60 real liver tissue sections. No stored templates or binary
-    data — everything is derived from the module-level TISSUE_* constants.
+    data - everything is derived from the module-level TISSUE_* constants.
 
     The fundamental shape is an ellipse (aspect ratio ~1.3, from the large
     negative harmonic 1) with fractal boundary texture added via power-law
@@ -628,7 +632,7 @@ def tissue_from_outline(size: int, rng, target_frac: float | None = None) -> np.
     # IFFT index mapping: DFT slot N-(n-j) ↔ frequency -(n-j), and after the
     # internal reversal, slot 0 of neg_re corresponds to c_{-1}).
     neg_amps_k = np.zeros(n_harm)
-    # c_{-1}: dominant negative harmonic — real liver shapes are non-elliptical
+    # c_{-1}: dominant negative harmonic - real liver shapes are non-elliptical
     neg1_ratio = float(np.clip(
         rng.lognormal(np.log(TISSUE_NEG1_RATIO_MEDIAN),
                       TISSUE_NEG1_RATIO_SIGMA),
@@ -858,7 +862,7 @@ def generate_lobule_amp_map(labels, kept_ids, rng,
     """Per-lobule PV amplitude cap (A in `base + (A-base)*shape`).
 
     On real pooled p99-normalized PV marker data, fitting with free amplitude
-    gives A≈0.60 — i.e. the *mean* stain intensity at CV reaches only ~60%
+    gives A≈0.60 - i.e. the *mean* stain intensity at CV reaches only ~60%
     of per-lobule p99. The remaining headroom is filled by bright cellular
     clusters (log-normal texture), not by the shape itself.
     """
@@ -913,7 +917,7 @@ def hex_grid_centers(size, side, rng, jitter_frac=0.55):
 
 
 # ---------------------------------------------------------------------------
-#  Voronoi → perturbed lobule polygons
+#  Voronoi -> perturbed lobule polygons
 # ---------------------------------------------------------------------------
 def _perturb_edge(p0, p1, rng, hex_side):
     """Create a curved path between p0 and p1.
@@ -939,8 +943,8 @@ def _perturb_edge(p0, p1, rng, hex_side):
     normal  = np.array([-tangent[1], tangent[0]])
 
     max_ortho = PERTURB_ORTHO_FRAC * length
-    sigma_A   = 0.60 * max_ortho
-    sigma_t   = float(rng.uniform(0.10, 0.22))
+    sigma_A   = 0.50 * max_ortho   # typical displacement ~40% of max
+    sigma_t   = float(rng.uniform(0.15, 0.35))  # wider bumps -> gentler curves
 
     # Amplitude magnitude (always positive; sign assigned below)
     amp = float(np.clip(abs(rng.normal(0.0, sigma_A)), 0.0, max_ortho))
@@ -1007,8 +1011,8 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
 
     Each Voronoi ridge is perturbed exactly once using a deterministic per-ridge
     sub-rng (derived from a single value consumed from the main rng).  Both
-    adjacent polygons reuse the same pre-computed perturbed points — one forward,
-    the other reversed — so their shared boundary is identical and no mismatch
+    adjacent polygons reuse the same pre-computed perturbed points - one forward,
+    the other reversed - so their shared boundary is identical and no mismatch
     strip exists between them.  This eliminates interlocking without affecting the
     main rng state for the junction-smoothing loop that follows.
 
@@ -1034,7 +1038,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
 
     vor = Voronoi(all_pts)
 
-    # Jitter Voronoi vertices (corners) globally — shared across all
+    # Jitter Voronoi vertices (corners) globally - shared across all
     # adjacent polygons so lobules still tile without gaps
     jitter_max = VERTEX_JITTER_FRAC * hex_side
     jittered_vertices = vor.vertices.copy()
@@ -1083,7 +1087,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
             key = (min(v_i, v_j), max(v_i, v_j))
             k = ridge_by_verts.get(key)
             if k is not None:
-                pts = ridge_pts[k]               # v_p → v_q, includes endpoints
+                pts = ridge_pts[k]               # v_p -> v_q, includes endpoints
                 rp = vor.ridge_vertices[k][0]
                 if v_i == rp:
                     edge_pts = pts[:-1]           # forward, drop last
@@ -1102,9 +1106,9 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
             # Per-junction local smoothing: at each vertex where two curved
             # edges meet, independently choose how much of each adjacent edge
             # gets rounded and with what sigma.
-            #   frac_L, frac_R ~ U[0, 0.6]  → smoothed fraction of each side
-            #   sigma           ~ U[0, max(n_L, n_R)]  → in point-index units
-            # A cosine taper blends smoothed→original at the window edges so
+            #   frac_L, frac_R ~ U[0, 0.6]  -> smoothed fraction of each side
+            #   sigma           ~ U[0, max(n_L, n_R)]  -> in point-index units
+            # A cosine taper blends smoothed->original at the window edges so
             # there is no hard discontinuity between smoothed and raw sections.
             n_verts = len(verts)
             pts_per_edge = PERTURB_N_PTS + 1   # points contributed per edge
@@ -1116,7 +1120,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
 
                 # Square-root sampling biases toward the upper end of each
                 # range: U^0.5 has PDF 2u so large fracs/sigmas are ~2x more
-                # likely than small ones → most junctions are visibly rounded.
+                # likely than small ones -> most junctions are visibly rounded.
                 frac_L = 0.60 * float(rng.uniform(0.0, 1.0) ** 0.5)
                 frac_R = 0.60 * float(rng.uniform(0.0, 1.0) ** 0.5)
                 n_L = int(frac_L * pts_per_edge)
@@ -1181,7 +1185,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
 
     # Step 4: fill gaps (coverage == 0 inside tissue) with nearest-region EDT.
     # With shared-ridge perturbation, gaps only arise at polygon vertices
-    # (where 3+ polygons meet) and at the tissue boundary — never between
+    # (where 3+ polygons meet) and at the tissue boundary - never between
     # adjacent polygon interiors.  EDT-from-existing-region correctly
     # interpolates these tiny vertex gaps following the local curved shapes.
     gap = tissue & (labels == 0)
@@ -1199,14 +1203,25 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
     # Zero out non-tissue
     labels[~tissue] = 0
 
-    # Discard tiny / edge lobules (these would otherwise leave dark cutouts)
+    # Discard tiny / edge lobules (these would otherwise leave dark cutouts).
+    # Two criteria:
+    #   1. Area < 15 % of a full hexagonal cell - lobule too small.
+    #   2. Bbox fill < 0.25 - lobule is a degenerate thin sliver (wedge
+    #      formed when the tissue boundary clips a Voronoi cell at an acute
+    #      angle).  A normal lobule fills ≥ 40 % of its bounding box.
     kept_ids = []
     for label_id in range(1, n_real + 1):
-        area = np.sum(labels == label_id)
-        if area < 0.15 * (hex_side ** 2):  # too small
-            labels[labels == label_id] = 0
-        else:
-            kept_ids.append(label_id)
+        _mask = labels == label_id
+        area = int(_mask.sum())
+        if area < 0.15 * (hex_side ** 2):
+            labels[_mask] = 0
+            continue
+        _ys, _xs = np.where(_mask)
+        _bbox_area = int((_ys.max() - _ys.min() + 1) * (_xs.max() - _xs.min() + 1))
+        if _bbox_area > 0 and area / _bbox_area < 0.25:   # sliver check
+            labels[_mask] = 0
+            continue
+        kept_ids.append(label_id)
 
     # Re-fill any holes left behind by the discard step (EDT from kept regions).
     gap2 = tissue & (labels == 0)
@@ -1221,7 +1236,7 @@ def build_perturbed_voronoi_labels(centers, tissue, hex_side, rng):
     # Step 5: enforce simply-connected labels.
     # Despite shared ridge perturbation, straight-polygon fallbacks can leave
     # tiny disconnected slivers.  Absorb every secondary component of each
-    # label into its dominant 8-connected neighbour — regardless of size —
+    # label into its dominant 8-connected neighbour - regardless of size -
     # so the final GT has no interlocking regions.
     _conn8 = _ndstruct(2, 2)
     for label_id in list(kept_ids):
@@ -1264,15 +1279,26 @@ def paint_blob_mask(mask, cx, cy, rx, ry, rng, n_pts=None, rnoise_range=(0.55, 1
 
     Similar silhouette to ``paint_ellipse_mask`` but with per-vertex radius
     noise so the boundary is organic rather than elliptical.
+
+    rnoise_range widened to (0.30, 1.70) so blobs have realistic circularity
+    (0.2–0.6) matching real CV/PP vessel cross-sections that include oblique
+    sections, partial collapse, and irregular lumens.  The optimizer then learns
+    vessel_circularity_min values that transfer to real data.
     """
     H, W = mask.shape
     if n_pts is None:
-        n_pts = int(rng.integers(10, 18))
+        n_pts = int(rng.integers(12, 22))   # more vertices -> smoother yet still irregular
     ang = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
     ang += rng.uniform(0, 2 * np.pi)
+    # Optionally rotate the whole ellipse to simulate oblique sections
+    rot = rng.uniform(0, np.pi)
+    cos_r, sin_r = np.cos(rot), np.sin(rot)
     rnoise = rng.uniform(rnoise_range[0], rnoise_range[1], n_pts)
-    xs = cx + rx * rnoise * np.cos(ang)
-    ys = cy + ry * rnoise * np.sin(ang)
+    # Local axes before rotation
+    lx = rx * rnoise * np.cos(ang)
+    ly = ry * rnoise * np.sin(ang)
+    xs = cx + cos_r * lx - sin_r * ly
+    ys = cy + sin_r * lx + cos_r * ly
     xs = np.clip(xs, 0, W - 1)
     ys = np.clip(ys, 0, H - 1)
     rr, cc = ski_polygon(ys, xs, (H, W))
@@ -1286,16 +1312,29 @@ def place_vessels(centers, kept_ids, labels, tissue, hex_side, rng):
     portal_mask = np.zeros((h, w), dtype=bool)
     gt_centers_out = []
 
-    # CV: one ellipse per kept lobule, at the centroid — some lobules have no CV
+    # Minimum distance the CV centre must be from the lobule boundary.
+    # Ensures the CV sits well inside the lobule even for edge-clipped cells.
+    # Set to max possible CV radius + a safety margin.
+    _CV_MIN_DIST = float(max(CV_RX[1], CV_RY[1])) + 8.0
+
+    # CV: one ellipse per kept lobule, placed at the deepest interior point
+    # (maximum of the distance transform) rather than the centroid.  This
+    # guarantees the CV is as far from all boundaries as possible.
     for label_id in kept_ids:
-        ys, xs = np.where(labels == label_id)
-        if len(ys) == 0:
+        _lob_mask = labels == label_id
+        if not _lob_mask.any():
             continue
-        cy = ys.mean()
-        cx = xs.mean()
+        # Distance of every lobule pixel from the lobule boundary.
+        _dist = edt(_lob_mask)
+        _max_dist = float(_dist.max())
+        # Deepest interior point - use this as the CV centre.
+        _flat = int(np.argmax(_dist))
+        cy, cx = float(_flat // w), float(_flat % w)
         gt_centers_out.append((cx, cy))
         if rng.random() < CV_DROPOUT:
             continue  # this lobule has no central vein
+        if _max_dist < _CV_MIN_DIST:
+            continue  # lobule too thin to place a realistic CV
         rx = rng.integers(CV_RX[0], CV_RX[1] + 1)
         ry = rng.integers(CV_RY[0], CV_RY[1] + 1)
         paint_blob_mask(central_mask, cx, cy, rx, ry, rng)
@@ -1392,7 +1431,7 @@ def compute_pp_portality(labels, central_mask, portal_mask, kept_ids):
 
     Unlike the regular portality (which is 0 at ALL lobule boundaries),
     this is 0 only where portal vessels are. The PP stain derived from this
-    is therefore high only near portal vessels — it does NOT appear at tissue
+    is therefore high only near portal vessels - it does NOT appear at tissue
     edges, tissue cutouts, or at shared lobule boundaries that have no portal
     vessel. This eliminates the visual "adding" artefact at non-portal edges.
 
@@ -1456,16 +1495,16 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
                            v_power=FUSION_V_POWER):
     """For each Voronoi edge between adjacent lobules, sample v = U^(1/v_power).
 
-    v < threshold  → edge ABSENT from GT: lobules merge into one super-lobule.
+    v < threshold  -> edge ABSENT from GT: lobules merge into one super-lobule.
                      Portal vessels that become interior are removed.
-                     Portality is NOT modified here — caller should recompute
+                     Portality is NOT modified here - caller should recompute
                      compute_portality() on the merged labels so the fused edge
                      becomes an interior region and portality flows naturally.
-    v >= threshold → edge PRESENT in GT: no change.
+    v >= threshold -> edge PRESENT in GT: no change.
 
     Returns
     -------
-    labels               : (H,W) int32, merged — fused lobules share smallest ID
+    labels               : (H,W) int32, merged - fused lobules share smallest ID
     kept_ids             : list, updated to only contain root super-lobule IDs
     portal_mask          : (H,W) bool, interior vessels removed
     fused_edges          : list of (id_a, id_b, v_e) for fused pairs
@@ -1521,7 +1560,7 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
     # --- 3b. Pixel mask of fused boundaries (BEFORE label merging) ---
     # Marks every pixel on either side of a fused Voronoi edge.
     # Returned so the caller can suppress PP stain there:
-    # no portal tract at a fused boundary → PP signal should be absent.
+    # no portal tract at a fused boundary -> PP signal should be absent.
     fused_boundary_mask = np.zeros((h, w), dtype=bool)
     for id_a, id_b, _ in fused_edges:
         for dy, dx in ((0, 1), (1, 0)):
@@ -1552,7 +1591,7 @@ def apply_boundary_fusion(labels, kept_ids, portal_mask, hex_side, rng,
         if id_a in parent and id_b in parent:
             _union(id_a, id_b)
 
-    # Remap every non-root id → its root
+    # Remap every non-root id -> its root
     root_map = {i: _find(i) for i in kept}
     old_labels = labels.copy()
     for old_id, new_id in root_map.items():
@@ -1596,6 +1635,42 @@ def _make_noise(shape, rng, sigma_spatial=8.0):
     if mx > 0:
         smooth /= mx
     return smooth
+
+
+def _make_shading_field(shape, rng, lo: float = 0.65, hi: float = 1.0) -> np.ndarray:
+    """Smooth multiplicative flatfield-degradation field in [lo, hi].
+
+    Simulates uneven staining intensity across the slide - e.g. an antibody
+    concentration gradient from one edge to the other, or a slow wash-out
+    pattern.  A single broad Gaussian-smoothed noise field is used so the
+    variation is image-wide and correlated at the lobule scale.
+
+    Sigma is drawn from U[30 %, 60 %] of the image width so the field is
+    always broader than a full lobule diameter (~560 px at hex_side=280 px /
+    1600 px image = 35 % of width).  This ensures the shading gradient is
+    always separable from the within-lobule zonation gradient, so the
+    flatfield correction (local_bg_sigma ≥ 400 px) can cleanly remove it
+    without destroying the PV/PP signal.
+
+    Parameters
+    ----------
+    shape : (H, W)
+    lo, hi : float  - multiplier range; default [0.50, 1.0]
+
+    Returns
+    -------
+    field : (H, W) float32  in [lo, hi]
+    """
+    h, w = shape
+    sigma = float(rng.uniform(0.30 * max(h, w), 0.60 * max(h, w)))
+    raw   = rng.standard_normal((h, w)).astype(np.float32)
+    field = gaussian_filter(raw, sigma=sigma)
+    f_min, f_max = float(field.min()), float(field.max())
+    if f_max > f_min:
+        field = (field - f_min) / (f_max - f_min)   # -> [0, 1]
+    else:
+        field = np.ones_like(field)
+    return (lo + field * (hi - lo)).astype(np.float32)
 
 
 def _make_illumination_field(shape, rng, i_min=0.4):
@@ -1642,7 +1717,7 @@ def _make_dapi_ecad_texture(shape, tissue, rng,
         local 9x9 std ≈ 27 (so pixel-to-pixel variation is most of total std).
 
     The texture is built as a sum of:
-      1. Nuclear dots — sparse Gaussian blobs at a density ≈ 1 per
+      1. Nuclear dots - sparse Gaussian blobs at a density ≈ 1 per
          (2*nuclear_radius)^2 px², contributing bright spots for DAPI.
       2. Medium-frequency background (blurred Gaussian noise, σ~6 px)
          contributing cytoplasm/E-Cad membrane patterns.
@@ -1654,7 +1729,7 @@ def _make_dapi_ecad_texture(shape, tissue, rng,
     # 1) Nuclear dots (DAPI)
     nuclei = np.zeros((h, w), dtype=np.float32)
     area = h * w
-    # ~one nucleus per 30 px² → very dense in tissue, close to real
+    # ~one nucleus per 30 px² -> very dense in tissue, close to real
     n_nuclei = int(area / 30)
     ys = rng.integers(0, h, n_nuclei)
     xs = rng.integers(0, w, n_nuclei)
@@ -1687,7 +1762,7 @@ def _make_dapi_ecad_texture(shape, tissue, rng,
     if s > 0:
         illum /= s
 
-    # Combine — nuclei dominate the bright peaks, bg provides the mid tones
+    # Combine - nuclei dominate the bright peaks, bg provides the mid tones
     combined = 0.75 * nuclei + 0.40 * bg + 0.10 * illum
 
     # Rescale to target mean/std inside tissue
@@ -1709,11 +1784,11 @@ def _make_dapi_ecad_texture(shape, tissue, rng,
 def _match_channel_stats(stain01, tissue, vessel_holes, target_p95, target_p05=10.0):
     """Rescale a float stain to uint8 so the in-tissue stats match targets.
 
-    Uses a p05→p99 anchor pair (rather than p05→p95) so the bright tail of
+    Uses a p05->p99 anchor pair (rather than p05->p95) so the bright tail of
     the source has headroom in uint8 space instead of saturating at 255.
 
-    - source p05 → target_p05
-    - source p99 → target_p99  (derived from target_p95 by a fixed ratio)
+    - source p05 -> target_p05
+    - source p99 -> target_p99  (derived from target_p95 by a fixed ratio)
     - values above p99 extend smoothly toward 255 (no hard clip until max)
 
     The real PV marker has p95/p99 ≈ 0.77, so target_p99 ≈ target_p95 / 0.77.
@@ -1801,7 +1876,7 @@ def generate_stain(portality, tissue, vessel_holes, rng,
     portality : (H,W) float32, 0=boundary, 1=CV, NaN=outside
     channel : "pv" (pericentral, high near CV) or "pp" (periportal, high near boundary)
     stain_type : "linear" (smooth gradient) | "sharp" (exponential) |
-                 "hill" (sigmoidal — matches real PV marker best, R²≈0.95)
+                 "hill" (sigmoidal - matches real PV marker best, R²≈0.95)
     noise_level : "low" or "high"
     lobule_expr_map : (H,W) float32, per-lobule expression multiplier
     lobule_base_map : (H,W) float32, per-lobule PV baseline (defaults to
@@ -1848,7 +1923,7 @@ def generate_stain(portality, tissue, vessel_holes, rng,
     else:
         k_field = np.full_like(P, default_k, dtype=np.float32)
 
-    # -- Portality → normalized shape in [base, 1] --
+    # -- Portality -> normalized shape in [base, 1] --
     intensity = np.zeros_like(P, dtype=np.float32)
 
     if channel == "pv":
@@ -1862,7 +1937,7 @@ def generate_stain(portality, tissue, vessel_holes, rng,
             # but since we add base_field below, just use raw - exp(-k)  over 1-exp(-k)
             fmin = np.exp(-k_field)
             shape = (raw - fmin) / (1.0 - fmin + 1e-12)
-        else:  # "hill" — sigmoidal, measured to fit R²≈0.95 on real PV marker
+        else:  # "hill" - sigmoidal, measured to fit R²≈0.95 on real PV marker
             n_hill, h_hill = float(_CAL_HILL_PV[1]), float(_CAL_HILL_PV[2])
             u = np.clip(P, 0, 1)
             num = u ** n_hill
@@ -1890,10 +1965,10 @@ def generate_stain(portality, tissue, vessel_holes, rng,
         amp_field = np.ones_like(P, dtype=np.float32)
 
     # Decompose intensity into two components that are modulated separately:
-    #   base_contrib  — autofluorescence-like floor, unaffected by CYP
+    #   base_contrib  - autofluorescence-like floor, unaffected by CYP
     #                   expression / cellular clustering, but still touched
     #                   by microscope illumination
-    #   shape_contrib — CYP signal proportional to the stain shape; modulated
+    #   shape_contrib - CYP signal proportional to the stain shape; modulated
     #                   by lobule expression, illum, and (for PV) the
     #                   log-normal cellular multiplier that produces bright
     #                   CYP cell clusters.
@@ -1989,7 +2064,7 @@ def _add_scanbox(tissue, stain_u8, vessel_holes):
 # ---------------------------------------------------------------------------
 #  Main instance generator
 # ---------------------------------------------------------------------------
-def _generate_geometry(seed, hex_side):
+def _generate_geometry(seed, hex_side, verbose: bool = True):
     """Generate tissue, lobule labels, vessels, portality for one seed+hex_side.
 
     Returns a dict of geometry arrays (shared across stain variants).
@@ -2027,8 +2102,8 @@ def _generate_geometry(seed, hex_side):
     pp_portality = _smooth_pp_portality(pp_portality, hex_side)
 
     # Randomly fuse adjacent lobule pairs:
-    #   v < FUSION_THRESHOLD → merge in GT, remove interior portal vessels
-    #   v >= FUSION_THRESHOLD → keep separate, full dark valley
+    #   v < FUSION_THRESHOLD -> merge in GT, remove interior portal vessels
+    #   v >= FUSION_THRESHOLD -> keep separate, full dark valley
     _n_orig = len(kept_ids)
     labels, kept_ids, portal_mask, fused_pairs, fused_boundary_mask = apply_boundary_fusion(
         labels, kept_ids, portal_mask, hex_side, rng)
@@ -2046,8 +2121,8 @@ def _generate_geometry(seed, hex_side):
             compute_pp_portality(labels, central_mask, portal_mask, kept_ids), hex_side)
 
         # Suppress PP stain at fused edges: a fused boundary has no portal tract
-        # → the PP marker should show no ring there.  Blend pp_portality toward
-        # 1.0 (= "far from portal" → PP shape ≈ 0) over a Gaussian zone centred
+        # -> the PP marker should show no ring there.  Blend pp_portality toward
+        # 1.0 (= "far from portal" -> PP shape ≈ 0) over a Gaussian zone centred
         # on the boundary pixels.  sigma ≈ 15 % of hex_side ≈ half a portal-ring width.
         if fused_boundary_mask.any():
             suppress_sigma = max(8.0, hex_side * 0.15)
@@ -2063,17 +2138,19 @@ def _generate_geometry(seed, hex_side):
                 + 1.0 * fused_weight[valid_pp]
             )
 
-        print(f"    {_n_orig} lobules | {_n_fused} edge(s) fused → "
-              f"{_n_unchanged} unchanged + {_n_super} super-lobule(s)", flush=True)
+        if verbose:
+            print(f"    {_n_orig} lobules | {_n_fused} edge(s) fused → "
+                  f"{_n_unchanged} unchanged + {_n_super} super-lobule(s)", flush=True)
     else:
-        print(f"    {_n_orig} lobules | no fusions", flush=True)
+        if verbose:
+            print(f"    {_n_orig} lobules | no fusions", flush=True)
 
     # Now zero out vessel pixels from labels (they're holes, not lobule tissue)
     labels[vessel_holes] = 0
 
     # Post-vessel fragment absorption:
     # Vessel holes can punch through a lobule edge and disconnect a corner
-    # sliver from its main body.  These slivers are NOT independent lobules —
+    # sliver from its main body.  These slivers are NOT independent lobules -
     # absorb each one into its dominant neighbour using the Voronoi topology.
     # Uses 8-connected components; threshold = 10 % of a full hex cell area.
     _frag_thr = int(0.10 * hex_side ** 2)
@@ -2091,16 +2168,16 @@ def _generate_geometry(seed, hex_side):
                 _nbr_vals, _counts = np.unique(labels[_nbr_mask], return_counts=True)
                 labels[_frag] = _nbr_vals[np.argmax(_counts)]   # dominant neighbour
             else:
-                labels[_frag] = 0   # isolated island — treat as background
+                labels[_frag] = 0   # isolated island - treat as background
 
     # Per-lobule expression heterogeneity (calibrated range)
     lobule_expr_map = generate_lobule_expression_map(labels, kept_ids, rng)
-    # Per-lobule PV shape heterogeneity — each lobule gets its own
+    # Per-lobule PV shape heterogeneity - each lobule gets its own
     # (base, k) drawn from the measured per-lobule distribution, so the
     # synthetic per-lobule stat distribution matches the real one.
     lobule_base_map = generate_lobule_base_map(labels, kept_ids, rng)
     lobule_k_map = generate_lobule_k_map(labels, kept_ids, rng)
-    # Per-lobule PV amplitude cap (A) — mean stain curve peaks at A, not 1
+    # Per-lobule PV amplitude cap (A) - mean stain curve peaks at A, not 1
     lobule_amp_map = generate_lobule_amp_map(labels, kept_ids, rng)
     # Per-lobule CV-offset (peak-away-from-CV jitter, see generate_stain)
     cv_offset_map = generate_cv_offset_map(labels, kept_ids, rng)
@@ -2113,6 +2190,7 @@ def _generate_geometry(seed, hex_side):
     lobule_expr_map = _smooth_lobule_map(
         lobule_expr_map, tissue, smooth_sigma,
         fill=float(0.5 * (LOBULE_EXPR_MIN + LOBULE_EXPR_MAX)))
+
     lobule_base_map = _smooth_lobule_map(
         lobule_base_map, tissue, smooth_sigma,
         fill=float(0.5 * (_CAL_PV_BASE_RANGE[0] + _CAL_PV_BASE_RANGE[1])))
@@ -2123,7 +2201,7 @@ def _generate_geometry(seed, hex_side):
         lobule_amp_map, tissue, smooth_sigma,
         fill=float(0.5 * (_CAL_PV_AMP_RANGE[0] + _CAL_PV_AMP_RANGE[1])))
 
-    # Tissue fold artifact (stochastic — only some images get folds)
+    # Tissue fold artifact (stochastic - only some images get folds)
     fold_map = None
     if rng.random() < FOLD_PROB:
         fold_map = generate_tissue_fold((IMG, IMG), tissue, rng)
@@ -2187,7 +2265,7 @@ def generate_all_instances(
                 if verbose:
                     print(f"  Generating geometry: seed={seed}, hex_side={hex_side}...",
                           end="", flush=True)
-                geom = _generate_geometry(seed, hex_side)
+                geom = _generate_geometry(seed, hex_side, verbose=verbose)
                 _GEOM_CACHE[_key] = geom
                 if verbose:
                     n_lob = len(geom["kept_ids"])
@@ -2209,7 +2287,26 @@ def generate_all_instances(
                         cv_offset_map=geom.get("cv_offset_map"),
                         fold_map=geom["fold_map"])
 
-                    # pp_type="none" → no PP stain; segmentation must rely on PV alone.
+                    # Flatfield / staining-gradient degradation.
+                    # A single slow smooth field in [0.50, 1.0] is generated
+                    # once per stain variant and applied to BOTH pv_raw and
+                    # pp_raw (same field - same slide, same gradient).  It
+                    # simulates slide-level illumination/concentration gradients
+                    # (independent of the per-pixel microscope illumination
+                    # already baked into generate_stain).  The study's
+                    # local_bg_sigma parameter is expected to correct for this.
+                    _shading = _make_shading_field((IMG, IMG), stain_rng)
+                    _fg = geom["tissue"] & ~geom["vessel_holes"]
+
+                    pv_raw = pv_raw * _shading
+                    # Re-normalise to [0, 1] using the foreground max so the
+                    # relative shape within the tissue is preserved.
+                    _fg_max = float(pv_raw[_fg].max()) if _fg.any() else 0.0
+                    if _fg_max > 0:
+                        pv_raw = pv_raw / _fg_max
+                    pv_raw = pv_raw.astype(np.float32)
+
+                    # pp_type="none" -> no PP stain; segmentation must rely on PV alone.
                     # A zero array is used in the image stack so shape stays consistent.
                     if pp_type == "none":
                         pp_raw = None
@@ -2219,8 +2316,14 @@ def generate_all_instances(
                             geom["pp_portality"], geom["tissue"], geom["vessel_holes"],
                             stain_rng, stain_type=pp_type,
                             noise_level=noise_level, channel="pp",
-                            lobule_expr_map=geom["lobule_expr_map"],
+                            lobule_expr_map=None,  # no per-lobule brightness variation for PP;
+                            # shading field provides global intensity gradient instead
                             fold_map=geom["fold_map"])
+                        pp_raw = pp_raw * _shading
+                        _pp_fg_max = float(pp_raw[_fg].max()) if _fg.any() else 0.0
+                        if _pp_fg_max > 0:
+                            pp_raw = pp_raw / _pp_fg_max
+                        pp_raw = pp_raw.astype(np.float32)
 
                     # Match real per-channel p95 (uint8, inside tissue);
                     # ranges from GT-calibration fallbacks.
@@ -2273,6 +2376,7 @@ def generate_all_instances(
                             pv_stain_raw=pv_raw,
                             # pp_stain_raw=None for pp_type="none" AND for "single" mode
                             pp_stain_raw=pp_raw if (mode == "dual" and pp_raw is not None) else None,
+                            shading_field=_shading,
                             fused_pairs=geom.get("fused_pairs", []),
                             fused_boundary_mask=geom.get("fused_boundary_mask"),
                         )
@@ -2284,7 +2388,7 @@ def generate_all_instances(
 
 
 # ---------------------------------------------------------------------------
-#  TIFF export — writes a pyramidal OME-TIFF readable by the full pipeline
+#  TIFF export - writes a pyramidal OME-TIFF readable by the full pipeline
 # ---------------------------------------------------------------------------
 def save_instance_as_tiff(instance, path, pyramid_factors=None):
     """Write a :class:`SyntheticInstance` as a multi-level OME-TIFF.
@@ -2340,7 +2444,7 @@ def save_instance_as_tiff(instance, path, pyramid_factors=None):
 
 
 # ---------------------------------------------------------------------------
-#  Visualization helper — shared by viz_synth.py and the __main__ block
+#  Visualization helper - shared by viz_synth.py and the __main__ block
 # ---------------------------------------------------------------------------
 def visualize_instances(instances, out_path, title_suffix: str = "",
                         thumb_px: int = 512):
@@ -2355,9 +2459,9 @@ def visualize_instances(instances, out_path, title_suffix: str = "",
     Parameters
     ----------
     instances : list of SyntheticInstance
-    out_path  : str or Path — destination PNG
-    title_suffix : str — optional suptitle suffix
-    thumb_px  : int — max edge length for each panel thumbnail
+    out_path  : str or Path - destination PNG
+    title_suffix : str - optional suptitle suffix
+    thumb_px  : int - max edge length for each panel thumbnail
     """
     import matplotlib.pyplot as plt
     import numpy.ma as ma
@@ -2379,8 +2483,10 @@ def visualize_instances(instances, out_path, title_suffix: str = "",
 
     cmap_p = plt.get_cmap("magma").copy()
     cmap_p.set_bad("black")
+    cmap_s = plt.get_cmap("RdYlGn").copy()  # red=dark shading, green=full intensity
+    cmap_s.set_bad("black")
 
-    N_COLS  = 4
+    N_COLS  = 5
     n_inst  = len(instances)
     cell_in = thumb_px / 100        # cell size in inches (100 dpi reference)
     fig, axes = plt.subplots(
@@ -2473,10 +2579,25 @@ def visualize_instances(instances, out_path, title_suffix: str = "",
             fuse_pp_note = "  (cyan=fused edge)" if fbm_t is not None else ""
             ax.set_title(f"PP  (none){fuse_pp_note}", fontsize=6, pad=2)
 
+        # ── Panel 4: shading field (viridis) ──────────────────────────────────
+        ax = axes[si, 4]
+        if inst.shading_field is not None:
+            shd_t = _thumb(inst.shading_field, _cv2.INTER_AREA)
+            _s_min, _s_max = float(shd_t.min()), float(shd_t.max())
+            ax.imshow(shd_t, cmap=cmap_s, vmin=_s_min, vmax=_s_max)
+            ax.set_title(
+                f"shading  [{inst.shading_field.min():.2f}–{inst.shading_field.max():.2f}]",
+                fontsize=6, pad=2,
+            )
+        else:
+            blank = np.full(pv_t.shape[:2], 30, dtype=np.uint8)
+            ax.imshow(blank, cmap="gray", vmin=0, vmax=255)
+            ax.set_title("shading  (none)", fontsize=6, pad=2)
+
     for ax in axes.ravel():
         ax.axis("off")
 
-    suptitle = f"Synthetic instances — {n_inst} total"
+    suptitle = f"Synthetic instances - {n_inst} total"
     if title_suffix:
         suptitle += f"  {title_suffix}"
     fig.suptitle(suptitle, fontsize=9, y=1.002)

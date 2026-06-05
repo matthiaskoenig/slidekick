@@ -594,7 +594,7 @@ class StainSeparator(BaseOperator):
                 "Channel": {"Name": [stain_name]},  # one logical channel, RGB stored as samples
             }
 
-            # Passing a level→array dict + ome_metadata => pyramidal OME-TIFF
+            # Passing a level->array dict + ome_metadata => pyramidal OME-TIFF
             # `metadata=new_meta` is kept for API compatibility but ignored by save_tif
             # when it is not a dict.
             save_tif(separated_levels[j], out_path, metadata=new_meta, ome_metadata=ome_meta)

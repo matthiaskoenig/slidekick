@@ -1,5 +1,5 @@
 """
-Graph-based lobule annotator — supports RGB brightfield and fluorescence.
+Graph-based lobule annotator - supports RGB brightfield and fluorescence.
 
 Data model
 ----------
@@ -21,9 +21,9 @@ Its contour is subsampled and injected with edge_is_tissue=True.
 
 Image types
 -----------
-    fluorescence  — multi-channel uint16/float; each channel is colourised
+    fluorescence  - multi-channel uint16/float; each channel is colourised
                     using OME channel colours from the file's metadata.
-    brightfield   — 1-, 3-, or 4-channel uint8; displayed as RGB; tissue mask
+    brightfield   - 1-, 3-, or 4-channel uint8; displayed as RGB; tissue mask
                     built on inverted gray (tissue is dark, background bright).
 
 Auto-detection uses channel count and dtype; override with --image-type.
@@ -90,7 +90,7 @@ from shapely.ops import polygonize, unary_union
 
 # -- slidekick imports --------------------------------------------------------
 # Guard: ensure src/ is on sys.path when the file is run directly as a script.
-_SRC = Path(__file__).resolve().parents[4]   # …/annotate_lobules/ → src/
+_SRC = Path(__file__).resolve().parents[4]   # …/annotate_lobules/ -> src/
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
@@ -116,12 +116,12 @@ def _to_chw(arr: np.ndarray) -> np.ndarray:
     while arr.ndim > 3 and arr.shape[0] == 1:
         arr = arr[0]
     if arr.ndim == 2:
-        return arr[np.newaxis]                        # (H, W)   → (1, H, W)
+        return arr[np.newaxis]                        # (H, W)   -> (1, H, W)
     if arr.ndim == 3:
         s = arr.shape
-        # (H, W, C): channel-last heuristic — last dim small, both others larger
+        # (H, W, C): channel-last heuristic - last dim small, both others larger
         if s[-1] <= 16 and s[0] > s[-1] and s[1] > s[-1]:
-            return np.moveaxis(arr, -1, 0)            # (H, W, C) → (C, H, W)
+            return np.moveaxis(arr, -1, 0)            # (H, W, C) -> (C, H, W)
         # Already (C, H, W) or ambiguous: leave as-is
         return arr
     raise ValueError(f"Cannot reshape array of shape {arr.shape} to (C, H, W)")
@@ -134,7 +134,7 @@ def _load_level(filepath: Path, level: int):
     CZI files are converted to TIFF via :func:`slidekick.io.wsi.read_wsi`
     before loading.
     """
-    # CZI → TIFF conversion (read_wsi writes the TIFF alongside the CZI)
+    # CZI -> TIFF conversion (read_wsi writes the TIFF alongside the CZI)
     if filepath.suffix.lower() == ".czi":
         _, filepath = read_wsi(filepath)
 
@@ -179,7 +179,7 @@ def _detect_image_type(data: np.ndarray, metadata: Metadata) -> str:
     """Return ``'brightfield'`` or ``'fluorescence'``.
 
     Uses :attr:`Metadata.image_type` when set; otherwise falls back to
-    a dtype/channel-count heuristic (uint8 with 1–4 channels → brightfield).
+    a dtype/channel-count heuristic (uint8 with 1–4 channels -> brightfield).
     """
     itype = (metadata.image_type or "").lower()
     if itype in ("brightfield", "rgb", "h&e", "ihc", "he"):
@@ -287,12 +287,12 @@ def _detect_tissue_contours(data: np.ndarray,
         valid = [i for i in tissue_channels if 0 <= i < C]
         sub = data[valid] if valid else data
     else:
-        sub = data  # all channels → averaged in ensure_grayscale_uint8
+        sub = data  # all channels -> averaged in ensure_grayscale_uint8
 
     # Robust grey conversion (handles any dtype / layout via slidekick)
     gray = ensure_grayscale_uint8(sub)   # (H, W) uint8
 
-    # Brightfield: tissue is dark → invert so tissue becomes bright for the
+    # Brightfield: tissue is dark -> invert so tissue becomes bright for the
     # multi-Otsu detector (which returns the brightest class as tissue).
     if image_type == "brightfield":
         gray = 255 - gray

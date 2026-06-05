@@ -268,7 +268,7 @@ class ValisRegistrator(BaseOperator):
         """
         indices = list(transform_czi) if transform_czi is not None else []
         if not indices:
-            console.print("[CZI→OME-TIFF] transform_czi is empty; skipping CZI conversion", style="info")
+            console.print("[CZI->OME-TIFF] transform_czi is empty; skipping CZI conversion", style="info")
             return
 
         convert_all = (-1 in indices)
@@ -276,7 +276,7 @@ class ValisRegistrator(BaseOperator):
         # Determine target indices
         if convert_all:
             target_indices = list(range(len(self.metadata)))
-            console.print("[CZI→OME-TIFF] -1 provided; converting all CZIs", style="info")
+            console.print("[CZI->OME-TIFF] -1 provided; converting all CZIs", style="info")
         else:
             raw = [int(i) for i in indices if i is not None]
             # Accept 1-based indexing if user did not include 0 and all are >= 1
@@ -289,19 +289,19 @@ class ValisRegistrator(BaseOperator):
 
         for idx in target_indices:
             if idx < 0 or idx >= len(self.metadata):
-                console.print(f"[CZI→OME-TIFF] index out of range: {idx} (n={len(self.metadata)})", style="warning")
+                console.print(f"[CZI->OME-TIFF] index out of range: {idx} (n={len(self.metadata)})", style="warning")
                 continue
 
             meta = self.metadata[idx]
             src = Path(meta.path_storage)
 
             if src.suffix.lower() != ".czi":
-                console.print(f"[CZI→OME-TIFF] idx={idx} is not .czi ({src.name}); skipping", style="info")
+                console.print(f"[CZI->OME-TIFF] idx={idx} is not .czi ({src.name}); skipping", style="info")
                 continue
 
 
             if not src.exists():
-                console.print(f"[CZI→OME-TIFF] missing source file: {src}", style="error")
+                console.print(f"[CZI->OME-TIFF] missing source file: {src}", style="error")
                 continue
 
             # Store alongside the original CZI (same folder, same stem, .tiff)
@@ -309,17 +309,17 @@ class ValisRegistrator(BaseOperator):
 
             if not tiff_path.exists():
                 console.print(
-                    f"[CZI→OME-TIFF] converting {src.name} -> {tiff_path.name}",
+                    f"[CZI->OME-TIFF] converting {src.name} -> {tiff_path.name}",
                     style="info",
                 )
                 try:
                     czi2tiff(src, tiff_path, **czi_kwargs)
                 except Exception as e:
-                    console.print(f"[CZI→OME-TIFF] conversion failed for {src.name}: {e}", style="error")
+                    console.print(f"[CZI->OME-TIFF] conversion failed for {src.name}: {e}", style="error")
                     continue
             else:
                 console.print(
-                    f"[CZI→OME-TIFF] using existing {tiff_path.name} for {src.name}",
+                    f"[CZI->OME-TIFF] using existing {tiff_path.name} for {src.name}",
                     style="warning",
                 )
 

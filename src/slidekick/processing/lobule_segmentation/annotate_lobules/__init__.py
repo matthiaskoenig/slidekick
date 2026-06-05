@@ -1,4 +1,4 @@
-"""Lobule annotation tool — graph-based boundary editor for brightfield and fluorescence WSI."""
+"""Lobule annotation tool - graph-based boundary editor for brightfield and fluorescence WSI."""
 from .annotate_lobules import (
     AnnotationGraph,
     LobuleAnnotator,

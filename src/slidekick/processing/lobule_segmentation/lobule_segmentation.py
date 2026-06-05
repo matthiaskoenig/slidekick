@@ -3,6 +3,7 @@ from pathlib import Path
 from rich.prompt import Confirm
 from typing import List, Union, Optional, Tuple, Dict, Any
 import cv2
+from scipy.ndimage import gaussian_filter as _gaussian_filter
 import datetime
 import uuid
 from sklearn.cluster import KMeans
@@ -82,8 +83,9 @@ class LobuleSegmentor(BaseOperator):
                  adaptive_histonorm: bool = True,
                  bg_low_val: int = 0,
                  clahe_bg_suppress: int = 10,
+                 local_bg_correction: bool = True,
+                 local_bg_sigma: float = 500.0,
                  # nonlinear KMeans
-                 interactive_weighting: bool = True,
                  nonlinear_kmeans: bool = True,
                  alpha_pv: float = 9.25,
                  alpha_pp: float = 4.0,
@@ -94,7 +96,6 @@ class LobuleSegmentor(BaseOperator):
                  quantile_kmeans: Optional[bool] = False,
                  fg_min_signal_frac: float = 0.05,
                  # vessel gating
-                 interactive_vessels: bool = True,
                  min_vessel_area_pp: int = 180,
                  min_vessel_area_pv: int = 560,
                  vessel_annulus_px: int = 9,
@@ -113,7 +114,7 @@ class LobuleSegmentor(BaseOperator):
                  peak_thresh_pct: float = 40.0,
                  valley_sigma: float = 25.0,
                  cluster_merge_sigma: float = 0.0,
-                 interactive_smoothing: bool = True,
+                 higra_preview_max_px: int = 1500,
                  boundary_smooth_sigma: float = 31.0,
                  boundary_smooth_valley_pct: float = 51.5,
                  boundary_smooth_valley_band_px: int = 14,
@@ -140,7 +141,13 @@ class LobuleSegmentor(BaseOperator):
         @param n_clusters: number of clusters in (weighted) K-Means to use for superpixel clustering
         @param target_superpixels: number of superpixels to use for segmentation, overrides region_size
         @param adaptive_histonorm: use adaptive histogram norm in filtering
-        @param interactive_weighting: whether to use interactive weighting in a napari preview
+        @param local_bg_correction: if True, apply per-channel pseudo-flatfield correction in
+            _filter() to remove slow-varying illumination gradients (uneven staining, vignetting).
+            Each channel is divided by a masked Gaussian of itself at *local_bg_sigma* radius,
+            making intensities more spatially uniform before KMeans clustering.
+        @param local_bg_sigma: Gaussian sigma (pixels, at the loaded pyramid level) for the
+            background estimate used by local_bg_correction. Should span several lobule widths
+            - e.g. 150 px is a good starting point at pyramid level 1 for most slides.
         @param nonlinear_kmeans: use a non-linear feature weighting in K_means
         @param alpha_pv: weighting factors for superpixel clustering for pv channels in linear KMeans
         @param alpha_pp: weighting factors for superpixel clustering for pp channels in linear KMeans
@@ -148,7 +155,6 @@ class LobuleSegmentor(BaseOperator):
         @param pv_gamma: Gamma exponent applied to PV channels after robust percentile normalization. smaller = stronger boost
         @param nl_low_pct: Lower percentile used as the per-channel floor before gamma.
         @param nl_high_pct: Upper percentile used as the per-channel ceiling before gamma.
-        @param interactive_vessels: whether to use interactive vessel detection/grouping in a napari preview
         @param min_vessel_area_pp: min area (px) for PP-enclosed vessel candidates
         @param min_vessel_area_pv: min area (px) for PV-enclosed vessel candidates
         @param vessel_annulus_px: thickness (px) of ring-consistency check
@@ -171,10 +177,9 @@ class LobuleSegmentor(BaseOperator):
             watershed edge weights. Larger values produce smoother lobule boundaries.
         @param cluster_merge_sigma: coarse-scale sigma for basin-merging in seed detection;
             0 or None disables merging.
-        @param interactive_smoothing: when both *preview* and this flag are True, an
-            interactive napari step is shown after the watershed so the user can tune
-            *boundary_smooth_sigma* and *boundary_smooth_valley_pct* with live feedback.
-            Pressing Back in the final review returns to this step.
+        @param higra_preview_max_px: maximum side length (pixels) of the downsampled image
+            used for the interactive Higra seeding preview (shown when *preview* is True).
+            Larger values give higher-fidelity previews but are slower to recompute.
         @param boundary_smooth_sigma: Gaussian radius (pixels) for post-watershed boundary
             smoothing. 0 disables. See ``segment_lobules`` for details.
         @param boundary_smooth_valley_pct: percentile of the inverted-PV distribution above
@@ -196,19 +201,19 @@ class LobuleSegmentor(BaseOperator):
         self.adaptive_histonorm = adaptive_histonorm
         self.bg_low_val = int(bg_low_val)
         self.clahe_bg_suppress = int(clahe_bg_suppress)
+        self.local_bg_correction = bool(local_bg_correction)
+        self.local_bg_sigma = float(local_bg_sigma)
 
         # Kmeans
-        self.interactive_weighting = interactive_weighting
         self.nonlinear_kmeans = nonlinear_kmeans
         self.pp_gamma = pp_gamma
         self.pv_gamma = pv_gamma
         self.nl_low_pct = nl_low_pct
         self.nl_high_pct = nl_high_pct
-        self.quantile_kmeans = quantile_kmeans  # False default; None = auto (single-polarity → True)
+        self.quantile_kmeans = quantile_kmeans  # False default; None = auto (single-polarity -> True)
         self.fg_min_signal_frac = float(fg_min_signal_frac)
 
         # vessel gating
-        self.interactive_vessels = interactive_vessels
         self.min_vessel_area_pp = min_vessel_area_pp
         self.min_vessel_area_pv = min_vessel_area_pv
         self.vessel_annulus_px = vessel_annulus_px
@@ -230,7 +235,7 @@ class LobuleSegmentor(BaseOperator):
         self.peak_thresh_pct = float(peak_thresh_pct)
         self.valley_sigma = float(valley_sigma)
         self.cluster_merge_sigma = float(cluster_merge_sigma)
-        self.interactive_smoothing = bool(interactive_smoothing)
+        self.higra_preview_max_px = int(higra_preview_max_px)
         self.boundary_smooth_sigma = float(boundary_smooth_sigma)
         self.boundary_smooth_valley_pct = float(boundary_smooth_valley_pct)
         self.boundary_smooth_valley_band_px = int(boundary_smooth_valley_band_px)
@@ -306,6 +311,25 @@ class LobuleSegmentor(BaseOperator):
 
             # blur, ksize from zia=7
             ch = cv2.medianBlur(ch, ksize=self.ksize)
+
+            # Pseudo-flatfield / shade correction: divide by local background
+            # estimate so slow illumination gradients don't bias KMeans clustering.
+            # Uses the same masked-Gaussian approach as _masked_smooth in higra_segment:
+            # smooth(I * fg) / smooth(fg) gives the local mean within tissue only,
+            # avoiding leakage from zero-padded background into border tissue pixels.
+            if self.local_bg_correction and self.local_bg_sigma > 0:
+                _ch_f = ch.astype(np.float32)
+                _fg = _ch_f > 0  # background already zeroed by bg_low_val step above
+                if _fg.any():
+                    _sigma = float(self.local_bg_sigma)
+                    _num = _gaussian_filter(_ch_f, sigma=_sigma)
+                    _den = _gaussian_filter(_fg.astype(np.float32), sigma=_sigma)
+                    _local_bg = np.where(_den > 1e-6, _num / _den, 0.0)
+                    _corrected = np.where(_fg, _ch_f / np.maximum(_local_bg, 1e-6), 0.0)
+                    # Re-scale to [0, 255] within tissue so subsequent steps are unaffected.
+                    _t_max = float(_corrected[_fg].max())
+                    if _t_max > 0:
+                        ch = (_corrected / _t_max * 255.0).clip(0, 255).astype(np.uint8)
 
             # adaptive histogram norm (2D only)
             if self.adaptive_histonorm:
@@ -889,8 +913,8 @@ class LobuleSegmentor(BaseOperator):
             tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
         else:
             # multi_otsu is None (auto) or True (force 3-class legacy).
-            # auto=True  → decide bimodal/trimodal from mic_bg_frac heuristic.
-            # auto=False → always tissue = top class only (old multi_otsu=True behaviour).
+            # auto=True  -> decide bimodal/trimodal from mic_bg_frac heuristic.
+            # auto=False -> always tissue = top class only (old multi_otsu=True behaviour).
             tissue_mask = detect_tissue_mask_multiotsu(
                 stack_grayscale,
                 auto=(self.multi_otsu is None),
@@ -1309,7 +1333,7 @@ class LobuleSegmentor(BaseOperator):
             X = smooth_sp_features(X, sp_ids, sp_adj,
                                    iterations=2, weight_self=0.5)
 
-        # Quantile normalisation: resolve None → auto (single-polarity → True).
+        # Quantile normalisation: resolve None -> auto (single-polarity -> True).
         use_quantile = self.quantile_kmeans
         if use_quantile is None:
             use_quantile = bool(km_pv and not km_pp) or bool(km_pp and not km_pv)
@@ -1758,7 +1782,7 @@ class LobuleSegmentor(BaseOperator):
             vessel_circ_check_area_pv=self.vessel_circ_check_area_pv,
         )
 
-        if self.interactive_vessels:
+        if self.preview:
             # base image (for the bottom grayscale layer)
             base_vis = image_stack.mean(axis=2).astype(np.uint8)
             base_rgb = cv2.cvtColor(base_vis, cv2.COLOR_GRAY2BGR)
@@ -2054,7 +2078,7 @@ class LobuleSegmentor(BaseOperator):
             pp_closed = cv2.morphologyEx(
                 pp_mask.astype(np.uint8), cv2.MORPH_CLOSE, se
             ).astype(bool)
-            # Only flip MID → PP (never flip PV or BG)
+            # Only flip MID -> PP (never flip PV or BG)
             mid_mask = np.zeros_like(fg_pix_mask, dtype=bool)
             for mid_idx in idx_mid:
                 mid_mask |= (cluster_map_final == mid_idx)
@@ -2064,7 +2088,7 @@ class LobuleSegmentor(BaseOperator):
             n_flipped = int(flippable.sum())
             if n_flipped > 0:
                 console.print(
-                    f"  PP closing flipped {n_flipped:,} MID → PP pixels "
+                    f"  PP closing flipped {n_flipped:,} MID -> PP pixels "
                     f"({100 * n_flipped / fg_pix_mask.sum():.1f}% of foreground)",
                     style="info",
                 )
@@ -2204,7 +2228,7 @@ class LobuleSegmentor(BaseOperator):
 
             if step == 2:
                 # Interactive weighting preview
-                if self.interactive_weighting:
+                if self.preview:
                     action = self._preview_channel_weighting(img_stack, return_action=True)
                     if action == "abort":
                         console.print("Aborted by user. No segmentation performed.", style="error")
@@ -2278,6 +2302,176 @@ class LobuleSegmentor(BaseOperator):
         _pv_raw = img_stack[:, :, pv_channel_idx].astype(np.float32)
         pv_stain = np.pad(_pv_raw, ((pad, pad), (pad, pad)), mode="constant", constant_values=0.0)
 
+        # ── Interactive Higra-seeding preview (downsampled) ───────────────────
+        # Shows a fast napari preview so the user can tune blob_sigma,
+        # peak_min_dist, peak_thresh_pct, valley_sigma, and min_area_px before
+        # the (slow) full-resolution watershed.  Widgets show full-res pixel
+        # values; scaling to preview resolution is handled internally.
+        if self.preview:
+            _PREV_MAX = self.higra_preview_max_px
+            Hpad, Wpad = tissue_mask.shape  # already padded by _classify_vessels_and_zones
+            _s = min(1.0, _PREV_MAX / max(Hpad, Wpad))
+
+            if _s < 1.0:
+                _Hp = max(1, int(round(Hpad * _s)))
+                _Wp = max(1, int(round(Wpad * _s)))
+                _pad_s = max(0, int(round(pad * _s)))
+                _tm_s = cv2.resize(
+                    tissue_mask.astype(np.uint8), (_Wp, _Hp),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+                _vh_s = cv2.resize(
+                    vessel_holes.astype(np.uint8), (_Wp, _Hp),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+                _pv_s = cv2.resize(pv_stain, (_Wp, _Hp), interpolation=cv2.INTER_AREA)
+            else:
+                _Hp, _Wp, _pad_s, _s = Hpad, Wpad, pad, 1.0
+                _tm_s, _vh_s, _pv_s = tissue_mask, vessel_holes, pv_stain
+
+            # Downsample the original (unpadded) img_stack for the overlay background.
+            # Derive target size from (_Hp, _Wp, _pad_s) - not by re-rounding (H*_s) -
+            # so _img_s is guaranteed to match the _seg_crop shape pixel-exactly.
+            _Hv = max(1, _Hp - 2 * _pad_s)
+            _Wv = max(1, _Wp - 2 * _pad_s)
+            _C0 = img_stack.shape[2]
+            _img_s = np.stack(
+                [cv2.resize(img_stack[:, :, c], (_Wv, _Hv), interpolation=cv2.INTER_AREA)
+                 for c in range(_C0)],
+                axis=-1,
+            )
+
+            def _scale_higra_param(key: str, val: float) -> float:
+                """Scale a full-resolution param value to the preview resolution."""
+                if key in ("blob_sigma", "valley_sigma"):
+                    return max(1.0, val * _s)
+                if key == "peak_min_dist":
+                    return max(1, int(round(val * _s)))
+                if key == "min_area_px":
+                    return max(1, int(round(val * _s * _s)))
+                return val  # peak_thresh_pct is dimensionless
+
+            _higra_defaults = dict(
+                blob_sigma=self.blob_sigma,
+                peak_min_dist=self.peak_min_dist,
+                peak_thresh_pct=self.peak_thresh_pct,
+                valley_sigma=self.valley_sigma,
+                min_area_px=self.min_area_px,
+            )
+            _higra_pending = dict(_higra_defaults)
+
+            def _compute_higra_preview_vis() -> np.ndarray:
+                _seg = segment_lobules(
+                    _tm_s, _vh_s, _pv_s,
+                    blob_sigma=_scale_higra_param("blob_sigma", _higra_pending["blob_sigma"]),
+                    peak_min_dist=_scale_higra_param("peak_min_dist", _higra_pending["peak_min_dist"]),
+                    peak_thresh_pct=float(_higra_pending["peak_thresh_pct"]),
+                    valley_sigma=_scale_higra_param("valley_sigma", _higra_pending["valley_sigma"]),
+                    cluster_merge_sigma=self.cluster_merge_sigma,
+                    min_area_px=_scale_higra_param("min_area_px", _higra_pending["min_area_px"]),
+                    boundary_smooth_sigma=0,
+                )
+                _seg_crop = _seg[_pad_s: _Hp - _pad_s, _pad_s: _Wp - _pad_s] if _pad_s > 0 else _seg
+                return overlay_mask(_img_s, _seg_crop, alpha=0.5)
+
+            _higra_viewer = napari.Viewer()
+            _higra_seg_layer = _higra_viewer.add_image(
+                _compute_higra_preview_vis(),
+                name="Higra seeds preview",
+                rgb=True,
+            )
+
+            @magicgui(
+                layout="vertical",
+                auto_call=True,
+                blob_sigma={
+                    "min": 5.0, "max": 500.0, "step": 5.0,
+                    "label": "Blob sigma (px, full-res)",
+                    "tooltip": "Gaussian sigma for PV peak detection. Approximately the lobule radius in full-resolution pixels.",
+                },
+                peak_min_dist={
+                    "min": 10, "max": 2000, "step": 10,
+                    "label": "Peak min dist (px, full-res)",
+                    "tooltip": "Minimum distance between seed peaks in full-resolution pixels.",
+                },
+                peak_thresh_pct={
+                    "min": 5.0, "max": 95.0, "step": 5.0,
+                    "label": "Peak thresh (%)",
+                    "tooltip": "Percentile brightness threshold for interior PV peaks.",
+                },
+                valley_sigma={
+                    "min": 1.0, "max": 200.0, "step": 2.5,
+                    "label": "Valley sigma (px, full-res)",
+                    "tooltip": "Gaussian sigma for watershed edge weights in full-resolution pixels.",
+                },
+                min_area_px={
+                    "min": 1000, "max": 500000, "step": 1000,
+                    "label": "Min lobule area (px², full-res)",
+                    "tooltip": "Full-resolution minimum lobule area; smaller regions are discarded.",
+                },
+            )
+            def higra_controls(
+                blob_sigma: float = float(self.blob_sigma),
+                peak_min_dist: int = int(self.peak_min_dist),
+                peak_thresh_pct: float = float(self.peak_thresh_pct),
+                valley_sigma: float = float(self.valley_sigma),
+                min_area_px: int = int(self.min_area_px),
+            ):
+                _higra_pending["blob_sigma"] = float(blob_sigma)
+                _higra_pending["peak_min_dist"] = int(peak_min_dist)
+                _higra_pending["peak_thresh_pct"] = float(peak_thresh_pct)
+                _higra_pending["valley_sigma"] = float(valley_sigma)
+                _higra_pending["min_area_px"] = int(min_area_px)
+
+            def _apply_higra_pending_to_self() -> None:
+                self.blob_sigma = float(_higra_pending["blob_sigma"])
+                self.peak_min_dist = int(_higra_pending["peak_min_dist"])
+                self.peak_thresh_pct = float(_higra_pending["peak_thresh_pct"])
+                self.valley_sigma = float(_higra_pending["valley_sigma"])
+                self.min_area_px = int(_higra_pending["min_area_px"])
+
+            def on_higra_update() -> None:
+                console.print(
+                    f"Higra preview: blob_sigma={_higra_pending['blob_sigma']:.0f}, "
+                    f"peak_min_dist={_higra_pending['peak_min_dist']}, "
+                    f"valley_sigma={_higra_pending['valley_sigma']:.1f}, "
+                    f"min_area_px={_higra_pending['min_area_px']}",
+                    style="info",
+                )
+                _higra_seg_layer.data = _compute_higra_preview_vis()
+
+            def on_higra_reset() -> None:
+                _higra_pending.update(_higra_defaults)
+                higra_controls.blob_sigma.value = _higra_defaults["blob_sigma"]
+                higra_controls.peak_min_dist.value = _higra_defaults["peak_min_dist"]
+                higra_controls.peak_thresh_pct.value = _higra_defaults["peak_thresh_pct"]
+                higra_controls.valley_sigma.value = _higra_defaults["valley_sigma"]
+                higra_controls.min_area_px.value = _higra_defaults["min_area_px"]
+                _higra_seg_layer.data = _compute_higra_preview_vis()
+
+            _higra_action = run_napari_preview_action(
+                _higra_viewer,
+                higra_controls,
+                require_confirm=False,
+                on_update=on_higra_update,
+                on_reset=on_higra_reset,
+                include_back=False,
+            )
+
+            if _higra_action == "abort":
+                console.print("Aborted by user at Higra seeding step.", style="error")
+                return self.metadata
+
+            # Commit staged widget values to self regardless of confirm vs apply_values.
+            _apply_higra_pending_to_self()
+            console.print(
+                f"Higra params confirmed: blob_sigma={self.blob_sigma:.0f}, "
+                f"peak_min_dist={self.peak_min_dist}, valley_sigma={self.valley_sigma:.1f}, "
+                f"min_area_px={self.min_area_px}",
+                style="info",
+            )
+
+        # ── Full-resolution watershed ─────────────────────────────────────────
         # Run watershed without smoothing; smoothing is applied interactively below.
         mask_raw = segment_lobules(
             tissue_mask, vessel_holes, pv_stain,
@@ -2308,7 +2502,7 @@ class LobuleSegmentor(BaseOperator):
             # -------------------------------------------------------------------
             # A. Interactive boundary-smoothing preview (napari)
             # -------------------------------------------------------------------
-            if _show_smoothing_preview and self.preview and self.interactive_smoothing:
+            if _show_smoothing_preview and self.preview:
                 _smooth_defaults = dict(
                     boundary_smooth_sigma=self.boundary_smooth_sigma,
                     boundary_smooth_valley_pct=self.boundary_smooth_valley_pct,

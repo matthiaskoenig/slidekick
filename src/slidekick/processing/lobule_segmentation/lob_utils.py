@@ -62,7 +62,7 @@ _MIN_THRESHOLD_GAP = 0.10
 def _is_bimodal(lbl: np.ndarray, idx_mid: int, thr_low: float, thr_high: float) -> bool:
     """Decide whether a 3-class Otsu split really reflects 2 or 3 modes.
 
-    Two independent heuristics — either one triggering means bimodal:
+    Two independent heuristics - either one triggering means bimodal:
       1. The middle class contains < 5 % of pixels (it's a forced artefact).
       2. The two Otsu thresholds are within 10 % of the 0-255 range of each
          other, meaning the algorithm couldn't find a real valley between
@@ -116,8 +116,8 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
                                  min_obj_frac: float = 0.01):
     """Build a boolean tissue mask via multi-Otsu thresholding.
 
-    1. 3-class Otsu → labels for true BG, mic BG, tissue.
-    2. Bimodal check → fall back to 2-class Otsu if only 2 real modes.
+    1. 3-class Otsu -> labels for true BG, mic BG, tissue.
+    2. Bimodal check -> fall back to 2-class Otsu if only 2 real modes.
     3. Trimodal: tissue = brightest class; bimodal: tissue = above threshold.
     4. Border-connected BG removal fills interior vessel holes.
     5. Morphological cleanup (fill holes, remove specks).
@@ -136,7 +136,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
     lbl3, (idx_bg, idx_mid, idx_tis), thr3 = multiotsu_split(
         gray, classes=3, blur_sigma=sigma, report_path=report_path)
 
-    # Step 3: bimodal/trimodal decision → initial binary mask
+    # Step 3: bimodal/trimodal decision -> initial binary mask
     means = [float(gray[lbl3 == i].mean()) if np.any(lbl3 == i)
              else 0.0 for i in range(3)]
 
@@ -148,12 +148,12 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
             thr2 = float(np.mean(gray)) - 1.0
         m_tis = (gray > thr2)
     elif means[idx_bg] > 10:
-        # Darkest class contains mic BG (mean well above 0) → Otsu lumped
+        # Darkest class contains mic BG (mean well above 0) -> Otsu lumped
         # true BG + mic BG together and split tissue into mid/top.
         # Tissue = mid + top class (everything except darkest).
         m_tis = (lbl3 != idx_bg)
     else:
-        # Darkest class is pure true BG (near 0) → mid class is mic BG.
+        # Darkest class is pure true BG (near 0) -> mid class is mic BG.
         # Tissue = top class only.
         m_tis = (lbl3 == idx_tis)
 
@@ -180,7 +180,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
         border_ids.discard(0)
         m_tis = ~np.isin(bg_labeled, list(border_ids))
 
-    # Step 5: morphological cleanup (no median — it erodes boundaries)
+    # Step 5: morphological cleanup (no median - it erodes boundaries)
     return _morphological_cleanup(m_tis, dim, area, 0.0,
                                   hole_area_frac, min_obj_frac)
 
@@ -657,7 +657,7 @@ def lobule_miou(
     """Mean IoU of matched lobule instances (greedy best-match per GT lobule).
 
     For lobules that touch the tissue boundary the comparison is restricted to
-    *interior* pixels — those at least *tissue_margin_px* away from the tissue
+    *interior* pixels - those at least *tissue_margin_px* away from the tissue
     edge. Tissue-boundary pixels are excluded because their assignment to a
     lobule is determined by where the tissue happens to end, not by real lobule
     structure, so including them penalises otherwise correct predictions.
@@ -727,7 +727,7 @@ def lobule_miou(
         if interior_mask is not None:
             gt_eval = gt_r & interior_mask
             if gt_eval.sum() < min_interior_px:
-                # Lobule is almost entirely at the tissue boundary — skip.
+                # Lobule is almost entirely at the tissue boundary - skip.
                 continue
         else:
             gt_eval = gt_r
@@ -791,8 +791,8 @@ def add_napari_controls_dock(
     Default button set (in this exact order)
     ----------------------------------------
       1) Preview/Recalculate
-      2) Confirm Current View      — uses last previewed result
-      3) Apply Slider Values & Continue — applies current slider values (even if not previewed)
+      2) Confirm Current View      - uses last previewed result
+      3) Apply Slider Values & Continue - applies current slider values (even if not previewed)
       4) Back
       5) Reset Parameters
       6) Abort
@@ -951,8 +951,8 @@ def run_napari_preview_action(
     - Runs napari event loop
     - Returns action in {"confirm","apply_values","back","abort","closed"}
 
-    "confirm"      — user accepted the last previewed result (current view).
-    "apply_values" — user wants to apply current slider values even if not
+    "confirm"      - user accepted the last previewed result (current view).
+    "apply_values" - user wants to apply current slider values even if not
                      previewed via Recalculate.
 
     Closing the viewer without pressing a button maps to:

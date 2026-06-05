@@ -3,9 +3,9 @@
 Computes a continuous portality value for each pixel inside segmented lobule
 instances. Values are in [0, 1] where:
 
-- 0.0  — portal vessels and instance boundaries
-- 1.0  — central veins
-- NaN  — outside any instance
+- 0.0  - portal vessels and instance boundaries
+- 1.0  - central veins
+- NaN  - outside any instance
 
 The formula is ``P = d_PB / (d_PB + d_CV)`` where *PB* is the union of
 portal vessels and the instance boundary, and *d* denotes the Euclidean
@@ -40,13 +40,13 @@ def _find_cv_seed(
 
     Tries three strategies in order:
 
-    1. **PV-stain intensity peak** — the smoothed maximum of *pv_stain* inside
+    1. **PV-stain intensity peak** - the smoothed maximum of *pv_stain* inside
        *region*. A central vein typically appears bright in the PV channel.
        Skipped when *pv_stain* is ``None`` or the stain is nearly flat.
-    2. **Furthest-from-portal-boundary pixel** — the point inside *region* with
+    2. **Furthest-from-portal-boundary pixel** - the point inside *region* with
        the maximum Euclidean distance to *pb* (the portal boundary). This is
        the geometric centre of the lobule, equivalent to the medial axis peak.
-    3. **Centroid** — a single pixel at the region centroid, used only when both
+    3. **Centroid** - a single pixel at the region centroid, used only when both
        strategies above yield an empty set (degenerate region).
 
     Parameters

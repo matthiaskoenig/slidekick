@@ -157,7 +157,7 @@ def _find_intensity_cluster_seeds(
     edge_zone = tissue_boundary_dist < peak_min_dist
 
     # Optional: CV-distance info for zone-aware threshold and combined NMS score.
-    # cv_far = fg pixels far from any CV and not in the tissue edge zone — the
+    # cv_far = fg pixels far from any CV and not in the tissue edge zone - the
     # territory where CV-dropout lobules live and where the brightness threshold
     # must be relaxed to detect their weak PV peak.
     cv_dist_f: np.ndarray | None = None
@@ -197,10 +197,10 @@ def _find_intensity_cluster_seeds(
             ((blurred > thr_edge) & edge_zone)
         )
 
-    # Step 3: NMS — sort by combined score, suppress nearby duplicates.
+    # Step 3: NMS - sort by combined score, suppress nearby duplicates.
     # When cv_dist_map is available, weight brightness by distance from the
     # nearest CV so that a well-centred (far-from-CV) peak beats a slightly
-    # brighter but CV-adjacent peak — better coverage of unclaimed territory.
+    # brighter but CV-adjacent peak - better coverage of unclaimed territory.
     ys, xs = np.where(peaks)
     if len(ys) == 0:
         return []
@@ -279,7 +279,7 @@ def _seeds_from_cv_mask(
     outer ring always extends *seed_tissue_ring* pixels into the surrounding
     tissue, regardless of CV size.  This guarantees that some marker pixels are
     in the foreground (tissue & ~vessel_holes), giving the watershed a proper
-    low-inverted-PV starting point — identical in spirit to the intensity-peak
+    low-inverted-PV starting point - identical in spirit to the intensity-peak
     seeds that worked well before.  Seeding entirely inside the vessel lumen
     (where inverted PV is high) caused hg.WeightFunction.max to flatten the
     cost landscape and degraded boundary quality.
@@ -317,7 +317,7 @@ def _seeds_from_cv_mask(
 
         # Inscribed-circle centre via distance-transform maximum.
         # For a perfect circle this equals the centroid; for elongated or
-        # irregular lumens it is the most interior point — geometrically the
+        # irregular lumens it is the most interior point - geometrically the
         # true centre of the lumen, which is what the watershed needs as its
         # anchor so that portality flows outward from the correct origin.
         comp_mask = (labeled_cv == comp_id)
@@ -353,18 +353,18 @@ def _merge_below_valley(
     """Merge adjacent lobule pairs that share no real PV valley on their boundary.
 
     Two adjacent labelled regions A and B are merged when the minimum smoothed-PV
-    value along their shared pixel interface is >= *valley_thr* — meaning no dark
+    value along their shared pixel interface is >= *valley_thr* - meaning no dark
     inter-lobule region separates them, so they are most likely one lobule that was
     over-segmented.
 
     **Protected pairs** (both labels contain a CV): protected labels are normally
     skipped to avoid merging correctly-seeded lobules.  Exception: when *pp_smooth*
     is provided and the maximum PP signal along the shared boundary is below
-    *pp_thr*, both PV and PP agree there is no portal tract — the pair is a fused
+    *pp_thr*, both PV and PP agree there is no portal tract - the pair is a fused
     super-lobule and is merged.  This catches the synthetic fusion case where two
     CVs belong to one biological unit.
 
-    Uses union-find for transitive merging (A+B and B+C → A+B+C).
+    Uses union-find for transitive merging (A+B and B+C -> A+B+C).
 
     Parameters
     ----------
@@ -426,7 +426,7 @@ def _merge_below_valley(
             pp_b = pp_smooth[dy:, dx:]
             pp_bnd = np.maximum(pp_a[bnd], pp_b[bnd])
 
-        # Canonicalise pair (a <= b) → unique int64 code
+        # Canonicalise pair (a <= b) -> unique int64 code
         swap          = la_b > lb_b
         la_b[swap], lb_b[swap] = lb_b[swap].copy(), la_b[swap].copy()
         codes         = la_b * max_id + lb_b
@@ -476,14 +476,14 @@ def _merge_below_valley(
             b = int(code % max_id)
             if protected_labels and (a in protected_labels or b in protected_labels):
                 # Protected (CV-seeded) pair: only merge when PP also confirms
-                # absence of a portal tract → fused super-lobule.
+                # absence of a portal tract -> fused super-lobule.
                 if pp_smooth is not None:
                     max_pp = pair_max_pp.get(code, 1.0)
                     if max_pp >= pp_thr:
-                        continue   # PP-bright boundary → real portal tract → keep separate
-                    # Both PV (no valley) and PP (no portal tract) agree → merge
+                        continue   # PP-bright boundary -> real portal tract -> keep separate
+                    # Both PV (no valley) and PP (no portal tract) agree -> merge
                 else:
-                    continue   # no PP channel → keep original protection
+                    continue   # no PP channel -> keep original protection
             if a in parent and b in parent:
                 union(a, b)
 
@@ -510,7 +510,7 @@ def _smooth_labels_valley_aware(
 
     Each label's binary mask is blurred with a Gaussian of radius *sigma*
     pixels. Every fg pixel is then (re-)assigned to the label with the
-    highest blurred score at that location — effectively rounding the
+    highest blurred score at that location - effectively rounding the
     boundary curves.
 
     Pixels that sit on a real intensity valley are **frozen**: they keep
@@ -519,7 +519,7 @@ def _smooth_labels_valley_aware(
     erode into the valley.
 
     When *pp_smooth* is provided, frozen pixels are those where EITHER the PV
-    signal is dark (high *inverted*) OR the PP signal is bright — the element-
+    signal is dark (high *inverted*) OR the PP signal is bright - the element-
     wise maximum of both channels is used.  This prevents boundary smoothing
     from sliding across portal tracts that are visible in PP but not
     (or weakly) visible in PV.
@@ -534,12 +534,12 @@ def _smooth_labels_valley_aware(
     fg : np.ndarray
         Foreground mask (tissue minus vessel holes).
     sigma : float
-        Gaussian smoothing radius in pixels. Larger → rounder boundaries.
+        Gaussian smoothing radius in pixels. Larger -> rounder boundaries.
         0 disables the step entirely.
     valley_pct : float
         Percentile of the combined boundary-evidence distribution above which
         a pixel is frozen. E.g. 75 freezes the top 25 % (strongest boundary
-        evidence).  Lower → more pixels frozen (less smoothing but boundaries
+        evidence).  Lower -> more pixels frozen (less smoothing but boundaries
         faithfully preserved).
     valley_band_px : int
         Dilation radius (px) applied around frozen pixels.  Prevents the
@@ -599,7 +599,7 @@ def _postprocess_labels(labels: np.ndarray, fg: np.ndarray, min_area: int = 1000
 
     Removing a small region and leaving its pixels as 0 silently discards foreground
     area and hurts mIoU.  Instead we assign each removed pixel to the nearest
-    surviving label via the distance transform — equivalent to a nearest-neighbour
+    surviving label via the distance transform - equivalent to a nearest-neighbour
     Voronoi fill on the remaining labels.
 
     Parameters
@@ -642,7 +642,7 @@ def _merge_peakless_lobules(
 
     A lobule "has a peak" when its maximum blob-smoothed PV value (inside fg)
     exceeds the *peak_thresh_pct*-th percentile of all fg blob values.  Peakless
-    lobules are fragments — edge slivers, split artefacts — and are absorbed into
+    lobules are fragments - edge slivers, split artefacts - and are absorbed into
     whichever neighbour they share the most boundary pixels with.
 
     Merging is iterated until every surviving lobule contains a peak.
@@ -652,7 +652,7 @@ def _merge_peakless_lobules(
     labels : np.ndarray (int32)
         Updated label map.
     peak_coords : dict[int, tuple[int, int]]
-        Surviving label id → (row, col) of the brightest fg blob pixel in
+        Surviving label id -> (row, col) of the brightest fg blob pixel in
         that label.  Used by the caller to re-seed the second-pass watershed.
     """
     labels = labels.copy().astype(np.int32)
@@ -709,7 +709,7 @@ def _merge_peakless_lobules(
                 continue                         # absorbed in this round
             nb = counts.get(lid)
             if not nb:
-                continue                         # isolated → left for postprocess
+                continue                         # isolated -> left for postprocess
             best_nb = max(nb, key=nb.__getitem__)
             labels[labels == lid] = best_nb
             changed = True
@@ -741,6 +741,7 @@ def segment_lobules(
     valley_sigma: float = 25.0,
     cluster_merge_sigma: float = 0.0,
     min_area_px: int = 20000,
+    valley_merge_thr_pct: float | None = None,
     boundary_smooth_sigma: float = 31.0,
     boundary_smooth_valley_pct: float = 51.5,
     boundary_smooth_valley_band_px: int = 14,
@@ -751,7 +752,7 @@ def segment_lobules(
         One seed is placed at the centroid of every connected central-vein (CV)
         component.  Intensity peaks (local maxima in the smoothed PV channel)
         are added as fallback seeds only for tissue regions not already covered
-        by a CV seed — suppressed within *peak_min_dist* of any CV pixel.
+        by a CV seed - suppressed within *peak_min_dist* of any CV pixel.
         Without *cv_mask*, only intensity peaks are used (original behaviour).
 
     **Watershed** runs on an inverted masked-Gaussian-smoothed PV field so that
@@ -778,7 +779,7 @@ def segment_lobules(
         (backward-compatible default).
     pp_stain : np.ndarray or None
         Float32 PP-channel intensity image (same extent as *tissue*).
-        Portal tracts stain brightly for PP — combining this with inverted PV
+        Portal tracts stain brightly for PP - combining this with inverted PV
         reinforces inter-lobule boundary edges in the watershed weight map and
         significantly sharpens boundary placement.  When ``None`` only the
         inverted PV is used (backward-compatible default).
@@ -842,7 +843,7 @@ def segment_lobules(
     if cv_mask is not None and cv_mask.any():
         # One seed per CV component; exclude a neighbourhood around each CV
         # from intensity-peak detection so peaks don't duplicate CV seeds.
-        # Distance transform is O(H*W) regardless of peak_min_dist — avoids
+        # Distance transform is O(H*W) regardless of peak_min_dist - avoids
         # the massive kernel that cv2.dilate would need at large peak_min_dist.
         cv_seed_cnts = _seeds_from_cv_mask(cv_mask, tissue)
         _cv_dist = _edt(~cv_mask).astype(np.float32)
@@ -877,7 +878,7 @@ def segment_lobules(
     inverted[~tissue] = mx_val
 
     # ── Edge weights ─────────────────────────────────────────────────────────
-    # Portal tracts are dark in PV (→ high inverted_pv) AND bright in PP.
+    # Portal tracts are dark in PV (-> high inverted_pv) AND bright in PP.
     # Taking the element-wise maximum of both normalised signals gives the
     # strongest available boundary evidence at every pixel.  PP is smoothed at
     # a capped sigma (≤ 20 px) so that narrow portal-tract peaks survive even
@@ -902,7 +903,9 @@ def segment_lobules(
     else:
         edge_map = inverted
 
-    graph = hg.get_4_adjacency_graph((H, W))
+    # 8-adjacency follows diagonal edges more naturally at lobule boundaries,
+    # reducing staircase artefacts vs 4-adjacency.
+    graph = hg.get_8_adjacency_graph((H, W))
     edge_weights = hg.weight_graph(graph, edge_map, hg.WeightFunction.max)
     labels = hg.labelisation_seeded_watershed(graph, edge_weights, markers)
 
@@ -912,7 +915,7 @@ def segment_lobules(
     #
     # Protected labels (CV-seeded) are normally never merged.  Exception: when
     # PP is also dark on the shared boundary, both channels agree there is no
-    # portal tract — the pair is a fused super-lobule and should be merged.
+    # portal tract - the pair is a fused super-lobule and should be merged.
     _protected: frozenset = frozenset()
     if cv_mask is not None and cv_mask.any():
         _cv_dil1 = cv2.dilate(
@@ -925,7 +928,13 @@ def segment_lobules(
     if fg.any():
         _smooth_merge = _masked_smooth(pv_stain, tissue, 8.0)
         try:
-            valley_thr = float(threshold_otsu(_smooth_merge[fg]))
+            # Percentile threshold is more robust than Otsu under residual
+            # shading: it always selects the darkest N% of foreground pixels
+            # as valleys regardless of global intensity level.
+            if valley_merge_thr_pct is not None:
+                valley_thr = float(np.percentile(_smooth_merge[fg], valley_merge_thr_pct))
+            else:
+                valley_thr = float(threshold_otsu(_smooth_merge[fg]))
             labels = _merge_below_valley(
                 labels, _smooth_merge, fg, valley_thr,
                 protected_labels=_protected,
@@ -939,7 +948,7 @@ def segment_lobules(
 
     # ── Peak validation: merge peakless lobules ───────────────────────────────
     # Each genuine lobule has a PV brightness peak (perivenular zone near the CV).
-    # Lobules without a peak are fragments — split artefacts or edge slivers.
+    # Lobules without a peak are fragments - split artefacts or edge slivers.
     # They are absorbed into the neighbour with the longest shared boundary.
     labels, peak_coords = _merge_peakless_lobules(
         labels, smoothed_blob, fg, peak_thresh_pct,
@@ -968,7 +977,7 @@ def segment_lobules(
     # ── Second-pass watershed from confirmed PV peaks ─────────────────────────
     # After the merge the seed set has changed.  Re-seed from the refined PV
     # brightness maxima (inside fg tissue) rather than from the original CV
-    # centroids.  The same PV+PP edge-weight graph is reused — no extra
+    # centroids.  The same PV+PP edge-weight graph is reused - no extra
     # computation.  Every fg pixel is freshly assigned to its nearest confirmed
     # lobule centre through the strongest available boundary landscape.
     if peak_coords:
@@ -984,7 +993,7 @@ def segment_lobules(
     # After the second-pass watershed, small regions that contain no CV pixel
     # are likely boundary artefacts or tissue-edge slivers.  Absorb them into
     # the nearest surviving neighbour (Voronoi fill).  Regions that do contain
-    # a CV are kept unconditionally — removing them would discard a genuine
+    # a CV are kept unconditionally - removing them would discard a genuine
     # lobule seed and leave a gap in the portality map.
     if cv_mask is not None and cv_mask.any():
         _second_ids = np.unique(labels[labels > 0])

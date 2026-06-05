@@ -35,13 +35,13 @@ def load_distributions(npz_path) -> dict:
 
     Returns a plain dict with keys:
 
-    ``hist_counts``       (S, num_bins, n_hist_bins) int64 — raw pixel counts
-    ``hist_edges``        (S, n_hist_bins+1) float32 — intensity bin edges per stain
+    ``hist_counts``       (S, num_bins, n_hist_bins) int64 - raw pixel counts
+    ``hist_edges``        (S, n_hist_bins+1) float32 - intensity bin edges per stain
     ``stain_names``       list[str]
-    ``portality_centers`` (num_bins,) float32 — bin centre portality values
+    ``portality_centers`` (num_bins,) float32 - bin centre portality values
     ``portality_edges``   (num_bins+1,) float32
 
-    Example — reconstruct percentiles for stain 0, portality bin 5::
+    Example - reconstruct percentiles for stain 0, portality bin 5::
 
         d = load_distributions("lobule_statistics/distributions.npz")
         counts = d["hist_counts"][0, 5]           # histogram for (stain0, bin5)
@@ -171,9 +171,9 @@ class LobuleStatistics(BaseOperator):
             if a.shape != (H, W):
                 raise ValueError(f"Shape mismatch for stain[{j}]: {a.shape} vs portality {(H, W)}")
 
-        # ── Build stain_flat (N_valid, S) — skip the (S, H, W) cube ──────────
+        # ── Build stain_flat (N_valid, S) - skip the (S, H, W) cube ──────────
         # Writing each stain directly into a pre-allocated slice avoids the
-        # intermediate (S, H, W) → reshape → transpose chain (≈ 1 extra full
+        # intermediate (S, H, W) -> reshape -> transpose chain (≈ 1 extra full
         # copy of all stain data eliminated).
         mask_flat = valid.ravel()
         N_valid = int(mask_flat.sum())
@@ -197,8 +197,8 @@ class LobuleStatistics(BaseOperator):
             raw_df[name] = stain_flat[:, k] if S else np.empty((0,), dtype=np.float32)
 
         # ── Statistics + plot data in a single pass ───────────────────────────
-        # Replaces: melt → S × N_valid long DataFrame
-        #           groupby.apply(_agg) → 5 separate nanpercentile sorts per group
+        # Replaces: melt -> S × N_valid long DataFrame
+        #           groupby.apply(_agg) -> 5 separate nanpercentile sorts per group
         # New:      one loop over (stain, bin), one np.percentile call per group,
         #           plot data collected in the same pass (no re-groupby for plots).
         stats_rows = []
@@ -278,7 +278,7 @@ class LobuleStatistics(BaseOperator):
         bin_width = float(edges[1] - edges[0]) if edges.size > 1 else 1.0
         width = bin_width * 0.8
 
-        # ── Plot 2: Box plots — pre-computed data, no re-groupby ──────────────
+        # ── Plot 2: Box plots - pre-computed data, no re-groupby ──────────────
         for stain in stain_names:
             bin_indices, data_per_bin = plot_data[stain]
             if bin_indices.size == 0:
@@ -298,7 +298,7 @@ class LobuleStatistics(BaseOperator):
             fig_box.savefig(outdir / f"lobule_stats_boxplot_{_slug(stain)}.png", dpi=150)
             plt.close(fig_box)
 
-        # ── Plot 3: Violin plots — same pre-computed data ─────────────────────
+        # ── Plot 3: Violin plots - same pre-computed data ─────────────────────
         for stain in stain_names:
             bin_indices, data_per_bin = plot_data[stain]
             if bin_indices.size == 0:
@@ -319,7 +319,7 @@ class LobuleStatistics(BaseOperator):
             fig_violin.savefig(outdir / f"lobule_stats_violin_{_slug(stain)}.png", dpi=150)
             plt.close(fig_violin)
 
-        # ── Histogram NPZ — compact substitute for the per-pixel raw CSV ────────
+        # ── Histogram NPZ - compact substitute for the per-pixel raw CSV ────────
         # Per (stain, portality_bin): a fixed-grid count array over intensity.
         # Shape: (S, num_bins, n_hist_bins).  Shared edges per stain so percentiles
         # and violin/boxplot data can be reconstructed exactly from the file alone.
@@ -355,11 +355,11 @@ class LobuleStatistics(BaseOperator):
                 portality_edges  = edges,                # (num_bins+1,)
             )
 
-            # Long-format CSV — one row per (stain, portality_bin, intensity_bin).
+            # Long-format CSV - one row per (stain, portality_bin, intensity_bin).
             # Columns: stain, portality_bin, portality_center,
             #          intensity_left, intensity_right, intensity_center, count.
             # Rows: S × num_bins × n_hist_bins  (e.g. 3×20×200 = 12 000).
-            # Built with numpy tiling — no Python-level loop over rows.
+            # Built with numpy tiling - no Python-level loop over rows.
             hist_dfs = []
             for s_idx, stain_name in enumerate(stain_names):
                 e = hist_edges[s_idx]               # (n_hist_bins+1,)
