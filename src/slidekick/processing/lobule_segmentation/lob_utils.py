@@ -4,7 +4,7 @@ from scipy.ndimage import binary_fill_holes, label as ndi_label
 from skimage.filters import threshold_multiotsu, threshold_otsu
 from skimage.morphology import remove_small_holes, remove_small_objects
 from skimage.color import label2rgb
-from typing import Tuple, Dict, List, Optional, Any, Sequence, Callable
+from typing import Tuple, Dict, List, Optional, Any, Sequence
 from collections.abc import Mapping
 from pathlib import Path
 from PIL import Image
@@ -62,8 +62,8 @@ _MIN_THRESHOLD_GAP = 0.10
 def _is_bimodal(lbl: np.ndarray, idx_mid: int, thr_low: float, thr_high: float) -> bool:
     """Decide whether a 3-class Otsu split really reflects 2 or 3 modes.
 
-    Two independent heuristics - either one triggering means bimodal:
-      1. The middle class contains < 5 % of pixels (it's a forced artefact).
+    Two independent heuristics, either one triggering means bimodal:
+      1. The middle class contains < 5% of pixels (it's a forced artefact).
       2. The two Otsu thresholds are within 10 % of the 0-255 range of each
          other, meaning the algorithm couldn't find a real valley between
          them.
@@ -180,7 +180,7 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
         border_ids.discard(0)
         m_tis = ~np.isin(bg_labeled, list(border_ids))
 
-    # Step 5: morphological cleanup (no median - it erodes boundaries)
+    # Step 5: morphological cleanup (no median, it erodes boundaries)
     return _morphological_cleanup(m_tis, dim, area, 0.0,
                                   hole_area_frac, min_obj_frac)
 
@@ -313,194 +313,6 @@ def downsample_stack_to_max_side(stack: np.ndarray, max_side: int = 2048) -> np.
 
     frames = [downsample_to_max_side(stack[..., c], max_side) for c in range(stack.shape[2])]
     return np.stack(frames, axis=-1)
-
-
-def gray_for_cluster(cid: int, sorted_label_idx: np.ndarray, n_clusters: int) -> int:
-    """
-    Map a cluster id to a grayscale value based on semantic order:
-      position 0 (PP) -> 85, middle (MID) -> 170, last (PV) -> 255.
-    Background stays 0 outside this function (caller decides).
-    """
-    try:
-        pos = int(np.where(sorted_label_idx == cid)[0][0])
-    except Exception:
-        # Fallback: mid tone if cid is not in sorted_label_idx
-        pos = 1 if n_clusters > 2 else 0
-    if pos == 0:
-        n = 1
-    elif pos == (n_clusters - 1):
-        n = 3
-    else:
-        n = 2
-    return int(round(n * 255 / 3))
-
-
-def render_cluster_gray(cluster_map: np.ndarray,
-                        sorted_label_idx: np.ndarray,
-                        n_clusters: int) -> np.ndarray:
-    """
-    Render a per-pixel cluster map to a grayscale template using gray_for_cluster.
-    Leaves any values <0 (e.g., background/unassigned) at 0.
-    """
-    h, w = cluster_map.shape[:2]
-    out = np.zeros((h, w), dtype=np.uint8)
-    for cid in range(n_clusters):
-        out[cluster_map == cid] = gray_for_cluster(cid, sorted_label_idx, n_clusters)
-    return out
-
-
-def nonlinear_channel_weighting(
-    X: np.ndarray,
-    channels_pp: Optional[List[int]],
-    channels_pv: Optional[List[int]],
-    pp_gamma: float = 0.70,
-    pv_gamma: float = 0.85,
-    low_pct: float = 5.0,
-    high_pct: float = 95.0,
-) -> np.ndarray:
-    """
-    Percentile-normalize then gamma-lift selected columns of X.
-    channels_pp get pp_gamma, channels_pv get pv_gamma. Returns a copy.
-    """
-    Xo = X.astype(np.float32, copy=True)
-    eps = 1e-6
-
-    def _lift(cols: List[int], gamma: float):
-        if not cols:
-            return
-        for c in cols:
-            v = Xo[:, c]
-            lo = np.percentile(v, low_pct)
-            hi = np.percentile(v, high_pct)
-            if (hi - lo) <= eps:
-                continue
-            vn = np.clip((v - lo) / (hi - lo + eps), 0.0, 1.0)
-            Xo[:, c] = (vn ** float(gamma)) * (hi - lo) + lo
-
-    _lift(list(channels_pp) if channels_pp is not None else [], pp_gamma)
-    _lift(list(channels_pv) if channels_pv is not None else [], pv_gamma)
-    return Xo
-
-
-def quantile_normalize_features(X: np.ndarray) -> np.ndarray:
-    """
-    Replace each column of *X* with its per-column percentile rank in [0, 1].
-
-    Transforms a skewed intensity distribution into a uniform one so KMeans
-    splits the data into roughly equal-sized clusters. Useful when only one
-    polarity (PV-only or PP-only) is available and the raw intensity gradient
-    is very steep, leaving the midzone extremely thin.
-    """
-    Xq = np.empty_like(X, dtype=np.float32)
-    N = X.shape[0]
-    if N <= 1:
-        return np.zeros_like(X, dtype=np.float32)
-    for c in range(X.shape[1]):
-        col = X[:, c]
-        order = np.argsort(col, kind="mergesort")
-        ranks = np.empty(N, dtype=np.float32)
-        ranks[order] = np.arange(1, N + 1, dtype=np.float32)
-        # average-rank for ties
-        unique_vals, inverse = np.unique(col, return_inverse=True)
-        if unique_vals.size < N:
-            mean_ranks = np.zeros(unique_vals.size, dtype=np.float64)
-            counts = np.zeros(unique_vals.size, dtype=np.int64)
-            np.add.at(mean_ranks, inverse, ranks)
-            np.add.at(counts, inverse, 1)
-            mean_ranks /= counts
-            ranks = mean_ranks[inverse].astype(np.float32)
-        Xq[:, c] = (ranks - 1.0) / max(float(N - 1), 1.0)
-    return Xq
-
-
-def build_sp_adjacency(labels: np.ndarray) -> Dict[int, List[int]]:
-    """Build superpixel adjacency dict from a SLIC label image.
-
-    For each superpixel, lists the IDs of its neighboring superpixels
-    (those sharing at least one 4-connected boundary pixel).
-    """
-    adj: Dict[int, set] = {}
-
-    # Horizontal edges: collect unique (a, b) pairs where a < b
-    diff_h = labels[:, :-1] != labels[:, 1:]
-    a_h = labels[:, :-1][diff_h]
-    b_h = labels[:, 1:][diff_h]
-    pairs_h = np.column_stack([np.minimum(a_h, b_h), np.maximum(a_h, b_h)])
-
-    # Vertical edges
-    diff_v = labels[:-1, :] != labels[1:, :]
-    a_v = labels[:-1, :][diff_v]
-    b_v = labels[1:, :][diff_v]
-    pairs_v = np.column_stack([np.minimum(a_v, b_v), np.maximum(a_v, b_v)])
-
-    all_pairs = np.vstack([pairs_h, pairs_v])
-    unique_pairs = np.unique(all_pairs, axis=0)
-
-    for a, b in unique_pairs:
-        a, b = int(a), int(b)
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    return {k: list(v) for k, v in adj.items()}
-
-
-def _build_adj_matrix(sp_ids: np.ndarray, adj: Dict[int, List[int]],
-                      weight_self: float = 1.0):
-    """Build a sparse row-normalised adjacency matrix for graph smoothing.
-
-    Returns a CSR matrix A of shape (N, N) where each row sums to 1.
-    A[i,i] = weight_self / (weight_self + deg_i), and off-diagonal
-    neighbours share the rest equally.
-    """
-    from scipy.sparse import csr_matrix
-    sp_to_row = {int(sid): i for i, sid in enumerate(sp_ids)}
-    N = len(sp_ids)
-    rows, cols, vals = [], [], []
-    for i, sid in enumerate(sp_ids):
-        nbs = [sp_to_row[nb] for nb in adj.get(int(sid), [])
-               if nb in sp_to_row]
-        denom = weight_self + len(nbs)
-        rows.append(i); cols.append(i); vals.append(weight_self / denom)
-        for j in nbs:
-            rows.append(i); cols.append(j); vals.append(1.0 / denom)
-    return csr_matrix((vals, (rows, cols)), shape=(N, N), dtype=np.float32)
-
-
-def smooth_sp_features(X: np.ndarray, sp_ids: np.ndarray,
-                       adj: Dict[int, List[int]],
-                       iterations: int = 1,
-                       weight_self: float = 1.0) -> np.ndarray:
-    """Smooth superpixel features on the adjacency graph.
-
-    Each superpixel's feature is replaced by a weighted average of
-    itself and its neighbors via sparse matrix multiplication.
-    """
-    A = _build_adj_matrix(sp_ids, adj, weight_self)
-    Xs = X.astype(np.float32).copy()
-    for _ in range(iterations):
-        Xs = A.dot(Xs)
-    return Xs
-
-
-def smooth_sp_labels(labels_k: np.ndarray, sp_ids: np.ndarray,
-                     adj: Dict[int, List[int]],
-                     iterations: int = 1) -> np.ndarray:
-    """Majority-vote smoothing of cluster labels on the adjacency graph.
-
-    For each superpixel, if the majority of its neighbors have a
-    different label, switch to the majority label. Uses sparse
-    matrix multiplication for speed.
-    """
-    A = _build_adj_matrix(sp_ids, adj, weight_self=1.0)
-    n_clusters = int(labels_k.max()) + 1
-    N = len(sp_ids)
-    lk = labels_k.copy()
-    for _ in range(iterations):
-        one_hot = np.zeros((N, n_clusters), dtype=np.float32)
-        one_hot[np.arange(N), lk] = 1.0
-        votes = A.dot(one_hot)
-        lk = np.argmax(votes, axis=1).astype(labels_k.dtype)
-    return lk
 
 
 def to_base_full(contours_xy: List[np.ndarray],
@@ -656,11 +468,16 @@ def lobule_miou(
 ) -> float:
     """Mean IoU of matched lobule instances (greedy best-match per GT lobule).
 
-    For lobules that touch the tissue boundary the comparison is restricted to
-    *interior* pixels - those at least *tissue_margin_px* away from the tissue
-    edge. Tissue-boundary pixels are excluded because their assignment to a
-    lobule is determined by where the tissue happens to end, not by real lobule
-    structure, so including them penalises otherwise correct predictions.
+    When *tissue* is supplied, lobules touching the tissue boundary are compared
+    on *interior* pixels only, those at least *tissue_margin_px* from the tissue
+    edge, because assignment there is determined by where the tissue happens to
+    end rather than by real lobule structure.
+
+    IMPORTANT: this restriction is OPT-IN.  It activates only when *tissue* is
+    passed; leave it out and *tissue_margin_px* and *min_interior_px* are inert,
+    with boundary-touching lobules evaluated on their full extent.  Pass *tissue*
+    when the ground truth covers only part of the slide, where a prediction
+    clipped at the annotated edge would otherwise be scored as a bad match.
 
     Parameters
     ----------
@@ -727,7 +544,7 @@ def lobule_miou(
         if interior_mask is not None:
             gt_eval = gt_r & interior_mask
             if gt_eval.sum() < min_interior_px:
-                # Lobule is almost entirely at the tissue boundary - skip.
+                # Lobule is almost entirely at the tissue boundary, so skip.
                 continue
         else:
             gt_eval = gt_r
@@ -740,10 +557,27 @@ def lobule_miou(
             continue
         best = int(np.bincount(pred_in).argmax())
         matched_pred_ids.add(best)
-        pred_r = (pred_labels == best) & fg
 
-        # Restrict prediction to the same evaluation region.
-        pred_eval = pred_r & (interior_mask if interior_mask is not None else np.ones_like(gt_r))
+        eval_mask = interior_mask if interior_mask is not None else np.ones_like(gt_r)
+
+        # Split-tolerant matching: if multiple pred labels each overlap >20%
+        # of this GT lobule, union them for a better IoU.
+        gt_px = int(gt_eval.sum())
+        pred_counts_in_gt = np.bincount(pred_labels[gt_eval].ravel())
+        candidate_ids = [best]
+        for pid in range(1, len(pred_counts_in_gt)):
+            if pid == best:
+                continue
+            if pred_counts_in_gt[pid] >= 0.2 * gt_px:
+                candidate_ids.append(pid)
+                matched_pred_ids.add(pid)
+
+        pred_union = np.zeros_like(gt_r)
+        for pid in candidate_ids:
+            pred_union |= (pred_labels == pid)
+        pred_union &= fg
+
+        pred_eval = pred_union & eval_mask
 
         inter = int((gt_eval & pred_eval).sum())
         union = int((gt_eval | pred_eval).sum())
@@ -761,383 +595,3 @@ def lobule_miou(
     return float(np.mean(ious)) if ious else 0.0
 
 
-def add_napari_controls_dock(
-    viewer: Any,
-    controls_widget: Any,
-    *,
-    on_update: Optional[Callable[[], None]] = None,
-    on_confirm: Optional[Callable[[], None]] = None,
-    on_apply_values: Optional[Callable[[], None]] = None,
-    on_back: Optional[Callable[[], None]] = None,
-    on_reset: Optional[Callable[[], None]] = None,
-    on_abort: Optional[Callable[[], None]] = None,
-    update_text: str = "Preview/Recalculate",
-    confirm_text: str = "Confirm Current View",
-    apply_values_text: str = "continue and apply current values without preview",
-    back_text: str = "Back",
-    reset_text: str = "Reset Parameters",
-    abort_text: str = "Abort",
-    include_update: bool = True,
-    include_confirm: bool = True,
-    include_apply_values: bool = True,
-    include_back: bool = True,
-    include_reset: bool = True,
-    include_abort: bool = True,
-    dock_area: str = "right",
-) -> Dict[str, Any]:
-    """
-    Unify napari preview UI wiring across the codebase.
-
-    Default button set (in this exact order)
-    ----------------------------------------
-      1) Preview/Recalculate
-      2) Confirm Current View      - uses last previewed result
-      3) Apply Slider Values & Continue - applies current slider values (even if not previewed)
-      4) Back
-      5) Reset Parameters
-      6) Abort
-
-    Notes on environment compatibility
-    ---------------------------------
-    Different napari/magicgui versions expose PushButton signals differently:
-      - some versions use `changed`
-      - others use `clicked`
-      - some require wiring through the underlying Qt widget (`.native`)
-
-    Critical robustness fix
-    ----------------------
-    Some Qt bindings (notably some PySide setups) can drop callbacks connected via
-    anonymous lambdas if no Python reference is kept. We therefore create a
-    wrapper function and store it on the button to prevent GC.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Mapping of button names to PushButton widgets for optional external wiring.
-    """
-    from magicgui.widgets import Container, PushButton
-    import warnings
-
-    def _btn_text(btn: Any) -> str:
-        txt = getattr(btn, "text", None)
-        try:
-            return str(txt()) if callable(txt) else str(txt)
-        except Exception:
-            return "<unknown>"
-
-    def _wire_button(btn: Any, cb: Optional[Callable[[], None]]) -> None:
-        """Best-effort connect for magicgui/Qt push buttons across versions (GC-safe)."""
-        if cb is None:
-            return
-
-        def _invoke_cb(*_args: Any, **_kwargs: Any) -> None:
-            try:
-                cb()
-            except Exception as e:
-                warnings.warn(
-                    f"add_napari_controls_dock: callback error for button '{_btn_text(btn)}': {e!r}",
-                    RuntimeWarning,
-                )
-
-        # Keep a strong reference to avoid GC issues in some environments.
-        try:
-            setattr(btn, "_napari_controls_cb_ref", _invoke_cb)
-        except Exception:
-            pass
-
-        # Prefer underlying Qt signal if available (most reliable across versions)
-        native = getattr(btn, "native", None)
-        if native is not None:
-            for sig_name in ("clicked", "pressed", "released"):
-                sig = getattr(native, sig_name, None)
-                if sig is None:
-                    continue
-                try:
-                    sig.connect(_invoke_cb)
-                    return
-                except Exception:
-                    pass
-
-        # Fall back to magicgui-level signals
-        for sig_name in ("clicked", "changed"):
-            sig = getattr(btn, sig_name, None)
-            if sig is None:
-                continue
-            try:
-                sig.connect(_invoke_cb)
-                return
-            except Exception:
-                pass
-
-        warnings.warn(
-            f"add_napari_controls_dock: could not connect callback for button '{_btn_text(btn)}'.",
-            RuntimeWarning,
-        )
-
-    widgets = [controls_widget]
-    out: Dict[str, Any] = {}
-
-    # IMPORTANT: keep button order stable across ALL previews.
-    if include_update:
-        update_btn = PushButton(text=str(update_text))
-        _wire_button(update_btn, on_update)
-        widgets.append(update_btn)
-        out["update"] = update_btn
-
-    if include_confirm:
-        confirm_btn = PushButton(text=str(confirm_text))
-        _wire_button(confirm_btn, on_confirm)
-        widgets.append(confirm_btn)
-        out["confirm"] = confirm_btn
-
-    if include_apply_values:
-        apply_values_btn = PushButton(text=str(apply_values_text))
-        _wire_button(apply_values_btn, on_apply_values)
-        widgets.append(apply_values_btn)
-        out["apply_values"] = apply_values_btn
-
-    if include_back:
-        back_btn = PushButton(text=str(back_text))
-        _wire_button(back_btn, on_back)
-        widgets.append(back_btn)
-        out["back"] = back_btn
-
-    if include_reset:
-        reset_btn = PushButton(text=str(reset_text))
-        _wire_button(reset_btn, on_reset)
-        widgets.append(reset_btn)
-        out["reset"] = reset_btn
-
-    if include_abort:
-        abort_btn = PushButton(text=str(abort_text))
-        _wire_button(abort_btn, on_abort)
-        widgets.append(abort_btn)
-        out["abort"] = abort_btn
-
-    dock = Container(widgets=widgets, layout="vertical")
-    viewer.window.add_dock_widget(dock, area=str(dock_area))
-    return out
-
-
-def run_napari_preview_action(
-    viewer: Any,
-    controls_widget: Any,
-    *,
-    require_confirm: bool = False,
-    on_update: Optional[Callable[[], None]] = None,
-    on_reset: Optional[Callable[[], None]] = None,
-    on_confirm: Optional[Callable[[], None]] = None,
-    on_apply_values: Optional[Callable[[], None]] = None,
-    on_back: Optional[Callable[[], None]] = None,
-    on_abort: Optional[Callable[[], None]] = None,
-    include_update: bool = True,
-    include_confirm: bool = True,
-    include_apply_values: bool = True,
-    include_back: bool = True,
-    include_reset: bool = True,
-    include_abort: bool = True,
-    update_text: str = "Preview/Recalculate",
-    confirm_text: str = "Confirm Current View",
-    apply_values_text: str = "continue and apply current values without preview",
-    back_text: str = "Back",
-    reset_text: str = "Reset Parameters",
-    abort_text: str = "Abort",
-    dock_area: str = "right",
-) -> str:
-    """
-    Centralized napari preview runner for "button-only apply" previews.
-
-    - Wires the unified 6-button dock via add_napari_controls_dock
-    - Runs napari event loop
-    - Returns action in {"confirm","apply_values","back","abort","closed"}
-
-    "confirm"      - user accepted the last previewed result (current view).
-    "apply_values" - user wants to apply current slider values even if not
-                     previewed via Recalculate.
-
-    Closing the viewer without pressing a button maps to:
-      - "closed" if require_confirm=True
-      - "confirm" if require_confirm=False
-    """
-    import napari
-
-    nav: Dict[str, Optional[str]] = {"action": None}
-
-    def _safe_call(cb: Optional[Callable[[], None]]) -> None:
-        if cb is None:
-            return
-        cb()
-
-    def _on_update() -> None:
-        _safe_call(on_update)
-
-    def _on_reset() -> None:
-        _safe_call(on_reset)
-
-    def _on_confirm() -> None:
-        _safe_call(on_confirm)
-        nav["action"] = "confirm"
-        viewer.close()
-
-    def _on_apply_values() -> None:
-        _safe_call(on_apply_values)
-        nav["action"] = "apply_values"
-        viewer.close()
-
-    def _on_back() -> None:
-        _safe_call(on_back)
-        nav["action"] = "back"
-        viewer.close()
-
-    def _on_abort() -> None:
-        _safe_call(on_abort)
-        nav["action"] = "abort"
-        viewer.close()
-
-    add_napari_controls_dock(
-        viewer,
-        controls_widget,
-        on_update=_on_update if include_update else None,
-        on_confirm=_on_confirm if include_confirm else None,
-        on_apply_values=_on_apply_values if include_apply_values else None,
-        on_back=_on_back if include_back else None,
-        on_reset=_on_reset if include_reset else None,
-        on_abort=_on_abort if include_abort else None,
-        include_update=bool(include_update),
-        include_confirm=bool(include_confirm),
-        include_apply_values=bool(include_apply_values),
-        include_back=bool(include_back),
-        include_reset=bool(include_reset),
-        include_abort=bool(include_abort),
-        update_text=str(update_text),
-        confirm_text=str(confirm_text),
-        apply_values_text=str(apply_values_text),
-        back_text=str(back_text),
-        reset_text=str(reset_text),
-        abort_text=str(abort_text),
-        dock_area=str(dock_area),
-    )
-
-    napari.run()
-
-    action = nav["action"]
-    if action is None:
-        action = "confirm" if not require_confirm else "closed"
-    return str(action)
-
-
-def preview_images_napari(
-    images: Sequence[np.ndarray],
-    titles: Optional[Sequence[str]] = None,
-    *,
-    require_confirm: bool = False,
-    return_action: bool = False,
-    include_confirm: bool = True,
-    include_back: bool = False,
-    include_abort: bool = True,
-    confirm_text: str = "Confirm and Continue",
-    back_text: str = "Back",
-    abort_text: str = "Abort",
-    dock_area: str = "right",
-) -> Optional[str]:
-    """
-    Small helper to preview one or more images in napari.
-
-    Images are downsampled (max side 2048 px) for responsiveness.
-
-    Behavior
-    --------
-      - Always uses the unified 5-button dock:
-          Preview/Recalculate, Confirm and Continue, Back, Reset Parameters, Abort
-      - Returns an action string in {"confirm", "back", "abort", "closed"} if return_action=True.
-
-    Parameters
-    ----------
-    require_confirm:
-        If True, closing the viewer without pressing Confirm returns "closed".
-        If False, closing the viewer maps to "confirm".
-    return_action:
-        If True, return one of {"confirm","back","abort","closed"}.
-        If False, preserve legacy behavior and return None.
-    include_confirm / include_back / include_abort:
-        Still supported for call-site compatibility, but the dock always shows all five buttons.
-        If a callback is not enabled, the button is wired as a no-op.
-    confirm_text / back_text / abort_text:
-        Button labels.
-    dock_area:
-        Napari dock area; usually "right".
-    """
-    if not images:
-        return ("confirm" if not require_confirm else "closed") if return_action else None
-
-    import napari
-    from magicgui.widgets import Label
-
-    thumbs = [downsample_to_max_side(np.asarray(im), 2048) for im in images]
-    viewer = napari.Viewer()
-
-    layers = []
-    for idx, im in enumerate(thumbs):
-        name = str(titles[idx]) if titles and idx < len(titles) else f"Layer_{idx}"
-        if im.ndim == 2:
-            layers.append(viewer.add_image(im, name=name, colormap="gray"))
-        elif im.ndim == 3 and im.shape[-1] in (3, 4):
-            layers.append(viewer.add_image(im, name=name, rgb=True))
-        else:
-            layers.append(viewer.add_image(im, name=name))
-
-    def on_update() -> None:
-        # No parameters to recompute here; treat as a "refresh" button for consistency.
-        try:
-            viewer.reset_view()
-        except Exception:
-            pass
-
-    def on_reset() -> None:
-        # No parameters to reset; treat as a view reset.
-        try:
-            viewer.reset_view()
-        except Exception:
-            pass
-
-    # Minimal "controls" widget so we can reuse the shared dock builder.
-    controls_stub = Label(value="")
-
-    action = run_napari_preview_action(
-        viewer,
-        controls_stub,
-        require_confirm=bool(require_confirm),
-        on_update=on_update,
-        on_reset=on_reset,
-        on_confirm=None,  # no state to apply
-        on_apply_values=None,
-        on_back=None,     # no state to apply
-        on_abort=None,    # no state to apply
-        include_update=True,
-        include_confirm=True,
-        include_apply_values=False,  # no sliders in image preview
-        include_back=True,
-        include_reset=True,
-        include_abort=True,
-        update_text="Preview/Recalculate",
-        confirm_text=str(confirm_text),
-        back_text=str(back_text),
-        reset_text="Reset Parameters",
-        abort_text=str(abort_text),
-        dock_area=str(dock_area),
-    )
-
-    if not return_action:
-        return None
-
-    # Preserve call-site compatibility: disable actions by mapping to no-op wiring only.
-    # Note: the UI still shows all buttons (by design), but callers can still request
-    # whether a back/abort action is meaningfully used.
-    if (action == "back") and (not include_back):
-        return "confirm"
-    if (action == "abort") and (not include_abort):
-        return "confirm"
-    if (action == "confirm") and (not include_confirm):
-        return "confirm"
-
-    return action

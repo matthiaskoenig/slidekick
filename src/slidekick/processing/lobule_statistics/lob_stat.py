@@ -81,7 +81,7 @@ class LobuleStatistics(BaseOperator):
     n_hist_bins : int, optional
         Number of intensity bins for the per-portality-bin histograms saved in
         ``distributions.npz`` (default 200).  These histograms replace the old
-        per-pixel raw CSV: they are compact (≈ 50 KB for 3 stains × 20 bins),
+        per-pixel raw CSV: they are compact ( approx.  50 KB for 3 stains × 20 bins),
         allow exact violin/boxplot reproduction, and support arbitrary percentile
         queries without reprocessing the image.
     write_raw_csv : bool, optional
@@ -101,7 +101,26 @@ class LobuleStatistics(BaseOperator):
         write_raw_csv: bool = False,
     ) -> None:
         self.portality_meta = portality_meta
-        self.stain_metas = stain_metas
+        # Flatten one level of nesting. Several examples pass a list OF LISTS -
+        # [metadatas_separated[0][1:-1], metadatas_separated[1][1:]] - which used
+        # to be accepted here silently and then fail deep inside apply() with
+        # "Metadata must be an instance of Metadata class", AFTER the whole
+        # segmentation had already been computed and written. Failing here, with
+        # the actual problem named, costs seconds instead of a full run.
+        flat = []
+        for item in (stain_metas if isinstance(stain_metas, (list, tuple))
+                     else [stain_metas]):
+            if isinstance(item, (list, tuple)):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        bad = [i for i, m in enumerate(flat) if not isinstance(m, Metadata)]
+        if bad:
+            raise TypeError(
+                f"stain_metas must contain Metadata objects; entries {bad} are "
+                f"{[type(flat[i]).__name__ for i in bad]}. Pass a flat sequence "
+                f"of Metadata (nested lists are flattened automatically).")
+        self.stain_metas = flat
         self.num_bins = int(num_bins)
         self.base_level = int(base_level)
         self.out_subdir = str(out_subdir)
@@ -125,14 +144,14 @@ class LobuleStatistics(BaseOperator):
             count, mean, std, min, max, p01, p10, p50, p90, p99,
             portality_left, portality_right, portality_center.
         """
-        # ── Load images ──────────────────────────────────────────────────────
+        # -- Load images ------------------------------------------------------
         portality = self.load_image(0)[self.base_level]
         stain_list = [self.load_image(i + 1)[self.base_level] for i in range(len(self.stain_metas))]
 
         outdir = Path(OUTPUT_PATH) / self.out_subdir
         outdir.mkdir(parents=True, exist_ok=True)
 
-        # ── Valid mask & portality binning ────────────────────────────────────
+        # -- Valid mask & portality binning ------------------------------------
         p = np.asarray(portality, dtype=np.float32)
         valid = np.isfinite(p)
 
@@ -149,7 +168,7 @@ class LobuleStatistics(BaseOperator):
         np.minimum(bin_idx, len(edges) - 2, out=bin_idx)
         np.maximum(bin_idx, 0, out=bin_idx)
 
-        # ── Stain column names ────────────────────────────────────────────────
+        # -- Stain column names ------------------------------------------------
         stain_names: List[str] = []
         for i, m in enumerate(self.stain_metas):
             for key in ("label", "name", "stain", "channel_name"):
@@ -161,7 +180,7 @@ class LobuleStatistics(BaseOperator):
             else:
                 stain_names.append(f"stain_{i}")
 
-        # ── Normalise and validate stain shapes ───────────────────────────────
+        # -- Normalise and validate stain shapes -------------------------------
         portality_arr = _as_gray_f32(portality, "portality")
         H, W = portality_arr.shape
         del portality_arr           # no longer needed
@@ -171,9 +190,9 @@ class LobuleStatistics(BaseOperator):
             if a.shape != (H, W):
                 raise ValueError(f"Shape mismatch for stain[{j}]: {a.shape} vs portality {(H, W)}")
 
-        # ── Build stain_flat (N_valid, S) - skip the (S, H, W) cube ──────────
+        # -- Build stain_flat (N_valid, S) - skip the (S, H, W) cube ----------
         # Writing each stain directly into a pre-allocated slice avoids the
-        # intermediate (S, H, W) -> reshape -> transpose chain (≈ 1 extra full
+        # intermediate (S, H, W) -> reshape -> transpose chain ( approx.  1 extra full
         # copy of all stain data eliminated).
         mask_flat = valid.ravel()
         N_valid = int(mask_flat.sum())
@@ -188,7 +207,7 @@ class LobuleStatistics(BaseOperator):
             stain_flat = np.empty((N_valid, 0), dtype=np.float32)
         del stain_list              # free per-stain full-res arrays
 
-        # ── raw_df ────────────────────────────────────────────────────────────
+        # -- raw_df ------------------------------------------------------------
         raw_df = pd.DataFrame({
             "portality": xc.astype(np.float32, copy=False),
             "bin": bin_idx.astype(np.int16, copy=False),
@@ -196,7 +215,7 @@ class LobuleStatistics(BaseOperator):
         for k, name in enumerate(stain_names):
             raw_df[name] = stain_flat[:, k] if S else np.empty((0,), dtype=np.float32)
 
-        # ── Statistics + plot data in a single pass ───────────────────────────
+        # -- Statistics + plot data in a single pass ---------------------------
         # Replaces: melt -> S × N_valid long DataFrame
         #           groupby.apply(_agg) -> 5 separate nanpercentile sorts per group
         # New:      one loop over (stain, bin), one np.percentile call per group,
@@ -238,7 +257,7 @@ class LobuleStatistics(BaseOperator):
 
             plot_data[stain_name] = (np.array(bins_present, dtype=int), data_bins)
 
-        # ── summary_df ────────────────────────────────────────────────────────
+        # -- summary_df --------------------------------------------------------
         stats_wide = pd.DataFrame(stats_rows)
 
         bins_df = pd.DataFrame({
@@ -254,7 +273,7 @@ class LobuleStatistics(BaseOperator):
             .reset_index(drop=True)
         )
 
-        # ── Plot 1: Mean ± std per stain ──────────────────────────────────────
+        # -- Plot 1: Mean ± std per stain --------------------------------------
         fig, ax = plt.subplots(figsize=(6.0, 4.0))
         for stain in stain_names:
             df_s = stats_wide[stats_wide["stain"] == stain].merge(bins_df, on="bin", how="left")
@@ -278,7 +297,7 @@ class LobuleStatistics(BaseOperator):
         bin_width = float(edges[1] - edges[0]) if edges.size > 1 else 1.0
         width = bin_width * 0.8
 
-        # ── Plot 2: Box plots - pre-computed data, no re-groupby ──────────────
+        # -- Plot 2: Box plots - pre-computed data, no re-groupby --------------
         for stain in stain_names:
             bin_indices, data_per_bin = plot_data[stain]
             if bin_indices.size == 0:
@@ -298,7 +317,7 @@ class LobuleStatistics(BaseOperator):
             fig_box.savefig(outdir / f"lobule_stats_boxplot_{_slug(stain)}.png", dpi=150)
             plt.close(fig_box)
 
-        # ── Plot 3: Violin plots - same pre-computed data ─────────────────────
+        # -- Plot 3: Violin plots - same pre-computed data ---------------------
         for stain in stain_names:
             bin_indices, data_per_bin = plot_data[stain]
             if bin_indices.size == 0:
@@ -319,7 +338,7 @@ class LobuleStatistics(BaseOperator):
             fig_violin.savefig(outdir / f"lobule_stats_violin_{_slug(stain)}.png", dpi=150)
             plt.close(fig_violin)
 
-        # ── Histogram NPZ - compact substitute for the per-pixel raw CSV ────────
+        # -- Histogram NPZ - compact substitute for the per-pixel raw CSV --------
         # Per (stain, portality_bin): a fixed-grid count array over intensity.
         # Shape: (S, num_bins, n_hist_bins).  Shared edges per stain so percentiles
         # and violin/boxplot data can be reconstructed exactly from the file alone.
@@ -381,7 +400,7 @@ class LobuleStatistics(BaseOperator):
                 outdir / "distributions.csv", index=False
             )
 
-        # ── Write outputs ─────────────────────────────────────────────────────
+        # -- Write outputs -----------------------------------------------------
         if self.write_raw_csv:
             raw_df.to_csv(outdir / "lobule_stats_raw.csv", index=False)
         summary_df.to_csv(outdir / "summarized_stats.csv", index=False)
@@ -411,7 +430,6 @@ if __name__ == "__main__":
         channels_pp=1,
         channels_pv=2,
         base_level=0,
-        region_size=25,
         adaptive_histonorm=True,
     )
 

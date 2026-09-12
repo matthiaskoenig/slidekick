@@ -1,5 +1,5 @@
 """
-Graph-based lobule annotator - supports RGB brightfield and fluorescence.
+Graph-based lobule annotator supporting RGB brightfield and fluorescence.
 
 Data model
 ----------
@@ -10,7 +10,7 @@ The source of truth is a planar graph:
     edge_is_tissue   : (M,)  bool           edge comes from the auto-detected
                                             tissue mask contour
 
-Lobules are NOT drawn as polygons. The graph is passed through
+Lobules are not drawn as polygons. The graph is passed through
 shapely.ops.polygonize at save/rasterization time; every minimal enclosed
 region becomes one face. A face is flagged as "remainder" if more than
 TISSUE_EDGE_FRAC_THRESHOLD of its boundary length lies on tissue edges.
@@ -21,9 +21,9 @@ Its contour is subsampled and injected with edge_is_tissue=True.
 
 Image types
 -----------
-    fluorescence  - multi-channel uint16/float; each channel is colourised
+    fluorescence  : multi-channel uint16/float; each channel is colourised
                     using OME channel colours from the file's metadata.
-    brightfield   - 1-, 3-, or 4-channel uint8; displayed as RGB; tissue mask
+    brightfield   : 1-, 3-, or 4-channel uint8; displayed as RGB; tissue mask
                     built on inverted gray (tissue is dark, background bright).
 
 Auto-detection uses channel count and dtype; override with --image-type.
@@ -85,7 +85,7 @@ from matplotlib.patches import Polygon as MplPolygon
 from matplotlib.collections import LineCollection
 import tifffile
 
-from shapely.geometry import LineString, Polygon as ShPoly, Point
+from shapely.geometry import LineString, Point
 from shapely.ops import polygonize, unary_union
 
 # -- slidekick imports --------------------------------------------------------
@@ -119,7 +119,7 @@ def _to_chw(arr: np.ndarray) -> np.ndarray:
         return arr[np.newaxis]                        # (H, W)   -> (1, H, W)
     if arr.ndim == 3:
         s = arr.shape
-        # (H, W, C): channel-last heuristic - last dim small, both others larger
+        # (H, W, C): channel-last heuristic, last dim small, both others larger
         if s[-1] <= 16 and s[0] > s[-1] and s[1] > s[-1]:
             return np.moveaxis(arr, -1, 0)            # (H, W, C) -> (C, H, W)
         # Already (C, H, W) or ambiguous: leave as-is
@@ -578,8 +578,13 @@ class AnnotationGraph:
                 if p.contains(mp):
                     n_mk += 1
                     q_lvl = lvl if q_lvl is None else max(q_lvl, lvl)
+            # `q_lvl or 1` was wrong: grade 0 ("bad annotation") is falsy, so a
+            # face the annotator explicitly marked bad came back as 1, identical
+            # to an unmarked face, silently discarding every bad-quality mark.
+            # Only an absent marker should default to 1.
             out.append(dict(poly_level=p, is_remainder=is_rem,
-                            frac_tissue=frac_t, quality=q_lvl or 1,
+                            frac_tissue=frac_t,
+                            quality=(1 if q_lvl is None else q_lvl),
                             n_markers=n_mk))
         return out
 
@@ -838,7 +843,7 @@ class LobuleAnnotator:
         self._face_patches = []
         if not force:
             return
-        info = self.graph.heal(tol_full=3.0 * self.scale)
+        self.graph.heal(tol_full=3.0 * self.scale)
         faces = self.graph.extract_faces(scale=self.scale)
         q_hi = q_lo = 0
         for f in faces:
@@ -991,7 +996,6 @@ class LobuleAnnotator:
         ei, _, _, de = self.graph.nearest_edge(x, y, self.scale)
         R = self.snap_radius_level * 1.5
         if vi is not None and dv <= R and (ei is None or dv <= de):
-            sv = self.graph.vertices[vi]
             sc = list(self.current_chain)
             self.graph.remove_vertex(vi)
             self.current_chain = [(c - 1 if c > vi else c)
@@ -1187,7 +1191,7 @@ class LobuleAnnotator:
         if k == "Q":
             self._set_mode("quality" if self.mode != "quality" else "draw"); return
         if k == "H":
-            info = self.graph.heal(tol_full=3.0 * self.scale, verbose=True)
+            self.graph.heal(tol_full=3.0 * self.scale, verbose=True)
             self._end_chain(); self.selected = None
             if self._selection_artist:
                 try: self._selection_artist.remove()
@@ -1341,9 +1345,9 @@ def main():
         sys.exit(1)
 
     print(f"Found {len(files)} image(s) in {data_dir}")
-    ann = LobuleAnnotator(files, level=args.level, snap_radius_px=args.snap,
-                          tissue_channels=tissue_channels,
-                          image_type=args.image_type)
+    LobuleAnnotator(files, level=args.level, snap_radius_px=args.snap,
+                    tissue_channels=tissue_channels,
+                    image_type=args.image_type)
     plt.show()
 
 

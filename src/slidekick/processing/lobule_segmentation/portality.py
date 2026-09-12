@@ -3,17 +3,22 @@
 Computes a continuous portality value for each pixel inside segmented lobule
 instances. Values are in [0, 1] where:
 
-- 0.0  - portal vessels and instance boundaries
-- 1.0  - central veins
-- NaN  - outside any instance
+- 0.0  instance boundaries and the tissue ring around portal vessels
+- 1.0  the tissue ring around central veins
+- NaN  outside any instance, vessel lumens included
 
-The formula is ``P = d_PB / (d_PB + d_CV)`` where *PB* is the union of
-portal vessels and the instance boundary, and *d* denotes the Euclidean
-distance transform.
+The axis runs surface to surface, not lumen to lumen: a vessel lumen contains no
+tissue, so it has no zonation value and stays NaN. The endpoints sit on the
+immediate ring of tissue surrounding each detected vessel.
+
+The formula is ``P = d_PB / (d_PB + d_CV)`` where *PB* is the union of the
+instance boundary and the portal-vessel ring, *CV* is the central-vein ring, and
+*d* denotes the Euclidean distance transform.
 """
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt as edt, gaussian_filter
+from scipy.ndimage import binary_dilation, distance_transform_edt as edt, gaussian_filter
+from scipy.ndimage import label as _ndlabel
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -21,6 +26,64 @@ from scipy.ndimage import distance_transform_edt as edt, gaussian_filter
 
 _DIVISION_GUARD: float = 1e-8
 """Small epsilon added to the denominator to avoid division by zero."""
+
+_VESSEL_ANCHOR_RING: int = 3
+"""Pixels a lobule is dilated by when looking for its own vessels.
+
+Vessel lumens are holes in the watershed foreground and therefore carry label 0,
+so an un-dilated ``cv_mask & region`` never finds the lobule's central vein.
+"""
+
+_VESSEL_EDGE_RING: int = 1
+"""Thickness of the tissue ring around a vessel that carries the axis endpoint.
+
+Distinct from :data:`_VESSEL_ANCHOR_RING`, which is a *lookup* radius. This one
+is the anchor itself: the immediate ring of tissue around a central vein is the
+1.0 end, around a portal vessel the 0.0 end, while the lumen stays unvalued.
+"""
+
+
+LUMEN_DISPLAY_RGB: tuple[int, int, int] = (158, 166, 179)
+"""Neutral grey used to draw vessel lumens in portality figures.
+
+Shared so every renderer agrees. Painting lumens the same colour as the
+background is actively misleading: magma's top colour is a pale cream
+(``#FCFDBF``), so an unvalued lumen and a genuine portality of 1.0 become
+near-indistinguishable and a central vein reads as though it were *valued* 1
+rather than being a hole *ringed* by 1.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+def vessel_lumen_mask(portality: np.ndarray) -> np.ndarray:
+    """NaN regions fully enclosed by valued tissue, i.e. vessel lumens.
+
+    :func:`lobule_portality` leaves NaN in two places that mean different things:
+    outside the tissue/instances, and inside vessel lumens. Renderers need to tell
+    them apart: background should read as empty, a lumen as vessel with no tissue
+    to zonate. A lumen is distinguished geometrically: its NaN component does not
+    touch the image border.
+
+    Parameters
+    ----------
+    portality : np.ndarray
+        Float portality map as returned by :func:`lobule_portality`.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask, True on lumen pixels.
+    """
+    finite = np.isfinite(portality)
+    nan_lab, _ = _ndlabel(~finite)
+    if nan_lab.max() == 0:
+        return np.zeros_like(finite)
+    edge_ids = np.unique(np.concatenate([
+        nan_lab[0, :], nan_lab[-1, :], nan_lab[:, 0], nan_lab[:, -1]]))
+    return ~finite & ~np.isin(nan_lab, edge_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +103,15 @@ def _find_cv_seed(
 
     Tries three strategies in order:
 
-    1. **PV-stain intensity peak** - the smoothed maximum of *pv_stain* inside
+    1. **PV-stain intensity peak**: the smoothed maximum of *pv_stain* inside
        *region*. A central vein typically appears bright in the PV channel.
        Skipped when *pv_stain* is ``None`` or the stain is nearly flat.
-    2. **Furthest-from-portal-boundary pixel** - the point inside *region* with
-       the maximum Euclidean distance to *pb* (the portal boundary). This is
-       the geometric centre of the lobule, equivalent to the medial axis peak.
-    3. **Centroid** - a single pixel at the region centroid, used only when both
+    2. **Distance-weighted centroid**: the centroid of *region* weighted by each
+       pixel's Euclidean distance to *pb* (the portal boundary), i.e.
+       sum(coord * d) / sum(d). A plain max-distance rule picks a point on one arm
+       of C- or U-shaped lobules rather than near their centre; the weighted
+       centroid pulls the seed toward the bulk of the lobule interior.
+    3. **Centroid**: a single pixel at the region centroid, used only when both
        strategies above yield an empty set (degenerate region).
 
     Parameters
@@ -97,13 +162,24 @@ def _find_cv_seed(
             if seed.any():
                 return seed
 
-    # Strategy 2: pixel maximally far from the portal boundary
+    # Strategy 2: distance-weighted centroid.
+    # Using the plain furthest-from-boundary point fails for C/U-shaped lobules
+    # (common at tissue edges) where the medial-axis peak lies in the concavity
+    # tip, not where the CV would biologically sit. Instead, weight each pixel by
+    # its distance-from-boundary so the centroid is pulled toward the fat part of
+    # the lobule, robust to concavities.
     d_from_pb = edt(~pb).astype(np.float32)
-    d_in = np.where(region, d_from_pb, -np.inf)
-    cy, cx = np.unravel_index(int(np.argmax(d_in)), (h, w))
-    seed = _disk(cy, cx)
-    if seed.any():
-        return seed
+    d_in = np.where(region, d_from_pb, 0.0)
+    total_w = float(d_in.sum())
+    if total_w > 0:
+        ys, xs = np.where(region)
+        cy = int(np.round(np.sum(ys * d_in[ys, xs]) / total_w))
+        cx = int(np.round(np.sum(xs * d_in[ys, xs]) / total_w))
+        cy = np.clip(cy, 0, h - 1)
+        cx = np.clip(cx, 0, w - 1)
+        seed = _disk(cy, cx)
+        if seed.any():
+            return seed
 
     # Strategy 3: centroid (degenerate fallback)
     ys, xs = np.where(region)
@@ -147,8 +223,12 @@ def lobule_portality(
     Returns
     -------
     np.ndarray
-        Float32 portality map, NaN outside lobules.
-        0.0 = lobule boundary / portal vessel, 1.0 = central vein.
+        Float32 portality map, NaN outside lobules and inside vessel lumens.
+        0.0 = lobule boundary / portal-vessel ring, 1.0 = central-vein ring.
+
+        Leaving lumens NaN keeps them out of downstream selections such as
+        ``LobuleStatistics``, which picks pixels with ``isfinite``; lumens carry
+        no stain, so including them would drag the outermost portality bins down.
     """
     if labels.ndim != 2:
         raise ValueError("labels must be 2D (H, W).")
@@ -157,6 +237,11 @@ def lobule_portality(
     cv_mask = cv_mask.astype(bool)
     pf_mask = pf_mask.astype(bool)
 
+    # Connected components of the central-vein mask, so a lobule can adopt an
+    # entire vein rather than the sliver that happens to fall inside its
+    # dilation ring (see the anchor block below).
+    cv_labels, _ = _ndlabel(cv_mask)
+
     for label_id in np.unique(labels):
         if label_id == 0:
             continue
@@ -164,28 +249,77 @@ def lobule_portality(
         if region.sum() < 10:
             continue
 
+        # This lobule's own central vein, taken as whole components. A vein lies
+        # in a watershed hole, so only a rim of it falls inside `grown`; adopting
+        # just that rim would leave an unfilled core whose inner lip becomes a
+        # spurious boundary a few px from the tissue, capping portality at ~0.76
+        # (measured). Taking the whole component lifts it to ~0.99.
+        grown = binary_dilation(region, iterations=_VESSEL_ANCHOR_RING)
+        cv_comp = cv_mask & grown
+        if cv_comp.any():
+            _ids = np.unique(cv_labels[cv_comp])
+            cv_comp = np.isin(cv_labels, _ids[_ids > 0])
+
+        # The axis is anchored on the vein's outer surface, not its lumen: a
+        # lumen contains no tissue and so has no zonation value to report. The
+        # immediate ring of tissue around the vein is the 1.0 end.
+        #
+        # `cv_comp` and `cv_ring` must stay separate. The boundary trace below
+        # needs the component, so the lumen counts as interior; the distance
+        # transform needs the ring. Collapsing the two lets the lumen rim back
+        # into `pb` while it is also the anchor, which pins P to exactly 0.5.
+        cv_ring = binary_dilation(cv_comp, iterations=_VESSEL_EDGE_RING) & ~cv_mask
+
         # 4-connected boundary: pixels inside this lobule adjacent to a
-        # different label or to background.
+        # different label or to background.  Explicit slicing avoids np.roll
+        # wrap-around which would create false boundaries at image edges.
+        #
+        # The lobule's own central vein is interior, not an edge. Lumens carry
+        # label 0, so without this the vein's rim lands in `pb` while also being
+        # the anchor; then d_pb == d_cv near the vein and P = d_pb/(d_pb + d_cv)
+        # pins to exactly 0.5, so the zonation axis spans only half its range
+        # wherever a real vein is found. Treating the whole vein component as
+        # interior keeps the axis full-range.
+        traced = region | cv_comp
         boundary = np.zeros((h, w), dtype=bool)
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            shifted = np.roll(np.roll(labels, -dy, 0), -dx, 1)
-            boundary |= region & (shifted != label_id)
+            shifted = np.zeros_like(labels)
+            shifted_cv = np.zeros((h, w), dtype=bool)
+            src_r = slice(max(0, dy), h + min(0, dy))
+            dst_r = slice(max(0, -dy), h + min(0, -dy))
+            src_c = slice(max(0, dx), w + min(0, dx))
+            dst_c = slice(max(0, -dx), w + min(0, -dx))
+            shifted[dst_r, dst_c] = labels[src_r, src_c]
+            shifted_cv[dst_r, dst_c] = cv_comp[src_r, src_c]
+            boundary |= traced & (shifted != label_id) & ~shifted_cv
 
-        # Portal boundary: this lobule's edge + portal vessels within it.
-        pb = boundary | (pf_mask & region)
+        # Portal boundary: this lobule's edge plus the ring around portal vessels
+        # within it. Portal vessels mark the 0.0 end of the axis, so, unlike the
+        # central vein, their surface belongs here; their lumen, like the CV's,
+        # holds no tissue and is left unvalued.
+        pf_ring = binary_dilation(pf_mask & grown,
+                                  iterations=_VESSEL_EDGE_RING) & ~pf_mask
+        pb = boundary | pf_ring
 
-        # Central vein within this lobule; use structured fallback if none.
-        cv_in = cv_mask & region
-        if not cv_in.any():
-            cv_in = _find_cv_seed(region, pb, pv_stain)
+        # Fall back to the structured surrogate only when no vein was found. The
+        # surrogate already returns a disk of tissue pixels, so it needs no ring.
+        cv_anchor = cv_ring if cv_ring.any() else _find_cv_seed(region, pb, pv_stain)
 
         d_pb = edt(~pb).astype(np.float32)
-        d_cv = edt(~cv_in).astype(np.float32)
+        d_cv = edt(~cv_anchor).astype(np.float32)
 
         P = (d_pb / (d_pb + d_cv + _DIVISION_GUARD)).astype(np.float32)
         portality[region] = P[region]
 
-    # Hard-clamp vessel pixels for unambiguous downstream use.
-    portality[cv_mask & (labels > 0)] = 1.0
-    portality[pf_mask & (labels > 0)] = 0.0
+        # Exact endpoints. The formula already yields these (d_cv == 0 on the CV
+        # ring, d_pb == 0 on pb), but _DIVISION_GUARD leaves them a hair short.
+        # `pb` is applied second so it wins where a vein ring touches the lobule
+        # boundary; portal/boundary is the 0.0 end by convention.
+        portality[cv_anchor & region] = 1.0
+        portality[pb & region] = 0.0
+
+    # Lumens are deliberately left NaN. They are holes in the watershed
+    # foreground carrying label 0, so `portality[region]` never touches them, and
+    # a lumen holds no tissue whose zonation could be reported. The endpoints of
+    # the axis live on the vessel surfaces, assigned per lobule above.
     return portality

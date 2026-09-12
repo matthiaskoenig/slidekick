@@ -43,8 +43,25 @@ if __name__ == '__main__':
                                   ]
 
     # Segment Lobules
+    # ------------------------------------------------------------------
+    # SCALE: lobule_diameter_px is NOT set here, and probably should be.
+    #
+    # Every pixel-valued default (blob_sigma, peak_min_dist, min_area_px, ...) is
+    # calibrated for lobules ~226 px across. Running at a different magnification
+    # without saying so produces a seed explosion and heavy over-segmentation:
+    # measured, parameters 4x too small for the data gave 1392 seeds where ~60
+    # lobules exist. Nothing detects this automatically - a mis-scaled pipeline is
+    # internally consistent - so the operator only prints a warning.
+    #
+    # To set it: open the seeding preview and read the "Min lobule area" tooltip,
+    # which states the assumed lobule size and what the current value works out to
+    # at preview resolution. Measure one typical lobule in your own images
+    # (equivalent diameter = 2*sqrt(area/pi)) and pass that as lobule_diameter_px.
+    # For a slide whose pyramid you already know, level N of a slide calibrated at
+    # level 3 is 226.4 * 2**(3 - N).
+    # ------------------------------------------------------------------
     segmentor = LobuleSegmentor(metadatas_for_segmentation, channels_pp=[0,2], channels_pv=1, base_level=2,
-                                region_size=200, adaptive_histonorm=True)
+                                adaptive_histonorm=True)
 
     metadata_segmentation, metadata_portality = segmentor.apply()
 
