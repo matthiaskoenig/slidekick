@@ -272,7 +272,30 @@ def run_napari_preview_action(
         dock_area=str(dock_area),
     )
 
-    napari.run()
+    # Disable napari's background status-checker thread for the duration of the
+    # event loop. In napari 0.6.x that thread reads a layer's size/_indices_view
+    # off the main thread while a point delete is mutating them, raising an
+    # IndexError in Points._view_size; napari catches it but surfaces the
+    # traceback as a notification on every hover after a seed delete. The
+    # appearance.update_status_based_on_layer setting is the supported switch:
+    # assigning False terminates the thread and stops it restarting. The only
+    # cost is the hover status-bar readout. The prior value is restored so the
+    # user's global setting is left unchanged, and the import is guarded so a
+    # future napari that renames the setting falls back to a plain run.
+    _status_setting = _prev_status = None
+    try:
+        from napari.settings import get_settings
+        _status_setting = get_settings().appearance
+        _prev_status = _status_setting.update_status_based_on_layer
+        _status_setting.update_status_based_on_layer = False
+    except Exception:
+        _status_setting = None
+
+    try:
+        napari.run()
+    finally:
+        if _status_setting is not None:
+            _status_setting.update_status_based_on_layer = _prev_status
 
     action = nav["action"]
     if action is None:

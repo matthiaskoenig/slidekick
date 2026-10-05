@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
-from scipy.ndimage import binary_fill_holes, label as ndi_label
-from skimage.filters import threshold_multiotsu, threshold_otsu
+from scipy.ndimage import binary_fill_holes, distance_transform_edt, label as ndi_label
+from skimage.filters import threshold_multiotsu, threshold_otsu, threshold_triangle
 from skimage.morphology import remove_small_holes, remove_small_objects
 from skimage.color import label2rgb
 from typing import Tuple, Dict, List, Optional, Any, Sequence
@@ -113,7 +113,8 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
                                  blur_frac: float = 0.007,
                                  close_frac: float = 0.01,
                                  hole_area_frac: float = 0.05,
-                                 min_obj_frac: float = 0.01):
+                                 min_obj_frac: float = 0.01,
+                                 outline_smooth_frac: float = 0.0):
     """Build a boolean tissue mask via multi-Otsu thresholding.
 
     1. 3-class Otsu -> labels for true BG, mic BG, tissue.
@@ -180,9 +181,114 @@ def detect_tissue_mask_multiotsu(gray: np.ndarray,
         border_ids.discard(0)
         m_tis = ~np.isin(bg_labeled, list(border_ids))
 
-    # Step 5: morphological cleanup (no median, it erodes boundaries)
-    return _morphological_cleanup(m_tis, dim, area, 0.0,
+    # Step 5: morphological cleanup. outline_smooth_frac > 0 enables a median
+    # filter on the mask (fraction of the smaller dimension) that rounds off the
+    # jagged tissue outline without eroding concavities; 0 keeps the raw outline.
+    return _morphological_cleanup(m_tis, dim, area, outline_smooth_frac,
                                   hole_area_frac, min_obj_frac)
+
+
+# A 3-class mean at or below this raw value counts as a near-black background.
+_NEAR_BLACK = 10.0
+# Minimum fraction of the frame that must be near-black for a stain to be
+# considered tissue-positive (there is a real dark background to threshold off).
+_MIN_BLACK_FRAC = 0.05
+
+
+def is_tissue_positive(gray: np.ndarray) -> bool:
+    """True when the stain is mainly positive inside tissue over a near-black bg.
+
+    Decided from the 3-class Otsu mode structure (the same split the multi-Otsu
+    detector runs, so the two agree): a tissue-positive stain has its darkest
+    mode near black and a middle mode that belongs to the tissue continuum, i.e.
+    closer to the bright mode than to black. A slide with a microscopy-background
+    band instead has a mid mode sitting in the valley between black and tissue
+    (closer to black), or a darkest mode that is itself a bright band. That mode
+    test is robust to broad, skewed tissue intensity, which a simple threshold or
+    a bimodal-fraction test mistakes for a microscopy band.
+
+    Tissue-positive is exactly where a global Triangle threshold with minimal
+    cleanup follows the tissue edge, while the multi-Otsu path (which removes the
+    bright band at the cost of rounding the outline) is needed otherwise.
+    """
+    g = gray.astype(np.uint8)
+    if float(np.mean(gray <= _NEAR_BLACK)) < _MIN_BLACK_FRAC:
+        return False  # no real dark background to threshold off
+    sigma = max(int(0.007 * min(g.shape[:2])), 1)
+    lbl3, (idx_bg, idx_mid, idx_tis), _ = multiotsu_split(
+        g, classes=3, blur_sigma=sigma, report_path=None)
+
+    def _cmean(i: int) -> float:
+        return float(gray[lbl3 == i].mean()) if np.any(lbl3 == i) else 0.0
+
+    m_bg, m_mid, m_top = _cmean(idx_bg), _cmean(idx_mid), _cmean(idx_tis)
+    if m_bg > _NEAR_BLACK:
+        return False  # darkest mode is itself a bright band -> microscopy bg
+    # Middle mode belongs to the tissue continuum (nearer the bright mode) rather
+    # than being a dim background band (nearer black).
+    return (m_top - m_mid) < (m_mid - m_bg)
+
+
+def detect_tissue_mask_triangle(gray: np.ndarray,
+                                method: str = "triangle",
+                                blur_frac: float = 0.002,
+                                hole_area_frac: float = 0.05,
+                                min_obj_frac: float = 0.01,
+                                outline_smooth_frac: float = 0.0,
+                                keep_largest: bool = True,
+                                report_path: Path = None) -> np.ndarray:
+    """Single-threshold tissue mask for tissue-positive stains.
+
+    For a stain that is bright inside tissue over a near-black background, a
+    global Triangle (``method="triangle"``) or Otsu (``method="otsu"``)
+    threshold with only minimal blur and light cleanup follows the true tissue
+    boundary far better than the multi-Otsu + ellipse-closing path, which
+    rounds the outline into circular artefacts. No heavy closing is applied.
+
+    Spatial parameters are fractions of image dimensions for resolution
+    invariance.
+    """
+    H, W = gray.shape[:2]
+    dim = min(H, W)
+    area = H * W
+
+    # Minimal blur only: just enough to steady the threshold, not to round
+    # the outline. blur_frac defaults well below the multi-Otsu 0.007.
+    sigma = max(int(blur_frac * dim), 0)
+    g = gray.astype(np.uint8)
+    if sigma > 0:
+        g = cv2.GaussianBlur(g, (0, 0), sigma)
+    try:
+        thr = threshold_otsu(g) if method == "otsu" else threshold_triangle(g)
+    except Exception:
+        thr = float(np.mean(gray)) - 1.0
+    m_tis = gray > thr
+
+    # Border-connected background removal: keep interior holes (vessels) as
+    # tissue, drop only background that reaches the image border. No closing,
+    # so the outline is not rounded.
+    m_tis = ~border_connected_mask(~m_tis)
+
+    # Light cleanup: fill holes, drop specks, optional outline median.
+    m_tis = _morphological_cleanup(m_tis, dim, area, outline_smooth_frac,
+                                   hole_area_frac, min_obj_frac)
+
+    # Keep the single largest tissue component.
+    if keep_largest and np.any(m_tis):
+        lab, n = ndi_label(m_tis)
+        if n > 1:
+            sizes = np.bincount(lab.ravel())
+            sizes[0] = 0
+            m_tis = lab == int(np.argmax(sizes))
+
+    if report_path is not None:
+        rp = Path(report_path)
+        if rp.is_dir():
+            rp = rp / "tissue_map.png"
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(rp), (m_tis.astype(np.uint8) * 255))
+
+    return m_tis.astype(bool)
 
 
 def overlay_mask(image_stack: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
@@ -236,6 +342,70 @@ def border_connected_mask(binary: np.ndarray, connectivity: int = 8) -> np.ndarr
     if border_ids.size == 0:
         return np.zeros(b.shape, dtype=bool)
     return np.isin(lab, border_ids)
+
+
+def edge_lobule_labels(labels: np.ndarray,
+                       tissue_footprint: np.ndarray,
+                       margin_px: float,
+                       majority_frac: float = 0.5,
+                       min_area: int = 10) -> set:
+    """Label ids of lobules that are incomplete at the tissue section edge.
+
+    A lobule is flagged when it both *touches* the outer tissue boundary and has
+    the *majority* of its area close to that boundary, i.e. a cut, incomplete
+    lobule rather than a full one that merely kisses the edge. This mirrors how a
+    histologist ignores edge lobules.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Integer lobule label map (0 = background, >0 = lobule id).
+    tissue_footprint : np.ndarray
+        Boolean silhouette of the tissue (holes filled). Its outer contour is the
+        section boundary a lobule can be cut by.
+    margin_px : float
+        Distance from the boundary within which a pixel counts as "close to the
+        edge". Roughly one lobule radius: a full disc tangent to the boundary sits
+        at the 50% threshold, so a half-cut lobule is flagged and a complete one is
+        not.
+    majority_frac : float
+        A lobule is flagged when more than this fraction of its area lies within
+        *margin_px* of the boundary.
+    min_area : int
+        Ignore labels smaller than this (noise).
+
+    Returns
+    -------
+    set of int
+        Label ids to exclude.
+    """
+    foot = tissue_footprint.astype(bool)
+    if labels.size == 0 or int(labels.max()) == 0:
+        return set()
+    # Distance of every pixel from the exterior (0 on the tissue boundary).
+    dist = distance_transform_edt(foot).astype(np.float32)
+
+    # Aggregate per label in a single pass with bincount rather than looping and
+    # scanning the whole frame once per label (O(pixels) instead of O(labels x
+    # pixels)). `touch` counts pixels on the boundary (dist <= 1) and `near`
+    # counts pixels within the margin; a label is an edge lobule when it touches
+    # the boundary and the majority of its area is near it.
+    lab = labels.ravel().astype(np.intp)
+    d = dist.ravel()
+    n = int(labels.max()) + 1
+    area = np.bincount(lab, minlength=n).astype(np.float64)
+    near = np.bincount(lab, weights=(d < float(margin_px)).astype(np.float64),
+                       minlength=n)
+    touch = np.bincount(lab, weights=(d <= 1.0).astype(np.float64), minlength=n)
+
+    excluded = set()
+    for lid in range(1, n):
+        a = area[lid]
+        if a < min_area:
+            continue
+        if touch[lid] > 0 and (near[lid] / a) > majority_frac:
+            excluded.add(lid)
+    return excluded
 
 
 def holes_from_fg_mask(fg_pix_mask: np.ndarray, border_exclude: Optional[np.ndarray] = None) -> np.ndarray:

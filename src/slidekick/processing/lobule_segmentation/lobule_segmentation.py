@@ -21,6 +21,7 @@ from slidekick.processing.lobule_segmentation.portality import (
     LUMEN_DISPLAY_RGB,
     lobule_portality,
     vessel_lumen_mask,
+    vessel_network_portality,
 )
 from slidekick.processing.lobule_segmentation.vessel_detection import (
     detect_and_classify_vessels,
@@ -28,14 +29,14 @@ from slidekick.processing.lobule_segmentation.vessel_detection import (
     preprocess_stack,
 )
 from slidekick.processing.lobule_segmentation.lob_utils import (
-    detect_tissue_mask_multiotsu, overlay_mask,
+    detect_tissue_mask_multiotsu, detect_tissue_mask_triangle,
+    is_tissue_positive, overlay_mask,
     downsample_stack_to_max_side, minmax_to_uint8,
-    to_base_full,
+    to_base_full, edge_lobule_labels,
     common_pyramid_levels, choose_default_preview_level, load_level_from_multiscale,
     discover_pyramid_shapes,
 )
 from slidekick.processing.lobule_segmentation.napari_utils import (
-    preview_images_napari,
     run_napari_preview_action,
 )
 
@@ -205,6 +206,12 @@ class LobuleSegmentor(BaseOperator):
       turned out too narrow. At their ceiling: ``vessel_max_area_px`` and
       ``min_seed_border_dist``. At its floor: ``vessel_min_enclosure``. A future
       tuning round should widen these first.
+    * The boundary-smoothing defaults (``contour_smooth_sigma``,
+      ``boundary_smooth_valley_pct``, ``boundary_smooth_valley_band_px``) deviate
+      from the tuned config on purpose. The search drove them weak because the
+      jagged synthetic GT rewards boundaries that hug the noisy watershed; they are
+      set stronger here for direct, biologically-shaped outlines, trading a little
+      synthetic IoU for appearance.
 
     Vessel detection is the pixel-level zone classifier in ``vessel_detection``,
     shared with every other caller so there is exactly one implementation of this
@@ -224,6 +231,12 @@ class LobuleSegmentor(BaseOperator):
                  confirm: bool = True,
                  base_level: int = 0,
                  multi_otsu: Optional[bool] = None,
+                 tissue_method: str = "auto",
+                 # Median smoothing of the tissue outline, as a fraction of the
+                 # smaller image dimension. 0 = off (raw, slightly jagged outline);
+                 # ~0.01 rounds it off without eroding concavities. Multi-Otsu stays
+                 # the detector (it is the only one that removes microscopy bg).
+                 tissue_outline_smooth_frac: float = 0.0,
                  ksize: int = 5,
                  adaptive_histonorm: bool = True,
                  bg_low_val: int = 0,
@@ -260,17 +273,40 @@ class LobuleSegmentor(BaseOperator):
                  peak_min_dist: int = 120,
                  peak_thresh_pct: float = 45.0,
                  valley_sigma: float = 17.5,
+                 # Valley gain on the watershed edge field: amplifies faint valleys
+                 # (gamma lift) so more of them show and guide the cut. 0 = off.
+                 # Works with and without a PP stain (acts on the final edge field).
+                 valley_gain_pct: float = 0.0,
                  cluster_merge_sigma: float = 0.0,
                  valley_merge_thr_pct: Optional[float] = 57.5,
                  pp_thr: Optional[float] = 100.0,
                  pp_blend: float = 0.8,
                  peak_thresh_factor: float = 0.0,
-                 contour_smooth_sigma: float = 6.0,
+                 # Opt-in: treat every detected portal vessel as a hard-wall valley
+                 # anchor in the watershed (portal tracts sit at lobule corners).
+                 # OFF keeps headless/study and the shipped config bit-identical;
+                 # the interactive preview offers it with a checkbox defaulting on.
+                 portal_vessel_anchors: bool = False,
+                 # Anchor magnification strength: within each anchor footprint a
+                 # faint local PV dip (potential valley) is deepened by this factor,
+                 # magnifying it into a real valley. 0 = off. No floor in flat tissue.
+                 barrier_depth: float = 1.0,
+                 # Anchor footprint (px, full-res) of the magnified region; 0 = auto
+                 # (scales with image size). The anchor's diameter, separate from depth.
+                 barrier_width: int = 0,
+                 contour_smooth_sigma: float = 18.0,
                  min_seed_border_dist: float = 20.0,
-                 higra_preview_max_px: int = 1500,
+                 higra_preview_max_px: int = 2500,
                  boundary_smooth_sigma: float = 25.0,
-                 boundary_smooth_valley_pct: float = 35.0,
-                 boundary_smooth_valley_band_px: int = 15,
+                 boundary_smooth_valley_pct: float = 70.0,
+                 boundary_smooth_valley_band_px: int = 8,
+                 # Edge-lobule exclusion: drop lobules incomplete at the tissue
+                 # section edge from the portality maps (and therefore from the
+                 # statistics), as a histologist would. Auto-detected, and
+                 # re-includable in the interactive final review.
+                 exclude_edge_lobules: bool = True,
+                 edge_margin_frac: float = 0.5,
+                 edge_majority_frac: float = 0.5,
                  # Edge-map / merge / seed-geometry controls.  These were previously
                  # hardcoded to segment_lobules' own defaults at the call sites, so a
                  # tuned configuration could not be reproduced here at all: two of them
@@ -314,6 +350,13 @@ class LobuleSegmentor(BaseOperator):
             trimodal (microscopy background present) and only the top class is tissue.
             True forces 3-class behaviour (tissue = top class only, old default).
             False forces 2-class simple Otsu (no microscopy background handling).
+        @param tissue_method: which tissue detector to use. "auto" (default) picks
+            Triangle-minimal when the stain is tissue-positive (bright tissue over a
+            near-black background, no microscopy-background band) and otherwise keeps
+            the multi-Otsu path (honouring multi_otsu). "triangle"/"otsu" force the
+            single-threshold minimal-blur detector; "multiotsu" forces the multi-Otsu
+            path. Triangle avoids the circular outline artefact the multi-Otsu closing
+            introduces, at the cost of no microscopy-background removal.
         @param ksize: kernel size for convolution in filtering (cv2.median blur), must be odd and greater than 1, e.g., 3, 5, 7, ...
         @param adaptive_histonorm: use adaptive histogram norm in filtering
         @param local_bg_correction: if True, apply per-channel pseudo-flatfield correction in
@@ -464,6 +507,8 @@ class LobuleSegmentor(BaseOperator):
         self.confirm = confirm
         self.base_level = base_level
         self.multi_otsu = multi_otsu
+        self.tissue_method = str(tissue_method)
+        self.tissue_outline_smooth_frac = float(tissue_outline_smooth_frac)
         self.ksize = ksize
         self.adaptive_histonorm = adaptive_histonorm
         self.bg_low_val = int(bg_low_val)
@@ -504,6 +549,9 @@ class LobuleSegmentor(BaseOperator):
         self.peak_thresh_pct = float(peak_thresh_pct)
         self.valley_sigma = float(valley_sigma)
         self.cluster_merge_sigma = float(cluster_merge_sigma)
+        self.portal_vessel_anchors = bool(portal_vessel_anchors)
+        self.barrier_depth = float(barrier_depth)
+        self.barrier_width = int(barrier_width)
         self.edge_grad_blend = float(edge_grad_blend)
         self.edge_local_contrast_sigma = float(edge_local_contrast_sigma)
         self.fused_merge_pv_pct = (float(fused_merge_pv_pct)
@@ -511,6 +559,7 @@ class LobuleSegmentor(BaseOperator):
         self.seed_tissue_ring = int(seed_tissue_ring)
         self.valley_merge_sigma = float(valley_merge_sigma)
         self.valley_merge_thr_pct = float(valley_merge_thr_pct) if valley_merge_thr_pct is not None else None
+        self.valley_gain_pct = float(valley_gain_pct)
         self.pp_thr = float(pp_thr) if pp_thr is not None else None
         self.pp_blend = float(pp_blend)
         self.peak_thresh_factor = float(peak_thresh_factor)
@@ -520,6 +569,9 @@ class LobuleSegmentor(BaseOperator):
         self.boundary_smooth_sigma = float(boundary_smooth_sigma)
         self.boundary_smooth_valley_pct = float(boundary_smooth_valley_pct)
         self.boundary_smooth_valley_band_px = int(boundary_smooth_valley_band_px)
+        self.exclude_edge_lobules = bool(exclude_edge_lobules)
+        self.edge_margin_frac = float(edge_margin_frac)
+        self.edge_majority_frac = float(edge_majority_frac)
 
         # make sure channel is list for later iteration
         if isinstance(channel_selection, int):
@@ -579,6 +631,7 @@ class LobuleSegmentor(BaseOperator):
             None if vessel_portality_enclosure is None
             else float(vessel_portality_enclosure))
         self._edited_seed_points_xy = None
+        self._barrier_points_xy = None
         self.lobule_diameter_px = lobule_diameter_px
         self.um_per_px = um_per_px
         _scale = self.scale_factor(lobule_diameter_px, um_per_px)
@@ -877,7 +930,7 @@ class LobuleSegmentor(BaseOperator):
         _r_zone_sigma = self._widget_range(defaults["vessel_zone_sigma"], 0.0, 120.0)
         _r_area_pp = _int_range(defaults["min_vessel_area_pp"] or 1, 0, 5000, grow=16.0)
         _r_area_pv = _int_range(defaults["min_vessel_area_pv"] or 1, 0, 5000, grow=16.0)
-        _r_max_area = _int_range(defaults["vessel_max_area_px"], 500, 60000, grow=16.0)
+        _r_max_area = _int_range(defaults["vessel_max_area_px"], 500, 500000, grow=16.0)
         _r_annulus = _int_range(defaults["vessel_annulus_px"], 1, 30)
         _r_seed_area = _int_range(defaults["min_cv_seed_area"] or 1, 0, 1000, grow=16.0)
 
@@ -1124,6 +1177,36 @@ class LobuleSegmentor(BaseOperator):
         arrays = [minmax_to_uint8(a) for a in arrays]
         return np.dstack(arrays)
 
+    def _detect_tissue(self, gray: np.ndarray, report_path: Path = None,
+                       method: Optional[str] = None) -> np.ndarray:
+        """Single dispatch for tissue detection used by the preview and apply().
+
+        *method* overrides self.tissue_method (used by the preview control).
+        "auto" keeps the multi-Otsu path (honouring multi_otsu) but routes
+        tissue-positive stains to the Triangle-minimal detector; "triangle" /
+        "otsu" / "multiotsu" force a detector.
+        """
+        m = str(method) if method is not None else self.tissue_method
+        if m == "triangle" or m == "otsu":
+            return detect_tissue_mask_triangle(
+                gray, method=m, report_path=report_path,
+                outline_smooth_frac=self.tissue_outline_smooth_frac)
+        if m == "multiotsu":
+            return detect_tissue_mask_multiotsu(
+                gray, auto=(self.multi_otsu is None), report_path=report_path,
+                outline_smooth_frac=self.tissue_outline_smooth_frac)
+        # "auto" (or anything unknown): preserve the existing multi_otsu
+        # semantics, adding tissue-positive -> Triangle routing.
+        if self.multi_otsu is False:
+            return detect_tissue_mask(gray, morphological_radius=5)
+        if is_tissue_positive(gray):
+            return detect_tissue_mask_triangle(
+                gray, method="triangle", report_path=report_path,
+                outline_smooth_frac=self.tissue_outline_smooth_frac)
+        return detect_tissue_mask_multiotsu(
+            gray, auto=(self.multi_otsu is None), report_path=report_path,
+            outline_smooth_frac=self.tissue_outline_smooth_frac)
+
     def _interactive_preprocessing_preview(
             self,
             report_path: Optional[Path] = None,
@@ -1222,19 +1305,16 @@ class LobuleSegmentor(BaseOperator):
             colormap="gray",
         )
 
-        def _compute_tissue_mask(raw: np.ndarray) -> np.ndarray:
+        def _compute_tissue_mask(raw: np.ndarray, method: Optional[str] = None) -> np.ndarray:
             """Compute tissue mask from the raw stack.
 
-            Since detect_tissue_mask_multiotsu now uses fraction-based
-            parameters, the result is resolution-invariant and can be
-            computed directly on the downsampled preview stack.
+            The fraction-based detectors are resolution-invariant, so the
+            result can be computed directly on the downsampled preview stack.
+            *method* overrides self.tissue_method so the preview control can
+            switch detectors and re-detect live.
             """
             gray = ensure_grayscale_uint8(raw)
-            if self.multi_otsu is False:
-                return detect_tissue_mask(gray, morphological_radius=5)
-            return detect_tissue_mask_multiotsu(
-                gray, auto=(self.multi_otsu is None),
-            )
+            return self._detect_tissue(gray, method=method)
 
         raw_layers: List[Any] = []
         filt_layers: List[Any] = []
@@ -1271,6 +1351,7 @@ class LobuleSegmentor(BaseOperator):
             "fg_frac": float(self.fg_min_signal_frac),
             "ff_sigma": float(self.local_bg_sigma),
             "ff_on": bool(self.local_bg_correction),
+            "tissue_method": str(self.tissue_method),
         }
 
         pending = dict(defaults)
@@ -1283,6 +1364,7 @@ class LobuleSegmentor(BaseOperator):
             self.bg_low_val = bg
             self.clahe_bg_suppress = clahe
             self.fg_min_signal_frac = float(pending["fg_frac"])
+            self.tissue_method = str(pending["tissue_method"])
 
             raw = _get_raw_stack(lvl)
             filt = _get_filtered_stack(lvl, bg, clahe,
@@ -1292,7 +1374,8 @@ class LobuleSegmentor(BaseOperator):
             for c in range(raw.shape[2]):
                 raw_layers[c].data = raw[..., c]
                 filt_layers[c].data = filt[..., c]
-            tissue_layer.data = _compute_tissue_mask(raw).astype(np.int8)
+            tissue_layer.data = _compute_tissue_mask(
+                raw, method=str(pending["tissue_method"])).astype(np.int8)
 
         # See _widget_range: keeps local_bg_sigma's slider containing the CURRENT
         # (possibly rescaled) value rather than a fixed literal it can exceed.
@@ -1322,6 +1405,14 @@ class LobuleSegmentor(BaseOperator):
                                        "estimate. Set it comparable to or below the shading "
                                        "scale, roughly one lobule width. Too large and it "
                                        "stops correcting; too small and it eats the zonation."},
+            tissue_method={"choices": ["auto", "triangle", "otsu", "multiotsu"],
+                           "label": "Tissue method",
+                           "tooltip": "Tissue detector. auto picks Triangle-minimal for "
+                                      "tissue-positive stains (bright tissue, near-black bg) "
+                                      "and multi-Otsu otherwise. triangle/otsu force the "
+                                      "single-threshold minimal-blur detector (no circular "
+                                      "outline artefact, no microscopy-bg removal); multiotsu "
+                                      "forces the multi-Otsu path."},
         )
         def controls(
                 preview_level: int = int(default_level),
@@ -1330,6 +1421,7 @@ class LobuleSegmentor(BaseOperator):
                 fg_min_signal_frac: float = float(self.fg_min_signal_frac),
                 local_bg_sigma: float = float(self.local_bg_sigma),
                 local_bg_correction: bool = bool(self.local_bg_correction),
+                tissue_method: str = str(self.tissue_method),
         ):
             pending["level"] = int(preview_level)
             pending["bg"] = int(bg_low_val)
@@ -1337,6 +1429,7 @@ class LobuleSegmentor(BaseOperator):
             pending["fg_frac"] = float(fg_min_signal_frac)
             pending["ff_sigma"] = float(local_bg_sigma)
             pending["ff_on"] = bool(local_bg_correction)
+            pending["tissue_method"] = str(tissue_method)
 
         def on_update() -> None:
             _apply_update()
@@ -1350,6 +1443,7 @@ class LobuleSegmentor(BaseOperator):
             controls.fg_min_signal_frac.value = float(defaults["fg_frac"])
             controls.local_bg_sigma.value = float(defaults["ff_sigma"])
             controls.local_bg_correction.value = bool(defaults["ff_on"])
+            controls.tissue_method.value = str(defaults["tissue_method"])
 
             _apply_update()
 
@@ -1446,18 +1540,7 @@ class LobuleSegmentor(BaseOperator):
         # ROI detection block
         console.print("Complete. Detecting ROI...", style="info")
         stack_grayscale = ensure_grayscale_uint8(stack)
-        if self.multi_otsu is False:
-            # Explicit 2-class override: simple Otsu, no microscopy BG handling.
-            tissue_mask = detect_tissue_mask(stack_grayscale, morphological_radius=5)
-        else:
-            # multi_otsu is None (auto) or True (force 3-class legacy).
-            # auto=True  -> decide bimodal/trimodal from mic_bg_frac heuristic.
-            # auto=False -> always tissue = top class only (old multi_otsu=True behaviour).
-            tissue_mask = detect_tissue_mask_multiotsu(
-                stack_grayscale,
-                auto=(self.multi_otsu is None),
-                report_path=report_path,
-            )
+        tissue_mask = self._detect_tissue(stack_grayscale, report_path=report_path)
 
         # stack: (H,W,C); tissue_mask: (H,W) True=tissue
         stack[~tissue_mask] = 0
@@ -1521,6 +1604,90 @@ class LobuleSegmentor(BaseOperator):
 
         return stack, fg_maxproj, bbox, orig_shapes
 
+    def _interactive_lobule_selection(self, overlay_vis, labels_cropped,
+                                      portality_layers, auto_excluded):
+        """Napari click-to-toggle lobule include/exclude.
+
+        Shows the segmentation overlay, both portality maps for reference, a Labels
+        layer of the lobules, and the excluded set as a striped red overlay kept
+        as the topmost layer. Clicking a lobule toggles its exclusion; Reset
+        restores the auto (edge) set. Returns ``(action, excluded_set)`` where
+        action is one of the run_napari_preview_action strings.
+
+        *portality_layers* is a list of ``(name, rgba)`` reference layers to add
+        (the primary and vessel-network portality planes).
+        """
+        import napari
+        from magicgui.widgets import Label
+
+        labels_i = np.ascontiguousarray(labels_cropped.astype(np.int32))
+        excluded = set(int(x) for x in auto_excluded)
+        _auto = set(excluded)
+
+        # Diagonal stripe pattern, precomputed once, so the excluded overlay reads
+        # as hatched rather than a flat wash and stays cheap to rebuild on a click.
+        _yy, _xx = np.indices(labels_i.shape)
+        _stripe_w = max(4, int(round(0.006 * max(labels_i.shape))))
+        _stripe = (((_xx + _yy) // _stripe_w) % 2 == 0)
+
+        def _excl_rgba():
+            rgba = np.zeros((*labels_i.shape, 4), np.uint8)
+            if excluded:
+                sel = np.isin(labels_i, list(excluded)) & _stripe
+                rgba[sel] = (235, 20, 20, 220)     # opaque red stripes
+            return rgba
+
+        viewer = napari.Viewer(title="Select lobules to keep (click to toggle)")
+        viewer.add_image(overlay_vis, name="Segmentation", rgb=True)
+        for _name, _rgba in portality_layers:
+            viewer.add_image(_rgba, name=_name, rgb=True, visible=False)
+        lab_layer = viewer.add_labels(labels_i, name="Lobules (click to toggle)",
+                                      opacity=0.30)
+        # Added last, so it is the highest layer; a per-pixel-alpha RGBA overlay so
+        # the stripes sit on top of whichever reference layer is visible.
+        excl_layer = viewer.add_image(_excl_rgba(), name="Excluded (striped)",
+                                      rgb=True, opacity=1.0)
+
+        def _toggle(layer, event):
+            try:
+                pos = layer.world_to_data(event.position)
+                r, c = int(round(pos[-2])), int(round(pos[-1]))
+            except Exception:
+                return
+            if 0 <= r < labels_i.shape[0] and 0 <= c < labels_i.shape[1]:
+                lid = int(labels_i[r, c])
+                if lid > 0:
+                    excluded.discard(lid) if lid in excluded else excluded.add(lid)
+                    excl_layer.data = _excl_rgba()
+
+        lab_layer.mouse_drag_callbacks.append(_toggle)
+
+        def _reset():
+            excluded.clear()
+            excluded.update(_auto)
+            excl_layer.data = _excl_rgba()
+
+        console.print(
+            f"Lobule review: {len(excluded)} auto-excluded at the edge. Click a "
+            f"lobule to include/exclude, Reset restores the edge set, then Confirm.",
+            style="info")
+
+        action = run_napari_preview_action(
+            viewer,
+            Label(value="Click lobules to include / exclude"),
+            require_confirm=self.confirm,
+            on_reset=_reset,
+            include_update=False,
+            include_apply_values=False,
+            include_confirm=True,
+            include_back=True,
+            include_reset=True,
+            include_abort=True,
+            confirm_text="Confirm selection and finish",
+            back_text="Back to smoothing",
+            reset_text="Reset to auto (edge only)",
+        )
+        return action, excluded
 
     def apply(self) -> Tuple[Metadata, Metadata]:
 
@@ -1559,12 +1726,23 @@ class LobuleSegmentor(BaseOperator):
         _entry_step = 0
         _redo_seeding = False
         _back_to_seeding = False
+        # Cache the heavy step-1 stages (image load, flatfield/CLAHE correction,
+        # stain finalisation) across back-and-forth navigation. Each stage is keyed
+        # by the parameters it depends on, so a stage is recomputed only when one of
+        # those actually changed in the preprocessing preview; otherwise stepping
+        # back to preprocessing and forward reuses the result instead of reloading
+        # and re-correcting the full-resolution stack.
+        _stage_cache: Dict[str, Any] = {}
         while True:
-            if _redo_seeding:
-                _redo_seeding = False
-            else:
+            if not _redo_seeding:
                 step = _entry_step
             while True:
+                if _redo_seeding:
+                    # Returning from the smoothing preview to re-tune seeds. The
+                    # cached vessel-detection outputs are reused, so skip the step
+                    # machine and drop straight to the seeding preview below.
+                    _redo_seeding = False
+                    break
                 if step == 0:
                     # Initial interactive preprocessing preview (napari). The
                     # preview_level selector uses the intersection across stains,
@@ -1591,20 +1769,48 @@ class LobuleSegmentor(BaseOperator):
                     continue
 
                 if step == 1:
-                    console.print("Loading images...", style="info")
-                    img_stack, fg_maxproj, bbox, orig_shapes = self._load_and_invert_images_from_metadatas(report_path)
+                    # Load (keyed by base_level; fixed during navigation, so this
+                    # runs once and is reused on every return to preprocessing).
+                    _load_key = int(self.base_level)
+                    if _stage_cache.get("load_key") != _load_key:
+                        console.print("Loading images...", style="info")
+                        (_raw_stack, fg_maxproj, bbox,
+                         orig_shapes) = self._load_and_invert_images_from_metadatas(report_path)
+                        _stage_cache.update(load_key=_load_key, raw=_raw_stack,
+                                            fg=fg_maxproj, bbox=bbox, orig=orig_shapes)
+                    else:
+                        _raw_stack = _stage_cache["raw"]
+                        fg_maxproj = _stage_cache["fg"]
+                        bbox = _stage_cache["bbox"]
+                        orig_shapes = _stage_cache["orig"]
 
-                    img_size_base = img_stack.shape[:2]  # base size for back-mapping of mask
+                    img_size_base = _raw_stack.shape[:2]  # base size for back-mapping of mask
 
-                    console.print("Complete. Now applying filters...", style="info")
-                    # Keep both halves of preprocessing.  Vessel detection needs the
+                    # Correction (flatfield + CLAHE) is the expensive part. Keep both
+                    # halves of preprocessing: vessel detection needs the
                     # corrected-but-unblurred stack (blurring destroys small lumens);
-                    # the PV/PP stains need the blurred, p99-normalised one.
-                    stack_corr = self._correct_stack(img_stack)
-                    img_stack = self._finalize_stains(stack_corr)
+                    # the PV/PP stains need the blurred, p99-normalised one. Both are
+                    # keyed by the preprocessing parameters, so they recompute only
+                    # when one of those changed.
+                    _corr_key = (int(self.bg_low_val), int(self.clahe_bg_suppress),
+                                 float(self.local_bg_sigma), bool(self.local_bg_correction),
+                                 float(self.clahe_clip_limit), int(self.clahe_tile_px),
+                                 float(self.clahe_pp_factor), bool(self.adaptive_histonorm))
+                    if _stage_cache.get("corr_key") != _corr_key:
+                        console.print("Complete. Now applying filters...", style="info")
+                        stack_corr = self._correct_stack(_raw_stack)
+                        _stage_cache.update(corr_key=_corr_key, corr=stack_corr)
+                    else:
+                        stack_corr = _stage_cache["corr"]
 
-                    for i in range(img_stack.shape[2]):
-                        cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
+                    _fin_key = (_corr_key, int(self.ksize))
+                    if _stage_cache.get("fin_key") != _fin_key:
+                        img_stack = self._finalize_stains(stack_corr)
+                        _stage_cache.update(fin_key=_fin_key, fin=img_stack)
+                        for i in range(img_stack.shape[2]):
+                            cv2.imwrite(str(report_path / f"slide_{i}.png"), img_stack[:, :, i])
+                    else:
+                        img_stack = _stage_cache["fin"]
 
                     if (not self.preview) and self.confirm:
                         apply = Confirm.ask("Continue with lobule segmentation?", default=True, console=console)
@@ -1772,6 +1978,13 @@ class LobuleSegmentor(BaseOperator):
             # peak_min_dist, peak_thresh_pct, valley_sigma, and min_area_px before
             # the (slow) full-resolution watershed.  Widgets show full-res pixel
             # values; scaling to preview resolution is handled internally.
+            #
+            # On Confirm the full-res result is produced by upsampling the previewed
+            # label map rather than re-running the watershed, so the final
+            # segmentation reproduces exactly what the user tuned. These carry the
+            # last previewed labels (padded preview frame) and the chosen action out
+            # of the preview block, where the full-res step below can read them.
+            _preview_state = {"labels": None, "action": None}
             if self.preview:
                 _PREV_MAX = self.higra_preview_max_px
                 Hpad, Wpad = tissue_mask.shape  # already padded by vessel detection
@@ -1798,10 +2011,15 @@ class LobuleSegmentor(BaseOperator):
                         cv2.resize(pp_stain, (_Wp, _Hp), interpolation=cv2.INTER_AREA)
                         if pp_stain is not None else None
                     )
+                    _pf_s = cv2.resize(
+                        np.asarray(pf_mask, np.uint8), (_Wp, _Hp),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
                 else:
                     _Hp, _Wp, _pad_s, _s = Hpad, Wpad, pad, 1.0
                     _tm_s, _vh_s, _pv_s = tissue_mask, vessel_holes, pv_stain
                     _cv_s, _pp_s = cv_mask_seed, pp_stain
+                    _pf_s = np.asarray(pf_mask, bool)
 
                 # Downsample the original (unpadded) img_stack for the overlay background.
                 # Derive target size from (_Hp, _Wp, _pad_s), not by re-rounding
@@ -1837,6 +2055,7 @@ class LobuleSegmentor(BaseOperator):
                     peak_min_dist=self.peak_min_dist,
                     peak_thresh_pct=self.peak_thresh_pct,
                     valley_sigma=self.valley_sigma,
+                    valley_gain_pct=self.valley_gain_pct,
                     min_area_px=self.min_area_px,
                     # Added because these carry the measured effect: the valley-merge
                     # threshold dominates parameter importance, and the PP blend is
@@ -1848,6 +2067,19 @@ class LobuleSegmentor(BaseOperator):
                     contour_smooth_sigma=self.contour_smooth_sigma,
                     edge_grad_blend=self.edge_grad_blend,
                     valley_merge_sigma=self.valley_merge_sigma,
+                    # Local adaptive seed threshold: 0 keeps the global percentile above,
+                    # >0 catches dim peaks in low-contrast areas without over-seeding
+                    # bright ones, which helps when a staining gradient makes one global
+                    # threshold mis-fit the two sides of a section.
+                    peak_thresh_factor=self.peak_thresh_factor,
+                    # Portal-vessel anchoring: on by default in the preview so it is
+                    # available while tuning; the OFF constructor default governs
+                    # headless. Confirm persists this to self.portal_vessel_anchors.
+                    portal_anchors=True,
+                    # Anchor magnification strength and footprint (px, full-res;
+                    # 0 = auto). Anchors magnify a faint PV valley into a real one.
+                    barrier_depth=self.barrier_depth,
+                    barrier_width=self.barrier_width,
                 )
                 _higra_pending = dict(_higra_defaults)
 
@@ -1858,8 +2090,83 @@ class LobuleSegmentor(BaseOperator):
                 # round-trips to the same segmentation.
                 _seed_override = {"xy": None}
                 _seed_found = {"cv": np.empty((0, 2)), "peak": np.empty((0, 2))}
+                # Per-CV on/off flags, aligned to _seed_found["cv"]; reset to all
+                # active whenever CVs are re-detected. _cv_disp["idx"] records which
+                # global CV indices are currently drawn (the in-frame subset), so a
+                # clicked marker maps back to a flag.
+                _cv_active = {"mask": np.ones(0, bool)}
+                _cv_disp = {"idx": np.empty(0, int)}
+                # Holds the drawn-anchor Points layer once it exists, so
+                # _higra_evidence (defined and first called before the layer is
+                # created) can read the current anchors without a NameError.
+                _bar_state = {"layer": None}
+                # Portal-vessel anchor rows (cropped row,col) currently pre-loaded
+                # into the anchor layer, so a checkbox toggle can remove exactly
+                # them without disturbing hand-placed points.
+                _portal_state = {"rc": np.empty((0, 2))}
+                _CV_RGBA = np.array([1.0, 0.541, 0.0, 1.0], np.float32)    # #ff8a00
+                _CV_OFF_RGBA = np.array([0.333, 0.333, 0.333, 1.0], np.float32)
 
-                def _compute_higra_preview_vis() -> np.ndarray:
+                def _barrier_points_padded() -> np.ndarray:
+                    """Anchor points (napari (row,col), cropped) -> padded (x,y)."""
+                    _layer = _bar_state["layer"]
+                    if _layer is None:
+                        return np.empty((0, 2))
+                    rc = np.asarray(_layer.data, float).reshape(-1, 2)
+                    if not len(rc):
+                        return np.empty((0, 2))
+                    return np.column_stack([rc[:, 1] + _pad_s, rc[:, 0] + _pad_s])
+
+                def _portal_centroids_rc() -> np.ndarray:
+                    """Detected portal-vessel centroids as cropped napari (row, col)."""
+                    _pf = np.asarray(_pf_s, np.uint8)
+                    if not _pf.any():
+                        return np.empty((0, 2))
+                    _n, _, _, _cent = cv2.connectedComponentsWithStats(_pf, connectivity=8)
+                    if _n <= 1:
+                        return np.empty((0, 2))
+                    _xy = np.asarray(_cent[1:], float).reshape(-1, 2)   # (x, y) padded
+                    return _points_to_layer(_xy)                        # -> cropped (row, col)
+
+                def _sync_portal_anchors() -> None:
+                    """Keep the portal-vessel anchors in the points layer in step with
+                    the checkbox: add them when on and absent, remove exactly them
+                    when off, leaving hand-placed points untouched."""
+                    _layer = _bar_state["layer"]
+                    if _layer is None:
+                        return
+                    _want = bool(_higra_pending.get("portal_anchors"))
+                    _cur = np.asarray(_layer.data, float).reshape(-1, 2)
+                    _have = np.asarray(_portal_state["rc"], float).reshape(-1, 2)
+                    if _want and not len(_have):
+                        _new = _portal_centroids_rc()
+                        if len(_new):
+                            _layer.data = (np.vstack([_cur, _new]) if len(_cur) else _new)
+                            _portal_state["rc"] = _new
+                    elif not _want and len(_have):
+                        if len(_cur):
+                            # Drop rows within ~1 px of a recorded portal centroid;
+                            # a point the user moved is no longer a match and survives.
+                            _d = np.hypot(_cur[:, None, 0] - _have[None, :, 0],
+                                          _cur[:, None, 1] - _have[None, :, 1])
+                            _keep = _d.min(axis=1) > 1.5 if _d.size else np.ones(len(_cur), bool)
+                            _layer.data = _cur[_keep] if _keep.any() else np.empty((0, 2))
+                        _portal_state["rc"] = np.empty((0, 2))
+
+                def _higra_evidence() -> tuple:
+                    """Run the tentative watershed and return what drives it, not a
+                    filled segmentation.
+
+                    Returns (valley_field, boundary_lines), both cropped to the
+                    preview frame:
+                      - valley_field: the [0, 1] edge-evidence the watershed cuts
+                        along (bright = likely lobule wall: dark PV valley, or
+                        bright PP where blended in).
+                      - boundary_lines: the cut the current seeds produce on that
+                        field, as 1-px lines - honest about being tentative rather
+                        than implying stable filled regions.
+                    Also refreshes the detected seed set for the points layer.
+                    """
                     _seg, _dbg = segment_lobules(
                         _tm_s, _vh_s, _pv_s,
                         cv_mask=_cv_s,
@@ -1868,6 +2175,7 @@ class LobuleSegmentor(BaseOperator):
                         peak_min_dist=_scale_higra_param("peak_min_dist", _higra_pending["peak_min_dist"]),
                         peak_thresh_pct=float(_higra_pending["peak_thresh_pct"]),
                         valley_sigma=_scale_higra_param("valley_sigma", _higra_pending["valley_sigma"]),
+                        valley_gain_pct=float(_higra_pending["valley_gain_pct"]),
                         cluster_merge_sigma=self.cluster_merge_sigma,
                         valley_merge_thr_pct=float(_higra_pending["valley_merge_thr_pct"]),
                         pp_thr=float(_higra_pending["pp_thr"]),
@@ -1877,7 +2185,7 @@ class LobuleSegmentor(BaseOperator):
                             "contour_smooth_sigma", _higra_pending["contour_smooth_sigma"]),
                         min_seed_border_dist=int(_scale_higra_param(
                             "min_seed_border_dist", self.min_seed_border_dist)),
-                        peak_thresh_factor=self.peak_thresh_factor,
+                        peak_thresh_factor=float(_higra_pending["peak_thresh_factor"]),
                         edge_grad_blend=float(_higra_pending["edge_grad_blend"]),
                         edge_local_contrast_sigma=_scale_higra_param(
                             "edge_local_contrast_sigma", self.edge_local_contrast_sigma),
@@ -1888,31 +2196,141 @@ class LobuleSegmentor(BaseOperator):
                             "valley_merge_sigma", _higra_pending["valley_merge_sigma"]),
                         boundary_smooth_sigma=0,
                         seed_points_xy=_seed_override["xy"],
+                        barrier_points_xy=_barrier_points_padded(),
+                        barrier_depth=float(_higra_pending["barrier_depth"]),
+                        barrier_point_radius=(
+                            int(round(_higra_pending["barrier_width"] * _s))
+                            if _higra_pending["barrier_width"] > 0 else 0),
                         return_debug=True,
                     )
-                    _seed_found["cv"] = np.asarray(_dbg["cv_seed_xy"]).reshape(-1, 2)
-                    _seed_found["peak"] = np.asarray(_dbg["peak_seed_xy"]).reshape(-1, 2)
-                    _seg_crop = _seg[_pad_s: _Hp - _pad_s, _pad_s: _Wp - _pad_s] if _pad_s > 0 else _seg
-                    return overlay_mask(_img_s, _seg_crop, alpha=0.5)
+                    # Keep the previewed label map (padded preview frame) so the
+                    # full-res step can reproduce it by upsampling on Confirm.
+                    _preview_state["labels"] = _seg
+                    # Only trust the detector's split of cv vs peak in automatic
+                    # mode. With an explicit seed set the debug lumps every point
+                    # under cv_seed_xy, so keep the last automatic detection (and the
+                    # user's CV on/off flags) for display instead.
+                    if _seed_override["xy"] is None:
+                        _seed_found["cv"] = np.asarray(_dbg["cv_seed_xy"]).reshape(-1, 2)
+                        _seed_found["peak"] = np.asarray(_dbg["peak_seed_xy"]).reshape(-1, 2)
+                        _cv_active["mask"] = np.ones(len(_seed_found["cv"]), bool)
 
-                def _seed_points_for_layer() -> np.ndarray:
-                    """Detected seeds as napari (row, col) in the cropped preview frame.
+                    def _crop(_a):
+                        return (_a[_pad_s: _Hp - _pad_s, _pad_s: _Wp - _pad_s]
+                                if _pad_s > 0 else _a)
+
+                    # Display the final field (with anchor wells) but STRETCH it by
+                    # the natural valleys (the field before wells). The wells, deeper
+                    # than any natural valley, clip to the bright end while the real
+                    # valleys keep the contrast they had before anchors existed - so
+                    # the evidence shows valleys and anchors combined instead of the
+                    # wells washing the valleys out. Without anchors base == final.
+                    _final = np.asarray(_dbg.get("edge_map"), np.float32)
+                    _final = _crop(_final) if _final.ndim == 2 else np.zeros(
+                        (_Hp - 2 * _pad_s, _Wp - 2 * _pad_s), np.float32)
+                    _base = np.asarray(
+                        _dbg.get("edge_map_base", _dbg.get("edge_map")), np.float32)
+                    _base = _crop(_base) if _base.ndim == 2 else _final
+                    _valley = _final
+                    # The raw edge_map is a smooth, low-contrast field whose
+                    # informative part - the valley ridges the watershed cuts
+                    # along - sits in its upper range, so as-is it reads as a
+                    # diffuse glow. Stretch the in-tissue distribution so the
+                    # ridges pop: map [p60, p99] -> [0, 1], which pushes lobule
+                    # interiors (below the median evidence) to 0 (transparent
+                    # under additive blending) and leaves the valleys bright.
+                    # edge_map is also 1.0 outside tissue, so mask to tissue first
+                    # or the background would dominate.
+                    _tcrop = _crop(np.asarray(_tm_s, bool))
+                    _have_t = _tcrop.shape == _valley.shape and _tcrop.any()
+                    _tvals = (_base[_tcrop] if (_have_t and _base.shape == _tcrop.shape)
+                              else _base.ravel())
+                    if _tvals.size:
+                        _lo, _hi = np.percentile(_tvals, [60.0, 99.0])
+                        if _hi > _lo:
+                            _valley = np.clip(
+                                (_valley - _lo) / (_hi - _lo), 0.0, 1.0).astype(np.float32)
+                    if _have_t:
+                        _valley[~_tcrop] = 0.0
+                    from skimage.segmentation import find_boundaries
+                    _bnd = find_boundaries(_crop(_seg), mode="outer").astype(np.float32)
+                    return _valley, _bnd
+
+                def _points_to_layer_full(pts) -> tuple:
+                    """Padded (x, y) seeds -> (napari (row, col), kept indices).
 
                     segment_lobules works in PADDED coordinates and reports (x, y);
                     napari wants (row, col) in the cropped frame, so the pad offset
-                    comes off here and the axes swap.
+                    comes off here and the axes swap. Points that fall outside the
+                    cropped frame are dropped; the returned indices say which input
+                    points survived, so a caller can keep per-point state aligned.
                     """
-                    pts = np.vstack([_seed_found["cv"], _seed_found["peak"]])                     if len(_seed_found["peak"]) else _seed_found["cv"]
                     pts = np.asarray(pts).reshape(-1, 2)
                     if not len(pts):
-                        return np.empty((0, 2))
+                        return np.empty((0, 2)), np.empty(0, int)
                     rc = np.column_stack([pts[:, 1] - _pad_s, pts[:, 0] - _pad_s])
                     h, w = _Hp - 2 * _pad_s, _Wp - 2 * _pad_s
                     keep = (rc[:, 0] >= 0) & (rc[:, 0] < h) & (rc[:, 1] >= 0) & (rc[:, 1] < w)
-                    return rc[keep]
+                    return rc[keep], np.nonzero(keep)[0]
+
+                def _points_to_layer(pts) -> np.ndarray:
+                    return _points_to_layer_full(pts)[0]
+
+                def _cv_points_for_layer() -> np.ndarray:
+                    """Detected CV seeds as napari (row, col); records drawn indices."""
+                    rc, idx = _points_to_layer_full(_seed_found["cv"])
+                    _cv_disp["idx"] = idx
+                    return rc
+
+                def _cv_face_colors() -> np.ndarray:
+                    """Per-point colours for the CV layer: active orange, off grey."""
+                    idx = _cv_disp["idx"]
+                    if not len(idx):
+                        return np.empty((0, 4), np.float32)
+                    m = _cv_active["mask"]
+                    active = m[idx] if len(m) else np.ones(len(idx), bool)
+                    cols = np.tile(_CV_RGBA, (len(idx), 1))
+                    cols[~active] = _CV_OFF_RGBA
+                    return cols
+
+                def _peak_points_for_layer() -> np.ndarray:
+                    """Intensity-peak seeds as napari (row, col), for the editable layer."""
+                    return _points_to_layer(_seed_found["peak"])
+
+                def _active_cv_xy() -> np.ndarray:
+                    """Active CV seeds in padded (x, y)."""
+                    cv = np.asarray(_seed_found["cv"]).reshape(-1, 2)
+                    m = _cv_active["mask"]
+                    return cv[m] if (len(m) == len(cv) and len(m)) else cv
+
+                def _needs_override() -> bool:
+                    """Explicit-seed mode is needed once the user edits seeds or turns
+                    a CV off; automatic mode handles cv-vs-peak priority itself."""
+                    m = _cv_active["mask"]
+                    return (bool(_higra_pending.get("use_edited_seeds"))
+                            or (len(m) > 0 and not m.all()))
+
+                def _effective_override() -> np.ndarray:
+                    """Active CVs plus intensity seeds, with intensity seeds dropped
+                    within peak_min_dist of an active CV so CVs take priority."""
+                    cvxy = _active_cv_xy()
+                    if bool(_higra_pending.get("use_edited_seeds")):
+                        pkxy = _layer_points_to_seeds(_higra_seed_layer.data)
+                    else:
+                        pkxy = _seed_found["peak"]
+                    pkxy = np.asarray(pkxy).reshape(-1, 2)
+                    if len(cvxy) and len(pkxy):
+                        _pmd = float(_scale_higra_param(
+                            "peak_min_dist", _higra_pending["peak_min_dist"]))
+                        d = np.hypot(pkxy[:, None, 0] - cvxy[None, :, 0],
+                                     pkxy[:, None, 1] - cvxy[None, :, 1])
+                        pkxy = pkxy[d.min(axis=1) >= _pmd]
+                    if len(cvxy) and len(pkxy):
+                        return np.vstack([cvxy, pkxy])
+                    return cvxy if len(cvxy) else pkxy
 
                 def _layer_points_to_seeds(rc) -> np.ndarray:
-                    """Inverse of _seed_points_for_layer: napari (row,col) -> padded (x,y)."""
+                    """Inverse of _points_to_layer: napari (row,col) -> padded (x,y)."""
                     rc = np.asarray(rc, float).reshape(-1, 2)
                     if not len(rc):
                         return np.empty((0, 2))
@@ -1921,22 +2339,107 @@ class LobuleSegmentor(BaseOperator):
                 import napari
                 from magicgui import magicgui
                 _higra_viewer = napari.Viewer()
-                _higra_seg_layer = _higra_viewer.add_image(
-                    _compute_higra_preview_vis(),
-                    name="Higra seeds preview",
-                    rgb=True,
+                # Show the evidence, not a filled segmentation: a grayscale tissue
+                # base, the valley/boundary field the watershed cuts along, and the
+                # tentative cut lines for the current seeds. Each is its own layer
+                # so the user can toggle them. Additive blending keeps low values
+                # transparent, so only the ridges and lines show over the base.
+                _img_gray = _img_s.max(axis=-1).astype(np.float32)
+                _higra_viewer.add_image(
+                    _img_gray, name="tissue", colormap="gray", blending="translucent",
                 )
+                _valley0, _bnd0 = _higra_evidence()
+                _higra_valley_layer = _higra_viewer.add_image(
+                    _valley0, name="valley / boundary evidence",
+                    colormap="inferno", opacity=0.7, blending="additive",
+                )
+                _higra_bnd_layer = _higra_viewer.add_image(
+                    _bnd0, name="predicted boundaries (tentative)",
+                    colormap="green", opacity=1.0, blending="additive",
+                )
+
+                def _set_higra_layers() -> None:
+                    _v, _b = _higra_evidence()
+                    _higra_valley_layer.data = _v
+                    _higra_bnd_layer.data = _b
+
                 # Editable seed layer, pre-filled with what the detectors found.
                 # Add, move or delete points and press "Use edited seeds"; the next
                 # recompute uses exactly the layer contents. One marker per point.
+                _seed_size = max(6, int(round(0.012 * max(_Hp, _Wp))))
+                # CV seeds: shown in their own colour and shape so the detected
+                # central veins are distinct from intensity peaks. The layer is
+                # locked (not hand-editable); instead, clicking a CV while this layer
+                # is selected toggles it off (grey) or on (orange). Off CVs are
+                # dropped from the seed set and free that spot for an intensity seed.
+                _cv_rc0 = _cv_points_for_layer()
+                _higra_cv_layer = _higra_viewer.add_points(
+                    _cv_rc0,
+                    name="CV seeds (detected)",
+                    size=_seed_size,
+                    face_color=(_cv_face_colors() if len(_cv_rc0) else "#ff8a00"),
+                    border_color="#3a1e00",
+                    symbol="diamond",
+                )
+                # Reference only: lock the layer so points cannot be moved or deleted.
+                try:
+                    _higra_cv_layer.editable = False
+                except Exception:
+                    pass
+
+                def _toggle_cv(layer, event) -> None:
+                    # Only when the CV layer is the active layer, so it does not
+                    # steal clicks meant for adding intensity seeds.
+                    try:
+                        if _higra_viewer.layers.selection.active is not _higra_cv_layer:
+                            return
+                        pos = layer.world_to_data(event.position)
+                        pr, pc = float(pos[-2]), float(pos[-1])
+                    except Exception:
+                        return
+                    rc = np.asarray(_higra_cv_layer.data).reshape(-1, 2)
+                    if not len(rc):
+                        return
+                    d = np.hypot(rc[:, 0] - pr, rc[:, 1] - pc)
+                    j = int(np.argmin(d))
+                    if d[j] > max(_seed_size, 8):
+                        return
+                    idx = _cv_disp["idx"]
+                    m = _cv_active["mask"]
+                    if j < len(idx) and int(idx[j]) < len(m):
+                        m[int(idx[j])] = not bool(m[int(idx[j])])
+                        _higra_cv_layer.face_color = _cv_face_colors()
+
+                _higra_cv_layer.mouse_drag_callbacks.append(_toggle_cv)
+                # Intensity-peak seeds: the editable set. Add/move/delete and tick
+                # "Use edited seeds"; the next recompute uses the CV seeds plus
+                # exactly these points.
                 _higra_seed_layer = _higra_viewer.add_points(
-                    _seed_points_for_layer(),
-                    name="seeds (editable)",
-                    size=max(6, int(round(0.012 * max(_Hp, _Wp)))),
+                    _peak_points_for_layer(),
+                    name="intensity seeds (editable)",
+                    size=_seed_size,
                     face_color="#00e5ff",
                     border_color="#003844",
                     symbol="o",
                 )
+                # Drawn-anchor layer: click anchor points along a valley the
+                # intensity evidence cannot resolve. Each point becomes a hard-wall
+                # valley spot in the watershed edge map (independent points, not a
+                # connected line). A wall splits a region only where a seed sits on
+                # each side of it.
+                _higra_bar_layer = _higra_viewer.add_points(
+                    np.empty((0, 2)),
+                    name="boundary anchors (points)",
+                    size=_seed_size,
+                    face_color="#39ff14",
+                    border_color="#0a3d00",
+                    symbol="square",
+                )
+                _bar_state["layer"] = _higra_bar_layer
+                # Pre-load the detected portal vessels as anchor points (checkbox on
+                # by default), so they are marked and act as anchors from the start.
+                _sync_portal_anchors()
+                _set_higra_layers()
 
                 # These bound values are already rescaled by lobule_diameter_px or
                 # um_per_px, so a fixed literal can sit below the current value at
@@ -1970,7 +2473,7 @@ class LobuleSegmentor(BaseOperator):
                     f"This preview runs at {_s:.3f}x, so it acts as "
                     f"{max(1, int(round(float(self.min_area_px) * _s * _s))):,} px2 on screen "
                     f"(areas scale with the square of the preview factor).")
-                _r_contour = self._widget_range(float(self.contour_smooth_sigma), 0.0, 30.0)
+                _r_contour = self._widget_range(float(self.contour_smooth_sigma), 0.0, 60.0)
                 _r_vms = self._widget_range(
                     float(_higra_defaults["valley_merge_sigma"]), 0.0, 40.0)
 
@@ -2003,10 +2506,26 @@ class LobuleSegmentor(BaseOperator):
                         "tooltip": _min_area_tip,
                     },
                     valley_merge_thr_pct={
-                        "min": 5.0, "max": 80.0, "step": 2.5,
+                        "min": 5.0, "max": 95.0, "step": 2.5,
                         "label": "Valley-merge threshold (%)",
                         "tooltip": "Merge adjacent lobules whose shared seam has no PV valley "
                                    "below this percentile. The most influential parameter in tuning.",
+                    },
+                    valley_gain_pct={
+                        "min": 0.0, "max": 100.0, "step": 5.0,
+                        "label": "Valley gain (amplify faint, %)",
+                        "tooltip": "Amplify faint valleys so more of them show and can guide the "
+                                   "watershed cut; higher = stronger lift of weak ridges toward "
+                                   "the strong ones. 0 = off. Works with and without a PP stain "
+                                   "(it acts on the final edge field).",
+                    },
+                    peak_thresh_factor={
+                        "min": 0.0, "max": 3.0, "step": 0.25,
+                        "label": "Peak thresh factor (0=off)",
+                        "tooltip": "Local adaptive seed threshold (mean + factor*std). "
+                                   "0 uses the global peak percentile above; >0 catches dim "
+                                   "lobule peaks in low-contrast areas without over-seeding "
+                                   "bright areas.",
                     },
                     pp_blend={
                         "min": 0.0, "max": 1.0, "step": 0.1,
@@ -2032,10 +2551,34 @@ class LobuleSegmentor(BaseOperator):
                     use_edited_seeds={
                         "widget_type": "CheckBox",
                         "label": "Use edited seeds",
-                        "tooltip": "Take the seeds from the 'seeds (editable)' points "
-                                   "layer instead of re-detecting them. Tick this after "
-                                   "adding, moving or deleting points; untick to go back "
-                                   "to automatic seeding.",
+                        "tooltip": "Use the 'intensity seeds (editable)' layer instead "
+                                   "of re-detecting the peaks. The detected CV seeds are "
+                                   "always kept. Tick this after adding, moving or "
+                                   "deleting intensity points; untick for automatic "
+                                   "seeding.",
+                    },
+                    portal_anchors={
+                        "widget_type": "CheckBox",
+                        "label": "Portal vessels as anchors",
+                        "tooltip": "Pre-load every detected portal vessel as an anchor "
+                                   "point (portal tracts sit at lobule corners). The "
+                                   "points are editable; untick to remove them.",
+                    },
+                    barrier_depth={
+                        "min": 0.0, "max": 3.0, "step": 0.25,
+                        "label": "Anchor magnify (x)",
+                        "tooltip": "How strongly each anchor magnifies a faint PV valley "
+                                   "under its footprint into a real one. 0 = off; higher "
+                                   "deepens the local dip more. Flat tissue with no valley "
+                                   "signal is unaffected. Sets strength, not diameter.",
+                    },
+                    barrier_width={
+                        "min": 0, "max": 400, "step": 5,
+                        "label": "Anchor width (px, 0=auto)",
+                        "tooltip": "Footprint over which the anchor magnifies the valley, "
+                                   "in full-resolution pixels. 0 = auto (~1% of the image's "
+                                   "larger dimension). The anchor's diameter, independent of "
+                                   "strength; raise it so the footprint spans the boundary.",
                     },
                     valley_merge_sigma={
                         "min": _r_vms[0], "max": _r_vms[1], "step": 2.0,
@@ -2050,12 +2593,17 @@ class LobuleSegmentor(BaseOperator):
                     valley_sigma: float = float(self.valley_sigma),
                     min_area_px: int = int(self.min_area_px),
                     valley_merge_thr_pct: float = float(_higra_defaults["valley_merge_thr_pct"]),
+                    valley_gain_pct: float = float(_higra_defaults["valley_gain_pct"]),
                     pp_blend: float = float(_higra_defaults["pp_blend"]),
                     pp_thr: float = float(_higra_defaults["pp_thr"]),
                     contour_smooth_sigma: float = float(_higra_defaults["contour_smooth_sigma"]),
                     edge_grad_blend: float = float(_higra_defaults["edge_grad_blend"]),
                     valley_merge_sigma: float = float(_higra_defaults["valley_merge_sigma"]),
+                    peak_thresh_factor: float = float(_higra_defaults["peak_thresh_factor"]),
                     use_edited_seeds: bool = False,
+                    portal_anchors: bool = bool(_higra_defaults["portal_anchors"]),
+                    barrier_depth: float = float(_higra_defaults["barrier_depth"]),
+                    barrier_width: int = int(_higra_defaults["barrier_width"]),
                 ):
                     _higra_pending["blob_sigma"] = float(blob_sigma)
                     _higra_pending["peak_min_dist"] = int(peak_min_dist)
@@ -2063,11 +2611,17 @@ class LobuleSegmentor(BaseOperator):
                     _higra_pending["valley_sigma"] = float(valley_sigma)
                     _higra_pending["min_area_px"] = int(min_area_px)
                     _higra_pending["valley_merge_thr_pct"] = float(valley_merge_thr_pct)
+                    _higra_pending["valley_gain_pct"] = float(valley_gain_pct)
                     _higra_pending["pp_blend"] = float(pp_blend)
                     _higra_pending["pp_thr"] = float(pp_thr)
                     _higra_pending["contour_smooth_sigma"] = float(contour_smooth_sigma)
                     _higra_pending["edge_grad_blend"] = float(edge_grad_blend)
                     _higra_pending["valley_merge_sigma"] = float(valley_merge_sigma)
+                    _higra_pending["peak_thresh_factor"] = float(peak_thresh_factor)
+                    _higra_pending["use_edited_seeds"] = bool(use_edited_seeds)
+                    _higra_pending["portal_anchors"] = bool(portal_anchors)
+                    _higra_pending["barrier_depth"] = float(barrier_depth)
+                    _higra_pending["barrier_width"] = int(barrier_width)
 
                 def _apply_higra_pending_to_self() -> None:
                     self.blob_sigma = float(_higra_pending["blob_sigma"])
@@ -2076,22 +2630,46 @@ class LobuleSegmentor(BaseOperator):
                     self.valley_sigma = float(_higra_pending["valley_sigma"])
                     self.min_area_px = int(_higra_pending["min_area_px"])
                     self.valley_merge_thr_pct = float(_higra_pending["valley_merge_thr_pct"])
+                    self.valley_gain_pct = float(_higra_pending["valley_gain_pct"])
                     self.pp_blend = float(_higra_pending["pp_blend"])
                     self.pp_thr = float(_higra_pending["pp_thr"])
                     self.contour_smooth_sigma = float(_higra_pending["contour_smooth_sigma"])
                     self.edge_grad_blend = float(_higra_pending["edge_grad_blend"])
                     self.valley_merge_sigma = float(_higra_pending["valley_merge_sigma"])
-                    # Seeds are in PREVIEW pixels; the full-resolution run needs them
-                    # divided by the preview scale. Stored on the instance the same way
-                    # the tuned parameters are, so apply() picks them up below.
-                    if _seed_override["xy"] is not None and len(_seed_override["xy"]):
-                        self._edited_seed_points_xy = (
-                            np.asarray(_seed_override["xy"], float) / max(_s, 1e-9))
+                    self.peak_thresh_factor = float(_higra_pending["peak_thresh_factor"])
+                    self.portal_vessel_anchors = bool(_higra_pending["portal_anchors"])
+                    self.barrier_depth = float(_higra_pending["barrier_depth"])
+                    self.barrier_width = int(_higra_pending["barrier_width"])
+                    # Reuse the exact seed set the preview showed for the full-res
+                    # run, so what the user saw is what gets segmented. Manual edits
+                    # win; otherwise the auto-detected seeds from the last recompute
+                    # are used. Both are in preview padded (x, y); dividing by the
+                    # preview scale maps them to full-res padded (x, y). Stored on the
+                    # instance the same way the tuned parameters are, so apply() picks
+                    # them up below. This runs only in preview mode, so a headless run
+                    # still detects its own seeds at full resolution.
+                    if _needs_override():
+                        _seeds_prev = np.asarray(_effective_override(), float).reshape(-1, 2)
+                        _edited = True
+                    else:
+                        _seeds_prev = np.vstack([_seed_found["cv"], _seed_found["peak"]]) \
+                            if len(_seed_found["peak"]) else np.asarray(_seed_found["cv"])
+                        _seeds_prev = np.asarray(_seeds_prev, float).reshape(-1, 2)
+                        _edited = False
+                    if len(_seeds_prev):
+                        self._edited_seed_points_xy = _seeds_prev / max(_s, 1e-9)
                         console.print(
-                            f"Using {len(self._edited_seed_points_xy)} manually edited "
-                            f"seed(s) for the full-resolution segmentation.", style="info")
+                            f"Using {len(self._edited_seed_points_xy)} "
+                            f"{'manually edited' if _edited else 'preview'} seed(s) "
+                            f"for the full-resolution segmentation.", style="info")
                     else:
                         self._edited_seed_points_xy = None
+                    # Carry the drawn anchor points into the full-res run. They are in
+                    # preview padded (x, y); dividing by the preview scale maps them
+                    # to full-res padded (x, y), matching the seed handling above.
+                    _bar_pts = _barrier_points_padded()
+                    self._barrier_points_xy = (
+                        _bar_pts / max(_s, 1e-9) if len(_bar_pts) else None)
 
                 def on_higra_update() -> None:
                     console.print(
@@ -2101,22 +2679,32 @@ class LobuleSegmentor(BaseOperator):
                         f"min_area_px={_higra_pending['min_area_px']}",
                         style="info",
                     )
+                    # Explicit seeds once the user edits points or turns a CV off:
+                    # active CVs plus intensity seeds, intensity seeds within
+                    # peak_min_dist of an active CV dropped so CVs take priority.
+                    # Otherwise stay on the automatic path (which dedups internally).
                     _seed_override["xy"] = (
-                        _layer_points_to_seeds(_higra_seed_layer.data)
-                        if bool(_higra_pending.get("use_edited_seeds")) else None)
-                    _higra_seg_layer.data = _compute_higra_preview_vis()
+                        _effective_override() if _needs_override() else None)
+                    # Keep the portal anchors in step with the checkbox before the
+                    # recompute, so their effect shows immediately.
+                    _sync_portal_anchors()
+                    _set_higra_layers()
                     _refresh_seed_layer()
 
                 def _refresh_seed_layer() -> None:
                     """Show the seeds the last recompute actually used.
 
-                    While seeding is automatic the layer follows the detectors, so
-                    changing a parameter shows its effect on the seeds immediately.
-                    Once the user has taken manual control the layer is left alone -
+                    The CV layer always follows the detector. While seeding is
+                    automatic the intensity layer follows the detectors too, so
+                    changing a parameter shows its effect immediately. Once the user
+                    has taken manual control the intensity layer is left alone -
                     otherwise a slider nudge would silently discard their edits.
                     """
+                    _higra_cv_layer.data = _cv_points_for_layer()
+                    _higra_cv_layer.face_color = (
+                        _cv_face_colors() if len(_higra_cv_layer.data) else "#ff8a00")
                     if _seed_override["xy"] is None:
-                        _higra_seed_layer.data = _seed_points_for_layer()
+                        _higra_seed_layer.data = _peak_points_for_layer()
 
                 def on_higra_reset() -> None:
                     _higra_pending.update(_higra_defaults)
@@ -2125,12 +2713,31 @@ class LobuleSegmentor(BaseOperator):
                     higra_controls.peak_thresh_pct.value = _higra_defaults["peak_thresh_pct"]
                     higra_controls.valley_sigma.value = _higra_defaults["valley_sigma"]
                     higra_controls.min_area_px.value = _higra_defaults["min_area_px"]
-                    for _k in ("valley_merge_thr_pct", "pp_blend", "pp_thr",
-                               "contour_smooth_sigma", "edge_grad_blend", "valley_merge_sigma"):
+                    for _k in ("valley_merge_thr_pct", "valley_gain_pct", "pp_blend", "pp_thr",
+                               "contour_smooth_sigma", "edge_grad_blend", "valley_merge_sigma",
+                               "peak_thresh_factor", "barrier_depth", "barrier_width"):
                         getattr(higra_controls, _k).value = _higra_defaults[_k]
                     _seed_override["xy"] = None          # back to automatic seeding
-                    _higra_seg_layer.data = _compute_higra_preview_vis()
-                    _higra_seed_layer.data = _seed_points_for_layer()
+                    _higra_pending["use_edited_seeds"] = False
+                    _cv_active["mask"] = np.ones(len(_seed_found["cv"]), bool)
+                    try:
+                        higra_controls.use_edited_seeds.value = False
+                        higra_controls.portal_anchors.value = _higra_defaults["portal_anchors"]
+                    except Exception:
+                        pass
+                    # Clear all anchors, then re-load portal anchors per the default.
+                    try:
+                        _higra_bar_layer.data = np.empty((0, 2))
+                    except Exception:
+                        pass
+                    _portal_state["rc"] = np.empty((0, 2))
+                    self._barrier_points_xy = None
+                    _sync_portal_anchors()
+                    _set_higra_layers()
+                    _higra_cv_layer.data = _cv_points_for_layer()
+                    _higra_cv_layer.face_color = (
+                        _cv_face_colors() if len(_higra_cv_layer.data) else "#ff8a00")
+                    _higra_seed_layer.data = _peak_points_for_layer()
 
                 _higra_action = run_napari_preview_action(
                     _higra_viewer,
@@ -2155,6 +2762,11 @@ class LobuleSegmentor(BaseOperator):
 
                 # Commit staged widget values to self regardless of confirm vs apply_values.
                 _apply_higra_pending_to_self()
+                # "confirm" accepts the last previewed view, so the full-res step
+                # can copy that previewed segmentation. "apply_values" applies staged
+                # slider values without a matching preview, so it falls back to a
+                # fresh full-res watershed below.
+                _preview_state["action"] = _higra_action
                 console.print(
                     f"Higra params confirmed: blob_sigma={self.blob_sigma:.0f}, "
                     f"peak_min_dist={self.peak_min_dist}, valley_sigma={self.valley_sigma:.1f}, "
@@ -2324,31 +2936,79 @@ class LobuleSegmentor(BaseOperator):
             )
 
             # -- Full-resolution watershed -----------------------------------------
-            # Run watershed without smoothing; smoothing is applied interactively below.
-            mask_raw = segment_lobules(
-                tissue_mask, vessel_holes, pv_stain,
-                cv_mask=cv_mask_seed,
-                pp_stain=pp_stain,
-                blob_sigma=self.blob_sigma,
-                peak_min_dist=self.peak_min_dist,
-                peak_thresh_pct=self.peak_thresh_pct,
-                valley_sigma=self.valley_sigma,
-                cluster_merge_sigma=self.cluster_merge_sigma,
-                valley_merge_thr_pct=self.valley_merge_thr_pct,
-                pp_thr=self.pp_thr,
-                pp_blend=self.pp_blend,
-                min_area_px=self.min_area_px,
-                contour_smooth_sigma=self.contour_smooth_sigma,
-                min_seed_border_dist=int(self.min_seed_border_dist),
-                peak_thresh_factor=self.peak_thresh_factor,
-                edge_grad_blend=self.edge_grad_blend,
-                edge_local_contrast_sigma=self.edge_local_contrast_sigma,
-                fused_merge_pv_pct=self.fused_merge_pv_pct,
-                seed_tissue_ring=self.seed_tissue_ring,
-                valley_merge_sigma=self.valley_merge_sigma,
-                seed_points_xy=self._edited_seed_points_xy,
-                boundary_smooth_sigma=0,  # applied interactively below
-            )
+            # On Confirm, reproduce the previewed segmentation exactly by upsampling
+            # its label map to full resolution instead of re-running the watershed
+            # (which would re-decide valley-merge and min_area at a different scale
+            # and could change the lobule set). Nearest-neighbour keeps the preview
+            # topology; the label map is in the padded preview frame, a scaled copy
+            # of the full padded frame, so it resizes back onto it. The rim gained at
+            # full resolution is filled from the nearest surviving label, and the
+            # valley-aware smoothing step below refines the staircase onto the
+            # full-res valleys. Headless and "apply values without preview" fall
+            # through to a fresh full-res watershed.
+            if (self.preview and _preview_state["action"] == "confirm"
+                    and _preview_state["labels"] is not None):
+                from scipy.ndimage import distance_transform_edt as _edt_fill
+                _Hpad_f, _Wpad_f = tissue_mask.shape
+                _up = cv2.resize(
+                    np.asarray(_preview_state["labels"]).astype(np.int32),
+                    (_Wpad_f, _Hpad_f), interpolation=cv2.INTER_NEAREST,
+                ).astype(np.int32)
+                _fg_full = tissue_mask & ~vessel_holes
+                _up[~_fg_full] = 0
+                _un = _fg_full & (_up == 0)
+                if _un.any() and (_up > 0).any():
+                    _, _ix = _edt_fill(_up == 0, return_indices=True)
+                    _up[_un] = _up[_ix[0][_un], _ix[1][_un]]
+                mask_raw = _up
+                console.print(
+                    "Using the previewed segmentation at full resolution "
+                    f"({len(set(mask_raw[_fg_full].ravel()) - {0})} lobules).",
+                    style="info",
+                )
+            else:
+                # Anchor points for the full-res watershed. A preview run has already
+                # captured drawn + portal anchors in self._barrier_points_xy. For a
+                # headless run with portal anchoring on, derive portal-vessel centroids
+                # from pf_mask here (full-res padded (x, y)) and add them.
+                _bar_pts_full = self._barrier_points_xy
+                if self.portal_vessel_anchors and not self.preview \
+                        and np.asarray(pf_mask, np.uint8).any():
+                    _n, _, _, _cent = cv2.connectedComponentsWithStats(
+                        np.asarray(pf_mask, np.uint8), connectivity=8)
+                    if _n > 1:
+                        _pc = np.asarray(_cent[1:], float).reshape(-1, 2)
+                        _bar_pts_full = (_pc if _bar_pts_full is None
+                                         else np.vstack([_bar_pts_full, _pc]))
+                # Run watershed without smoothing; smoothing is applied below.
+                mask_raw = segment_lobules(
+                    tissue_mask, vessel_holes, pv_stain,
+                    cv_mask=cv_mask_seed,
+                    pp_stain=pp_stain,
+                    blob_sigma=self.blob_sigma,
+                    peak_min_dist=self.peak_min_dist,
+                    peak_thresh_pct=self.peak_thresh_pct,
+                    valley_sigma=self.valley_sigma,
+                    cluster_merge_sigma=self.cluster_merge_sigma,
+                    valley_merge_thr_pct=self.valley_merge_thr_pct,
+                    valley_gain_pct=self.valley_gain_pct,
+                    pp_thr=self.pp_thr,
+                    pp_blend=self.pp_blend,
+                    min_area_px=self.min_area_px,
+                    contour_smooth_sigma=self.contour_smooth_sigma,
+                    min_seed_border_dist=int(self.min_seed_border_dist),
+                    peak_thresh_factor=self.peak_thresh_factor,
+                    edge_grad_blend=self.edge_grad_blend,
+                    edge_local_contrast_sigma=self.edge_local_contrast_sigma,
+                    fused_merge_pv_pct=self.fused_merge_pv_pct,
+                    seed_tissue_ring=self.seed_tissue_ring,
+                    valley_merge_sigma=self.valley_merge_sigma,
+                    seed_points_xy=self._edited_seed_points_xy,
+                    barrier_points_xy=_bar_pts_full,
+                    barrier_depth=self.barrier_depth,
+                    barrier_point_radius=int(self.barrier_width),
+                    boundary_smooth_sigma=0,  # applied interactively below
+                )
 
             # Reconstruct the inverted PV field (same formula as inside segment_lobules)
             # so the interactive smoothing step can call _higra_smooth_labels directly.
@@ -2418,7 +3078,7 @@ class LobuleSegmentor(BaseOperator):
                         boundary_smooth_valley_pct={
                             "min": 5.0, "max": 99.0, "step": 1.0,
                             "label": "Freeze valley pct",
-                            "tooltip": "Top N% of inverted-PV pixels are frozen (real boundaries stay). Higher = more frozen.",
+                            "tooltip": "Pixels above this percentile of boundary evidence are frozen (real walls stay put). Higher = fewer frozen = more smoothing.",
                         },
                     )
                     def smooth_controls(
@@ -2550,69 +3210,116 @@ class LobuleSegmentor(BaseOperator):
                     pv_stain=_pv_full,
                 ).astype(np.float32)
 
-                # Crop base-level portality to ROI and save fixed-size PNG
-                portality_cropped = P_base[min_r:max_r, min_c:max_c]
+                # Second, boundary-free portality plane. Ignores the watershed
+                # boundaries entirely: each pixel is the Xenium zonation index
+                # d_central / (d_central + d_portal) from vessel distances alone
+                # (0 at a central vein, 1 at a portal vessel, the reverse of the
+                # primary portality plane's orientation). Additional to P_base, not
+                # a replacement. The footprint is the filled tissue silhouette, so
+                # every in-tissue pixel (vessel lumens included) is valued and only
+                # true background is NaN.
+                from scipy.ndimage import binary_fill_holes as _fill_footprint
+                _tissue_footprint = _fill_footprint(mask_base_full > 0)
+                P2_base, _net_lines = vessel_network_portality(
+                    _canvas_cv.astype(bool), _canvas_pf.astype(bool),
+                    tissue_mask=_tissue_footprint,
+                    labels=mask_base_full,
+                )
+                P2_base = P2_base.astype(np.float32)
 
-                cmap = plt.get_cmap("magma").copy()
-                cmap.set_bad(alpha=0.0)
-                Pm = np.ma.masked_invalid(portality_cropped).astype(np.float32)
+                # -- Edge-lobule exclusion (auto) ---------------------------------
+                # As in histology, lobules cut by the section edge are incomplete
+                # and are dropped from BOTH portality planes (and hence from the
+                # statistics, which only keep finite pixels). The margin is one
+                # median lobule radius, self-calibrated from this segmentation, so
+                # it needs no external scale. The set is a post-hoc NaN mask keyed
+                # by label id, so excluding or re-including a lobule never
+                # recomputes or shifts any other lobule's per-lobule portality.
+                _excluded_labels: set = set()
+                if self.exclude_edge_lobules:
+                    _areas = np.bincount(mask_base_full.ravel().astype(np.int64))
+                    _pos = _areas[1:][_areas[1:] > 0]
+                    if _pos.size:
+                        _med_diam = 2.0 * float(np.sqrt(np.median(_pos) / np.pi))
+                        _margin = max(1.0, self.edge_margin_frac * _med_diam)
+                        _excluded_labels = edge_lobule_labels(
+                            mask_base_full, _tissue_footprint, _margin,
+                            self.edge_majority_frac)
+                    if _excluded_labels:
+                        console.print(
+                            f"Edge lobules auto-excluded: {len(_excluded_labels)}",
+                            style="info")
 
-                # Vessel lumens are NaN, like the background, but they mean
-                # something different: vessel here, no tissue to zonate, rather
-                # than nothing here. Drawn transparent they read as white, and
-                # magma's top colour is a pale cream, so a lumen and a portality
-                # of 1.0 look the same and a central vein appears to be 1 itself
-                # instead of being a hole ringed by 1. Painting them grey keeps
-                # the distinction legible.
-                _lumen = vessel_lumen_mask(portality_cropped)
-                _port_rgba = (cmap(Pm) * 255).astype(np.uint8)
-                _port_rgba[_lumen, :3] = LUMEN_DISPLAY_RGB
-                _port_rgba[_lumen, 3] = 255
+                overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
 
+                # Portality reference RGBA for the review viewer (pre-exclusion).
+                def _portality_rgba(P: np.ndarray) -> np.ndarray:
+                    _crop = P[min_r:max_r, min_c:max_c]
+                    _cm = plt.get_cmap("magma").copy(); _cm.set_bad(alpha=0.0)
+                    _rgba = (_cm(np.ma.masked_invalid(_crop).astype(np.float32)) * 255).astype(np.uint8)
+                    _lum = vessel_lumen_mask(_crop)
+                    _rgba[_lum, :3] = LUMEN_DISPLAY_RGB
+                    _rgba[_lum, 3] = 255
+                    return _rgba
+
+                # -- Interactive include/exclude (preview only) -------------------
+                if self.preview:
+                    # Both portality planes as reference layers, resized to the
+                    # segmentation (proc) resolution so they overlay the labels.
+                    _ph, _pw = mask_cropped.shape
+                    _port_layers = [
+                        (_name, cv2.resize(_portality_rgba(_P), (_pw, _ph),
+                                           interpolation=cv2.INTER_NEAREST))
+                        for _name, _P in (("Portality", P_base),
+                                          ("Portality (network)", P2_base))
+                    ]
+                    _sel_action, _excluded_labels = self._interactive_lobule_selection(
+                        overlay_vis, mask_cropped, _port_layers, _excluded_labels)
+                    if _sel_action == "back":
+                        _show_smoothing_preview = True
+                        continue
+                    if _sel_action == "abort" or (self.confirm and _sel_action == "closed"):
+                        console.print("Aborted by user at lobule review. No outputs written.",
+                                      style="error")
+                        return self.metadata
+
+                # -- Apply exclusion: NaN the excluded lobules in both planes -----
+                if _excluded_labels:
+                    _ex_mask = np.isin(mask_base_full, list(_excluded_labels))
+                    P_base[_ex_mask] = np.nan
+                    P2_base[_ex_mask] = np.nan
+                    import json as _json
+                    (report_path / "excluded_lobules.json").write_text(
+                        _json.dumps(sorted(int(x) for x in _excluded_labels)))
+
+                # -- Save portality figures (reflect exclusion) -------------------
+                _port_rgba = _portality_rgba(P_base)
                 plt.imsave(str(report_path / "portality.png"), _port_rgba)
 
-                # ----------------------------------------------------------------
-                # D. Instance overlay, written for every run, not just interactive
-                # ----------------------------------------------------------------
-                # This used to be built inside the `if self.preview` block below and
-                # only ever shown in napari, so a headless run produced the mask and
-                # portality TIFFs but no image you could actually look at.
-                overlay_vis = overlay_mask(img_stack, mask_cropped, alpha=0.5)
+                _p2_crop = P2_base[min_r:max_r, min_c:max_c]
+                if np.isfinite(_p2_crop).any():
+                    _cmap2 = plt.get_cmap("magma").copy(); _cmap2.set_bad(alpha=0.0)
+                    _rgba2 = (_cmap2(np.ma.masked_invalid(_p2_crop)) * 255).astype(np.uint8)
+                    _lines_crop = _net_lines[min_r:max_r, min_c:max_c]
+                    _rgba2[_lines_crop, :3] = (0, 200, 255)   # cyan network overlay
+                    _rgba2[_lines_crop, 3] = 255
+                    plt.imsave(str(report_path / "portality_network.png"), _rgba2)
+
+                # -- Instance overlay (excluded lobules dimmed + red) -------------
+                if _excluded_labels:
+                    _ex_crop = np.isin(mask_cropped, list(_excluded_labels))
+                    overlay_vis = overlay_vis.copy()
+                    # Fade excluded lobules to a dark red wash so it reads clearly
+                    # as "removed" against the bright kept lobules.
+                    overlay_vis[_ex_crop] = (
+                        0.30 * overlay_vis[_ex_crop].astype(np.float32)
+                        + 0.70 * np.array([120, 0, 0], np.float32)).astype(overlay_vis.dtype)
                 cv2.imwrite(str(report_path / "segmentation_overlay.png"),
                             cv2.cvtColor(overlay_vis, cv2.COLOR_RGB2BGR))
                 console.print(
                     f"Instance overlay -> {report_path / 'segmentation_overlay.png'} "
-                    f"({int(mask_cropped.max())} lobules)", style="info")
-
-                # ----------------------------------------------------------------
-                # E. Final review preview
-                # ----------------------------------------------------------------
-                if self.preview:
-
-                    # Same lumen treatment as the saved PNG above, so the preview
-                    # and the report agree on what a grey hole means.
-                    portality_rgba = _port_rgba.copy()
-                    portality_rgba[..., 3] = (portality_rgba[..., 3] * 0.85).astype(np.uint8)
-
-                    action = preview_images_napari(
-                        [overlay_vis, portality_rgba],
-                        titles=["Segmentation Overlay", "Portality"],
-                        require_confirm=self.confirm,
-                        return_action=True,
-                        include_confirm=True,
-                        include_back=True,
-                        confirm_text="Confirm and finish",
-                        back_text="Back to smoothing",
-                    )
-
-                    if action == "back":
-                        # Return to smoothing preview so user can tweak sigma / valley_pct.
-                        _show_smoothing_preview = True
-                        continue
-
-                    if self.confirm and action == "closed":
-                        console.print("Aborted by user at final preview. No outputs written.", style="error")
-                        return self.metadata
+                    f"({int(mask_cropped.max())} lobules, {len(_excluded_labels)} excluded)",
+                    style="info")
 
                 break  # confirmed (or no preview)
 
@@ -2629,10 +3336,12 @@ class LobuleSegmentor(BaseOperator):
 
         mask_pyramid: Dict[int, np.ndarray] = {}
         portality_pyramid: Dict[int, np.ndarray] = {}
+        portality_network_pyramid: Dict[int, np.ndarray] = {}
         for lvl, (Hdst, Wdst) in orig_shapes.items():
             if lvl == self.base_level:
                 mask_pyramid[lvl] = mask_base_full
                 portality_pyramid[lvl] = P_base
+                portality_network_pyramid[lvl] = P2_base
             else:
                 mask_pyramid[lvl] = cv2.resize(
                     mask_base_full, (Wdst, Hdst),
@@ -2640,6 +3349,10 @@ class LobuleSegmentor(BaseOperator):
                 ).astype(np.int32)
                 portality_pyramid[lvl] = cv2.resize(
                     P_base, (Wdst, Hdst),
+                    interpolation=cv2.INTER_LINEAR,
+                ).astype(np.float32)
+                portality_network_pyramid[lvl] = cv2.resize(
+                    P2_base, (Wdst, Hdst),
                     interpolation=cv2.INTER_LINEAR,
                 ).astype(np.float32)
 
@@ -2665,6 +3378,19 @@ class LobuleSegmentor(BaseOperator):
         )
         new_port.save(report_path)
         save_tif(portality_pyramid, portality_path, metadata=new_port)
+
+        # Save the second (vessel-network) portality plane as its own TIFF. It is
+        # written to the report but not returned, so callers and LobuleStatistics
+        # keep consuming the primary portality only.
+        portality_network_path = report_path / f"{new_uid}_portality_network.tiff"
+        new_port_net = Metadata(
+            path_original=portality_network_path,
+            path_storage=portality_network_path,
+            image_type="portality",
+            uid=new_uid + "_portality_network",
+        )
+        new_port_net.save(report_path)
+        save_tif(portality_network_pyramid, portality_network_path, metadata=new_port_net)
 
         console.print("Complete.", style="info")
 

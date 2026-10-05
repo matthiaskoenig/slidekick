@@ -23,6 +23,9 @@ not applied to the input of step 2. The two blurs are deliberately distinct, see
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
 from scipy.ndimage import binary_dilation, binary_fill_holes
@@ -70,7 +73,8 @@ def apply_clahe(ch: np.ndarray, clip_limit: float, tile_px: int) -> np.ndarray:
 
 
 def apply_flatfield(ch: np.ndarray, sigma: float,
-                    mask: np.ndarray | None = None) -> np.ndarray:
+                    mask: np.ndarray | None = None,
+                    mask_blur: np.ndarray | None = None) -> np.ndarray:
     """Divide channel by its masked-Gaussian local-background estimate.
 
     Masked-Gaussian division at *sigma*, then renormalise to the original peak
@@ -85,11 +89,19 @@ def apply_flatfield(ch: np.ndarray, sigma: float,
            is used instead of ``ch > 0``, which is unreliable in dark shading
            regions where tissue pixels read near-zero.  Always pass an explicit
            tissue mask when one is available; ``ch > 0`` is the fallback only.
+    mask_blur : optional precomputed ``gaussian_filter(mask, sigma)``. The
+           denominator blur depends only on *mask* and *sigma*, not on the
+           channel, so when the same mask is reused across a stack it can be
+           computed once and passed in to skip the repeat. Ignored (recomputed)
+           when *mask* is None.
     """
     _ch_f = ch.astype(np.float32)
     _fg = mask.astype(bool) if mask is not None else (_ch_f > 0)
     _num = _gaussian_filter(_ch_f, sigma=sigma)
-    _den = _gaussian_filter(_fg.astype(np.float32), sigma=sigma)
+    if mask_blur is not None and mask is not None:
+        _den = mask_blur
+    else:
+        _den = _gaussian_filter(_fg.astype(np.float32), sigma=sigma)
     _local_bg = np.where(_den > 1e-6, _num / np.maximum(_den, 1e-6), 0.0)
     _corrected = np.where(_fg, _ch_f / np.maximum(_local_bg, 1e-6), 0.0)
     _t_max = float(_corrected[_fg].max()) if _fg.any() else 0.0
@@ -130,13 +142,33 @@ def preprocess_stack(
     if tissue_mask is None:
         tissue_mask = image_stack.max(axis=-1) > 0
 
-    for _c in range(_n_ch):
+    # The flatfield denominator is gaussian_filter(tissue_mask, sigma); it does
+    # not depend on the channel, so blur the mask once and reuse it for every
+    # channel instead of repeating the large Gaussian per channel.
+    _mask_blur = (
+        _gaussian_filter(tissue_mask.astype(bool).astype(np.float32),
+                         sigma=local_bg_sigma)
+        if local_bg_sigma > 0 else None
+    )
+
+    def _correct_channel(_c: int) -> np.ndarray:
         _ch = apply_flatfield(_stack_f[..., _c], local_bg_sigma,
-                              mask=tissue_mask)
+                              mask=tissue_mask, mask_blur=_mask_blur)
         _clip = clahe_clip_limit
         if _c == pp_index and has_pp:
             _clip = clahe_clip_limit * clahe_pp_factor
-        _stack_corr[..., _c] = apply_clahe(_ch, _clip, clahe_tile_px)
+        return apply_clahe(_ch, _clip, clahe_tile_px)
+
+    # Each channel's flatfield + CLAHE is independent. The flatfield's large
+    # Gaussian dominates runtime and scipy/cv2 release the GIL, so running the
+    # channels on a thread pool gives a near-linear, bit-identical speedup (same
+    # calls, each channel writes its own slice).
+    if _n_ch > 1:
+        with ThreadPoolExecutor(max_workers=min(_n_ch, os.cpu_count() or 1)) as _ex:
+            for _c, _res in enumerate(_ex.map(_correct_channel, range(_n_ch))):
+                _stack_corr[..., _c] = _res
+    else:
+        _stack_corr[..., 0] = _correct_channel(0)
     return _stack_corr
 
 

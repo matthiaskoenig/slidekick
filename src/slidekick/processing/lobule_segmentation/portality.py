@@ -3,19 +3,23 @@
 Computes a continuous portality value for each pixel inside segmented lobule
 instances. Values are in [0, 1] where:
 
-- 0.0  instance boundaries and the tissue ring around portal vessels
+- 0.0  instance boundaries and the tissue ring around detected portal vessels
 - 1.0  the tissue ring around central veins
-- NaN  outside any instance, vessel lumens included
+- NaN  outside any instance, and detected central-vein / portal lumens
 
 The axis runs surface to surface, not lumen to lumen: a vessel lumen contains no
 tissue, so it has no zonation value and stays NaN. The endpoints sit on the
-immediate ring of tissue surrounding each detected vessel.
+immediate ring of tissue surrounding each detected vessel. Only detected central
+veins and portal vessels are landmarks; a hole the detector found but never
+classified is absorbed into its surrounding lobule and interpolated by position
+like ordinary tissue, rather than forcing a portal-style 0.0 around itself.
 
 The formula is ``P = d_PB / (d_PB + d_CV)`` where *PB* is the union of the
 instance boundary and the portal-vessel ring, *CV* is the central-vein ring, and
 *d* denotes the Euclidean distance transform.
 """
 
+import cv2
 import numpy as np
 from scipy.ndimage import binary_dilation, distance_transform_edt as edt, gaussian_filter
 from scipy.ndimage import label as _ndlabel
@@ -84,6 +88,276 @@ def vessel_lumen_mask(portality: np.ndarray) -> np.ndarray:
     edge_ids = np.unique(np.concatenate([
         nan_lab[0, :], nan_lab[-1, :], nan_lab[:, 0], nan_lab[:, -1]]))
     return ~finite & ~np.isin(nan_lab, edge_ids)
+
+
+def _component_centroids(mask: np.ndarray) -> np.ndarray:
+    """(x, y) centroid of each connected component of a boolean mask."""
+    m = mask.astype(np.uint8)
+    n, _lab, _stats, cents = cv2.connectedComponentsWithStats(m, 8)
+    if n <= 1:
+        return np.empty((0, 2), dtype=np.float64)
+    return cents[1:].astype(np.float64)          # drop background, (x, y)
+
+
+def _vessel_network_lines(cv_mask: np.ndarray, pf_mask: np.ndarray) -> np.ndarray:
+    """Rasterised non-crossing portal-central network (bool line mask).
+
+    Reduce the central veins and portal vessels to centroids, Delaunay-triangulate
+    all of them, and keep only the portal-central edges. Delaunay is planar, so the
+    bipartite subset never crosses, leaving each portal linked to the central veins
+    around it. Used for display alongside the portality field.
+    """
+    from scipy.spatial import Delaunay
+
+    h, w = cv_mask.shape
+    lines = np.zeros((h, w), dtype=bool)
+    cv_pts = _component_centroids(cv_mask.astype(bool))
+    pf_pts = _component_centroids(pf_mask.astype(bool))
+    if len(cv_pts) == 0 or len(pf_pts) == 0:
+        return lines
+
+    pts = np.vstack([cv_pts, pf_pts])
+    is_portal = np.concatenate([np.zeros(len(cv_pts), bool),
+                                np.ones(len(pf_pts), bool)])
+
+    edges: set[tuple[int, int]] = set()
+    if len(pts) >= 3:
+        try:
+            tri = Delaunay(pts)
+            for simplex in tri.simplices:
+                for a, b in ((simplex[0], simplex[1]),
+                             (simplex[1], simplex[2]),
+                             (simplex[2], simplex[0])):
+                    if is_portal[a] != is_portal[b]:      # keep portal-central only
+                        edges.add((a, b) if a < b else (b, a))
+        except Exception:
+            # Any triangulation failure (e.g. a collinear set) falls through to
+            # the nearest-central fallback below.
+            edges = set()
+
+    if not edges:
+        # Degenerate input (two points, or a collinear set Delaunay rejected):
+        # link each portal to its nearest central vein.
+        for j in range(len(cv_pts), len(pts)):
+            d = np.hypot(pts[:len(cv_pts), 0] - pts[j, 0],
+                         pts[:len(cv_pts), 1] - pts[j, 1])
+            i = int(np.argmin(d))
+            edges.add((i, j) if i < j else (j, i))
+
+    canvas = np.zeros((h, w), dtype=np.uint8)
+    for i, j in edges:
+        cv2.line(canvas,
+                 (int(round(pts[i, 0])), int(round(pts[i, 1]))),
+                 (int(round(pts[j, 0])), int(round(pts[j, 1]))), 1, 1)
+    return canvas.astype(bool)
+
+
+def _median_lobule_diameter(labels: np.ndarray) -> float:
+    """Equivalent diameter of the median-area lobule, for scale-free thresholds."""
+    if labels.max() <= 0:
+        return 0.0
+    areas = np.bincount(labels.ravel())
+    areas = areas[1:]                 # drop background
+    areas = areas[areas > 0]
+    if areas.size == 0:
+        return 0.0
+    return float(2.0 * np.sqrt(np.median(areas) / np.pi))
+
+
+def _label_triple_junctions(labels: np.ndarray, merge_dist: float) -> np.ndarray:
+    """Points where three or more lobules meet: the portal-triad sites.
+
+    A 3x3 patch qualifies when it contains at least three distinct non-zero
+    labels. Section-edge corners (two labels plus background) are deliberately
+    not included: unlike the synthetic generator, a real section edge is not a
+    portal site. Nearby hits are clustered so each corner yields one point.
+    Returns an (N, 2) array of (x, y).
+    """
+    h, w = labels.shape
+    scale = 4                          # downsample; the corner count is unchanged
+    small = cv2.resize(labels.astype(np.float32),
+                       (max(1, w // scale), max(1, h // scale)),
+                       interpolation=cv2.INTER_NEAREST).astype(np.int32)
+    sh, sw = small.shape
+    hits: list = []
+    for y in range(1, sh - 1):
+        for x in range(1, sw - 1):
+            uniq = set(small[y - 1:y + 2, x - 1:x + 2].ravel().tolist())
+            uniq.discard(0)
+            if len(uniq) >= 3:
+                hits.append((x * scale, y * scale))
+    if not hits:
+        return np.empty((0, 2), np.float64)
+    pts = np.array(hits, np.float64)
+    merged: list = []
+    used = np.zeros(len(pts), bool)
+    for i in range(len(pts)):
+        if used[i]:
+            continue
+        cluster = [pts[i]]
+        used[i] = True
+        for j in range(i + 1, len(pts)):
+            if not used[j] and np.linalg.norm(pts[i] - pts[j]) < merge_dist:
+                cluster.append(pts[j])
+                used[j] = True
+        merged.append(np.mean(cluster, axis=0))
+    return np.array(merged, np.float64)
+
+
+def _uncovered_junction_anchors(
+    labels: np.ndarray,
+    pf_b: np.ndarray,
+    tissue_mask: np.ndarray | None,
+    cap_px: float,
+    corridor_px: int,
+    merge_dist: float,
+) -> np.ndarray:
+    """Triple junctions not already served by a portal vessel in the same valley.
+
+    "Same valley" is geodesic: a junction is covered when a detected portal
+    vessel is reachable from it along the dark inter-lobule boundary corridor
+    (the ridge the watershed cut), without crossing a lobule interior, within
+    *cap_px* of geodesic travel. Uncovered junctions are returned as (x, y)
+    points to be added as portal anchors, so lobule corners with no detected
+    tract still carry a portal landmark. Junctions covered by a real vessel are
+    dropped: the vessel already anchors them.
+    """
+    junc = _label_triple_junctions(labels, merge_dist)
+    if len(junc) == 0:
+        return junc
+    # No portal vessel anywhere: none of the junctions can be covered.
+    if not pf_b.any():
+        return junc
+
+    from skimage.segmentation import find_boundaries
+    from skimage.graph import MCP_Geometric
+
+    corridor = binary_dilation(find_boundaries(labels, mode="thick"),
+                               iterations=int(max(1, corridor_px)))
+    if tissue_mask is not None:
+        corridor &= tissue_mask.astype(bool)
+
+    # Portal sources, snapped onto the corridor so the geodesic starts on it.
+    pf_src = pf_b & corridor
+    if not pf_src.any():
+        pf_src = binary_dilation(pf_b, iterations=int(max(1, corridor_px))) & corridor
+    if not pf_src.any():
+        return junc                    # portals sit off every valley: leave anchors
+
+    costs = np.where(corridor, 1.0, np.inf).astype(np.float64)
+    mcp = MCP_Geometric(costs)
+    cum, _ = mcp.find_costs([tuple(s) for s in np.argwhere(pf_src)])
+
+    # The junction sits on a label boundary, hence inside the corridor already;
+    # this small window only absorbs the few-px rounding from junction
+    # clustering. Keeping it small stops it from discounting the geodesic budget.
+    h, w = labels.shape
+    win = 3
+    uncovered: list = []
+    for x, y in junc:
+        xi, yi = int(round(x)), int(round(y))
+        r0, r1 = max(0, yi - win), min(h, yi + win + 1)
+        c0, c1 = max(0, xi - win), min(w, xi + win + 1)
+        sub = cum[r0:r1, c0:c1]
+        d = float(sub.min()) if sub.size else np.inf
+        if not np.isfinite(d) or d > cap_px:
+            uncovered.append((x, y))
+    return np.array(uncovered, np.float64) if uncovered else np.empty((0, 2), np.float64)
+
+
+def vessel_network_portality(
+    cv_mask: np.ndarray,
+    pf_mask: np.ndarray,
+    tissue_mask: np.ndarray | None = None,
+    labels: np.ndarray | None = None,
+    junction_geodesic_cap_px: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Boundary-free portality from vessel distances, plus the network lines.
+
+    A second portality plane that ignores the watershed lobule boundaries and is
+    driven by the detected vessels alone. Each pixel is valued by the zonation
+    index used in the Xenium spatial workflow::
+
+        Z = d_central / (d_central + d_portal)
+
+    where *d_central* and *d_portal* are the Euclidean distances to the nearest
+    central vein and nearest portal vessel. So Z = 0 on a central vein, Z = 1 on a
+    portal vessel, interpolated by position in between; along a central-portal axis
+    it runs 0 -> 1. The non-crossing portal-central network (Delaunay bipartite) is
+    returned alongside for display and reference.
+
+    Note the orientation is the REVERSE of the boundary-based
+    :func:`lobule_portality` (which puts 1 at the central vein): this plane follows
+    the Xenium zonation-index convention (0 = central/CV-associated,
+    1 = portal-associated) so it is directly comparable to that analysis.
+
+    Parameters
+    ----------
+    cv_mask, pf_mask : np.ndarray
+        Boolean masks of detected central-vein and portal-vessel pixels.
+    tissue_mask : np.ndarray or None
+        When given, the index is NaN outside it; the ratio itself is defined for
+        every pixel.
+    labels : np.ndarray or None
+        Predicted lobule label map. When given, triple junctions (where three or
+        more lobules meet: the anatomical portal-triad sites) are added as portal
+        anchors wherever no detected portal vessel is reachable from the junction
+        along the dark inter-lobule boundary in the same valley (geodesic). This
+        fills portal gaps where a tract was not detected, using the tessellation
+        geometry, and never crosses a lobule interior to borrow a vessel from a
+        different valley. Junctions already served by a real vessel are left to
+        that vessel.
+    junction_geodesic_cap_px : float or None
+        Maximum geodesic distance (px, along the boundary corridor) at which a
+        detected portal vessel counts as serving a junction. None auto-derives it
+        from the median lobule diameter.
+
+    Returns
+    -------
+    (portality, network_lines)
+        *portality*: float32 in [0, 1] (0 = central vein, 1 = portal), NaN outside
+        *tissue_mask* and all-NaN when no central vein or no portal anchor is
+        present. *network_lines*: bool mask of the connecting lines, for overlay.
+    """
+    h, w = cv_mask.shape
+    cv_b = cv_mask.astype(bool)
+    pf_b = pf_mask.astype(bool)
+
+    # Valley-aware junction anchoring: enrich the portal set with lobule-corner
+    # triads that no detected vessel reaches along their own valley.
+    if labels is not None and np.any(labels):
+        _diam = _median_lobule_diameter(labels)
+        _cap = (float(junction_geodesic_cap_px)
+                if junction_geodesic_cap_px is not None
+                else max(20.0, _diam))
+        _corr = max(4, int(round(0.05 * _diam))) if _diam > 0 else 6
+        _merge = max(10.0, 0.15 * _diam) if _diam > 0 else 40.0
+        try:
+            _anchors = _uncovered_junction_anchors(
+                labels, pf_b, tissue_mask, _cap, _corr, _merge)
+        except Exception:
+            _anchors = np.empty((0, 2), np.float64)
+        if len(_anchors):
+            _pf_u8 = pf_b.astype(np.uint8)
+            _r = max(2, int(round(0.02 * _diam))) if _diam > 0 else 4
+            for _x, _y in _anchors:
+                cv2.circle(_pf_u8, (int(round(_x)), int(round(_y))), _r, 1, -1)
+            pf_b = _pf_u8.astype(bool)
+
+    lines = _vessel_network_lines(cv_b, pf_b)
+
+    if not cv_b.any() or not pf_b.any():
+        return np.full((h, w), np.nan, dtype=np.float32), lines
+
+    d_cv = edt(~cv_b).astype(np.float32)
+    d_pv = edt(~pf_b).astype(np.float32)
+    port = (d_cv / (d_cv + d_pv + _DIVISION_GUARD)).astype(np.float32)
+    # Exact endpoints (the ratio already yields these; assign for clarity).
+    port[cv_b] = 0.0
+    port[pf_b] = 1.0
+    if tissue_mask is not None:
+        port[~tissue_mask.astype(bool)] = np.nan
+    return port, lines
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +497,13 @@ def lobule_portality(
     Returns
     -------
     np.ndarray
-        Float32 portality map, NaN outside lobules and inside vessel lumens.
-        0.0 = lobule boundary / portal-vessel ring, 1.0 = central-vein ring.
+        Float32 portality map, NaN outside lobules and inside detected CV/portal
+        lumens. 0.0 = lobule boundary / detected-portal-vessel ring, 1.0 =
+        central-vein ring. Holes the detector left unclassified are relabelled into
+        the surrounding lobule and receive an interpolated value, so only the two
+        detected vessel types are landmarks.
 
-        Leaving lumens NaN keeps them out of downstream selections such as
+        Leaving detected lumens NaN keeps them out of downstream selections such as
         ``LobuleStatistics``, which picks pixels with ``isfinite``; lumens carry
         no stain, so including them would drag the outermost portality bins down.
     """
@@ -236,6 +513,32 @@ def lobule_portality(
     portality = np.full((h, w), np.nan, dtype=np.float32)
     cv_mask = cv_mask.astype(bool)
     pf_mask = pf_mask.astype(bool)
+
+    # Absorb unclassified holes into the surrounding lobule.
+    #
+    # The watershed carries every detected hole as label 0 (noise specks and
+    # missed vessels as well as the classified CV and portal lumens). Only
+    # detected central veins and portal vessels are real landmarks: a CV ring is
+    # the 1.0 end of the axis, a portal ring the 0.0 end, and both lumens are left
+    # NaN. An unclassified hole is none of those and must not act as a portal, so
+    # it is relabelled into its nearest lobule; it then receives an interpolated
+    # value by position like ordinary tissue and no longer forces a 0.0 boundary
+    # around itself. Enclosed holes are found by topology (label-0 regions that do
+    # not reach an image border, so the true exterior background is left alone).
+    _bg = labels == 0
+    if _bg.any():
+        _bg_lbl, _n_bg = _ndlabel(_bg)
+        if _n_bg:
+            _border = np.unique(np.concatenate([
+                _bg_lbl[0, :], _bg_lbl[-1, :], _bg_lbl[:, 0], _bg_lbl[:, -1]]))
+            _border = _border[_border > 0]
+            _interior_holes = _bg & ~np.isin(_bg_lbl, _border)
+            _unclassified = _interior_holes & ~cv_mask & ~pf_mask
+            _tissue = labels > 0
+            if _unclassified.any() and _tissue.any():
+                _, (_iy, _ix) = edt(~_tissue, return_indices=True)
+                labels = labels.copy()
+                labels[_unclassified] = labels[_iy[_unclassified], _ix[_unclassified]]
 
     # Connected components of the central-vein mask, so a lobule can adopt an
     # entire vein rather than the sliver that happens to fall inside its
@@ -318,8 +621,10 @@ def lobule_portality(
         portality[cv_anchor & region] = 1.0
         portality[pb & region] = 0.0
 
-    # Lumens are deliberately left NaN. They are holes in the watershed
-    # foreground carrying label 0, so `portality[region]` never touches them, and
-    # a lumen holds no tissue whose zonation could be reported. The endpoints of
-    # the axis live on the vessel surfaces, assigned per lobule above.
+    # Detected CV and portal lumens are deliberately left NaN. They are holes in
+    # the watershed foreground carrying label 0, so `portality[region]` never
+    # touches them, and a lumen holds no tissue whose zonation could be reported.
+    # The endpoints of the axis live on the vessel surfaces, assigned per lobule
+    # above. Unclassified holes were relabelled into a lobule at the top, so they
+    # are valued here rather than left NaN.
     return portality

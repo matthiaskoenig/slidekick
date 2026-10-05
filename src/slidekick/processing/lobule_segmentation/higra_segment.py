@@ -24,6 +24,12 @@ from scipy.ndimage import binary_fill_holes as _fill_holes
 from skimage.filters import threshold_otsu
 
 
+# A relaxed (dark) intensity seed is suppressed by a nearby bright seed only when
+# the bright one is at least this much brighter (ratio). Larger = less aggressive
+# cleanup; 0 would suppress on any brightness difference.
+_SEED_DOMINANCE_MARGIN = 0.5
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -286,6 +292,37 @@ def _find_intensity_cluster_seeds(
         )
         if not too_close:
             kept_peaks.append((y, x))
+
+    # Step 3b: brightness-dominance cleanup.
+    # The relaxed edge/CV-far thresholds let dim peaks through, and the NMS only
+    # enforces peak_min_dist spacing (half that near the edge), so a dim peak that
+    # sits farther than peak_min_dist from a bright peak is never compared against
+    # it and survives in clearly dark tissue. Drop such a relaxed (below the interior
+    # threshold) peak when a genuinely bright peak is within ~1.5 * peak_min_dist AND
+    # is clearly brighter (by _SEED_DOMINANCE_MARGIN), so near-equal peaks both
+    # survive. Isolated dim peaks (true CV-dropout lobules with no bright, much
+    # brighter neighbour) are kept.
+    if len(kept_peaks) > 1:
+        _bright_ref = float(np.percentile(fg_vals, peak_thresh_pct))
+        _bvals = np.array([blurred[y, x] for (y, x) in kept_peaks], dtype=np.float32)
+        _is_bright = _bvals >= _bright_ref
+        if _is_bright.any() and not _is_bright.all():
+            _dom_r2 = (1.5 * peak_min_dist) ** 2
+            _bright_pts = [(kept_peaks[j][0], kept_peaks[j][1], float(_bvals[j]))
+                           for j in range(len(kept_peaks)) if _is_bright[j]]
+            _cleaned: list[tuple[int, int]] = []
+            for i, (y, x) in enumerate(kept_peaks):
+                if _is_bright[i]:
+                    _cleaned.append((y, x))
+                    continue
+                _need = (1.0 + _SEED_DOMINANCE_MARGIN) * float(_bvals[i])
+                _dominated = any(
+                    bval >= _need and (y - by) ** 2 + (x - bx) ** 2 < _dom_r2
+                    for (by, bx, bval) in _bright_pts
+                )
+                if not _dominated:
+                    _cleaned.append((y, x))
+            kept_peaks = _cleaned
 
     # Step 4: coarse-basin cluster-merge
     if cluster_merge_sigma and cluster_merge_sigma > 0 and len(kept_peaks) > 1:
@@ -875,104 +912,6 @@ def _postprocess_labels(labels: np.ndarray, fg: np.ndarray, min_area: int = 1000
     return labels.astype(np.int32)
 
 
-def _merge_peakless_lobules(
-    labels: np.ndarray,
-    smoothed_blob: np.ndarray,
-    fg: np.ndarray,
-    peak_thresh_pct: float,
-) -> tuple:
-    """Merge lobules that contain no genuine PV-stain peak into their best neighbour.
-
-    A lobule "has a peak" when its maximum blob-smoothed PV value (inside fg)
-    exceeds the *peak_thresh_pct*-th percentile of all fg blob values. Peakless
-    lobules are fragments (edge slivers, split artefacts) and are absorbed into
-    whichever neighbour they share the most boundary pixels with.
-
-    Merging is iterated until every surviving lobule contains a peak.
-
-    A PP-based veto was tried here (skip the merge when a real portal tract sits
-    on the shared boundary, on the theory that such a lobule is genuine but has
-    its CV out of the section plane).  Measured on the full instance set it cost
-    0.006 PP IoU: the pipeline already runs correct-to-over-segmented, so
-    suppressing merges deepens over-segmentation rather than rescuing lobules.
-
-    Returns
-    -------
-    labels : np.ndarray (int32)
-        Updated label map.
-    peak_coords : dict[int, tuple[int, int]]
-        Surviving label id -> (row, col) of the brightest fg blob pixel in
-        that label.  Used by the caller to re-seed the second-pass watershed.
-    """
-    labels = labels.copy().astype(np.int32)
-    H, W = labels.shape
-
-    # blob_fg: smoothed PV restricted to fg (zero outside)
-    blob_fg = (smoothed_blob * fg.astype(np.float32)).astype(np.float32)
-    fg_vals = blob_fg[blob_fg > 0]
-    thr = float(np.percentile(fg_vals, peak_thresh_pct)) if len(fg_vals) else 0.0
-
-    def _peaks_per_label():
-        """Return {lid: (max_val, row, col)} for all positive labels."""
-        result = {}
-        for lid in np.unique(labels[labels > 0]):
-            lid = int(lid)
-            ys, xs = np.where(fg & (labels == lid))
-            if len(ys) == 0:
-                result[lid] = (0.0, 0, 0)
-                continue
-            vals = blob_fg[ys, xs]
-            best = int(np.argmax(vals))
-            result[lid] = (float(vals[best]), int(ys[best]), int(xs[best]))
-        return result
-
-    def _bnd_counts():
-        """Count shared boundary pixels for every adjacent label pair."""
-        counts = defaultdict(lambda: defaultdict(int))
-        max_id = int(labels.max()) + 1
-        for dy, dx in ((0, 1), (1, 0)):
-            la = labels[: H - dy if dy else H, : W - dx if dx else W]
-            lb = labels[dy:, dx:]
-            bnd = (la != lb) & (la > 0) & (lb > 0)
-            if not bnd.any():
-                continue
-            la_b = la[bnd].astype(np.int64)
-            lb_b = lb[bnd].astype(np.int64)
-            codes, cnts = np.unique(la_b * max_id + lb_b, return_counts=True)
-            for code, cnt in zip(codes.tolist(), cnts.tolist()):
-                a, b = int(code // max_id), int(code % max_id)
-                counts[a][b] += int(cnt)
-                counts[b][a] += int(cnt)
-        return counts
-
-    # Iterative merge until stable
-    for _ in range(50):                         # safety cap
-        info = _peaks_per_label()
-        peakless = [l for l, (mv, _, _) in info.items() if mv < thr]
-        if not peakless:
-            break
-        counts = _bnd_counts()
-        changed = False
-        for lid in peakless:
-            if not (labels == lid).any():
-                continue                         # absorbed in this round
-            nb = counts.get(lid)
-            if not nb:
-                continue                         # isolated -> left for postprocess
-            best_nb = max(nb, key=nb.__getitem__)
-            labels[labels == lid] = best_nb
-            changed = True
-        if not changed:
-            break
-
-    # Collect peak positions for surviving labels
-    peak_coords: dict = {}
-    for lid, (_, py, px) in _peaks_per_label().items():
-        peak_coords[lid] = (py, px)
-
-    return labels, peak_coords
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -988,6 +927,7 @@ def segment_lobules(
     peak_min_dist: int = 220,
     peak_thresh_pct: float = 40.0,
     valley_sigma: float = 25.0,
+    valley_gain_pct: float = 0.0,
     cluster_merge_sigma: float = 0.0,
     min_area_px: int = 20000,
     valley_merge_thr_pct: float | None = None,
@@ -1006,6 +946,9 @@ def segment_lobules(
     peak_thresh_factor: float = 0.0,
     seed_points_xy=None,
     seed_point_radius: int = 0,
+    barrier_points_xy=None,
+    barrier_point_radius: int = 0,
+    barrier_depth: float = 1.0,
     return_debug: bool = False,
 ) -> np.ndarray:
     """Segment liver lobules via Higra seeded watershed.
@@ -1060,6 +1003,11 @@ def segment_lobules(
     valley_sigma:
         Gaussian sigma for the valley-smoothed field used as watershed weights.
         Larger values produce smoother, more rounded lobule boundaries.
+    valley_gain_pct:
+        Valley amplification, 0-100. 0 disables it. When > 0, a gamma lift on the
+        watershed edge field raises faint valleys toward the strong ones, so more of
+        them show and can guide the cut. Acts on the final edge field, so it works
+        with and without a PP stain.
     cluster_merge_sigma:
         Coarse-scale sigma for basin-merging. 0 or None disables merging.
     min_area_px:
@@ -1080,6 +1028,20 @@ def segment_lobules(
         Dilation radius (pixels) applied around frozen valley pixels.
         Prevents the smoothed boundary from creeping up to or across a
         valley. Set to 0 to disable the buffer band.
+    barrier_points_xy : (N, 2) array or None
+        Hand-clicked anchor points, as (x, y) in the same padded frame as the
+        image. Each is stamped as a disc and burned into the edge map as a hard
+        wall the watershed will not cross. A split forms only where a seed sits
+        on each side of a wall. None disables the feature.
+    barrier_point_radius : int
+        Footprint radius (pixels) over which each anchor magnifies the PV valley.
+        0 picks a small default scaled to the image size; the Gaussian falloff uses
+        the same radius. This is the anchor's diameter, independent of its strength.
+    barrier_depth : float
+        Anchor magnification strength. Within each anchor footprint a local PV dip
+        (a faint/potential valley) is deepened by this factor times the dip depth,
+        so the valley is magnified and the whole pipeline then treats it as real.
+        0 disables it; flat tissue with no dip is never affected.
 
     Returns
     -------
@@ -1110,9 +1072,6 @@ def segment_lobules(
 
     fg = tissue & ~vessel_holes
     H, W = tissue.shape
-
-    # Blob-scale PV smooth: reused for seeding, peak validation, and re-seeding.
-    smoothed_blob = _masked_smooth(pv_stain, fg, blob_sigma)
 
     # -- Seeding --------------------------------------------------------------
     # An explicit seed set replaces the detectors entirely. This is what the
@@ -1154,7 +1113,8 @@ def segment_lobules(
             peak_thresh_factor=peak_thresh_factor,
         )
         seed_cnts = cv_seed_cnts + peak_seed_cnts
-    elif True:
+    else:
+        # No CV mask: intensity peaks are the only seeds.
         cv_seed_cnts = []
         peak_seed_cnts = _find_intensity_cluster_seeds(
             pv_stain, fg, np.zeros((H, W), dtype=bool),
@@ -1182,7 +1142,46 @@ def segment_lobules(
 
     markers = _make_markers_from_cnts(seed_cnts, H, W)
 
-    smoothed = _masked_smooth(pv_stain, tissue, valley_sigma)
+    # -- Anchor magnification -------------------------------------------------
+    # Anchors augment the PV data under their footprint so a faint or potential
+    # valley there is MAGNIFIED into a real one; the augmented PV then flows
+    # through every downstream valley map (watershed, merge, smoothing). Pure
+    # magnify: a local dip (PV below its broad local average, at valley scale) is
+    # deepened in proportion to barrier_depth and the footprint; flat/bright
+    # tissue has no dip so it is untouched, and the deepening follows the valley
+    # shape rather than being a round blob. Seeding above used the raw PV, so
+    # anchors never create seeds. No effect without anchors.
+    pv_valley = pv_stain
+    _has_pts = barrier_points_xy is not None and len(barrier_points_xy)
+    if _has_pts and barrier_depth > 0 and tissue.any():
+        _r = (int(barrier_point_radius) if barrier_point_radius > 0
+              else max(3, int(round(0.01 * max(H, W)))))
+        _S = np.zeros((H, W), np.float32)
+        for _pt in np.asarray(barrier_points_xy, float).reshape(-1, 2):
+            cv2.circle(_S, (int(round(_pt[0])), int(round(_pt[1]))), _r, 1.0, -1)
+        _fall = gaussian_filter(_S, sigma=float(_r))
+        _fm = float(_fall.max())
+        if _fm > 0:
+            _fall /= _fm
+        _S = np.maximum(_S, _fall)
+
+        def _mblur(_img, _sig):
+            _m = tissue.astype(np.float32)
+            _num = gaussian_filter(np.where(tissue, _img, 0.0).astype(np.float32), _sig)
+            _den = np.maximum(gaussian_filter(_m, _sig), 1e-6)
+            _o = _num / _den
+            _o[~tissue] = 0.0
+            return _o
+
+        _pvf = pv_stain.astype(np.float32)
+        _sig = _mblur(_pvf, max(1.0, float(valley_sigma)))            # valley-scale PV
+        _bg = _mblur(_pvf, max(float(valley_sigma) * 3.0, float(_r) * 2.0))  # broad interior
+        _dip = np.maximum(0.0, _bg - _sig)                            # potential-valley depth
+        _dip[~tissue] = 0.0
+        pv_valley = (_pvf - float(barrier_depth) * _S * _dip).astype(np.float32)
+        pv_valley = np.maximum(pv_valley, 0.0)
+
+    smoothed = _masked_smooth(pv_valley, tissue, valley_sigma)
 
     mx_val = smoothed[tissue].max() if tissue.any() else 1.0
     inverted = mx_val - smoothed
@@ -1193,10 +1192,10 @@ def segment_lobules(
     # so that Sobel gradient detects all boundaries, even between a bright and
     # dim lobule where the absolute gradient would be near zero.
     if edge_local_contrast_sigma > 0:
-        _lcn_mean = _masked_smooth(pv_stain, tissue, edge_local_contrast_sigma)
-        _lcn_sq = _masked_smooth(pv_stain ** 2, tissue, edge_local_contrast_sigma)
+        _lcn_mean = _masked_smooth(pv_valley, tissue, edge_local_contrast_sigma)
+        _lcn_sq = _masked_smooth(pv_valley ** 2, tissue, edge_local_contrast_sigma)
         _lcn_std = np.sqrt(np.maximum(_lcn_sq - _lcn_mean ** 2, 1e-6))
-        _pv_lcn = (pv_stain - _lcn_mean) / _lcn_std
+        _pv_lcn = (pv_valley - _lcn_mean) / _lcn_std
         _pv_lcn[~tissue] = 0.0
         smoothed_grad = _masked_smooth(_pv_lcn, tissue, valley_sigma)
     else:
@@ -1260,6 +1259,22 @@ def segment_lobules(
     edge_map = cv2.medianBlur(
         edge_map.astype(np.float32), 3,
     )
+    # Valley gain: amplify faint valleys. A gamma lift (gamma < 1) on the normalised
+    # edge field raises low/faint evidence toward the strong valleys while leaving the
+    # strong ones near the top and preserving their order, so more faint valleys show
+    # and become followable by the watershed. 0 disables it (bit-identical).
+    if valley_gain_pct > 0 and fg.any():
+        _mx = float(edge_map[fg].max())
+        if _mx > 0:
+            _g = 1.0 - 0.9 * min(1.0, valley_gain_pct / 100.0)   # gamma in [0.1, 1]
+            _e = edge_map.copy()
+            _norm = np.clip(edge_map[fg] / _mx, 0.0, 1.0)
+            _e[fg] = (np.power(_norm, _g) * _mx).astype(np.float32)
+            edge_map = _e.astype(np.float32)
+
+    # Anchors acted on the PV data upstream (pv_valley) and the gain above is in, so
+    # edge_map here is exactly what the watershed cuts; the preview shows it.
+    edge_map_base = edge_map
 
     graph = hg.get_8_adjacency_graph((H, W))
     edge_weights = hg.weight_graph(graph, edge_map, hg.WeightFunction.mean)
@@ -1295,7 +1310,9 @@ def segment_lobules(
         )
 
     if fg.any():
-        _smooth_merge = _masked_smooth(pv_stain, tissue, valley_merge_sigma)
+        # pv_valley carries the anchor magnification, so a seam running through an
+        # anchor-magnified valley reads as a dark valley here and is not merged.
+        _smooth_merge = _masked_smooth(pv_valley, tissue, valley_merge_sigma)
         try:
             # Percentile threshold is more robust than Otsu under residual
             # shading: it always selects the darkest N% of foreground pixels
@@ -1329,53 +1346,8 @@ def segment_lobules(
     labels = _postprocess_labels(labels, fg, min_area=min_area_px)
     _tally("postprocess_min_area")
 
-    # -- Peak validation: merge peakless lobules -------------------------------
-    # Each genuine lobule has a PV brightness peak (perivenular zone near the CV).
-    # Lobules without a peak are fragments: split artefacts or edge slivers.
-    # They are absorbed into the neighbour with the longest shared boundary.
-    labels, peak_coords = _merge_peakless_lobules(
-        labels, smoothed_blob, fg, peak_thresh_pct,
-    )
-    _tally("merge_peakless")
-
-    # -- Fine-scale peak refinement --------------------------------------------
-    # _merge_peakless_lobules returns the peak at blob_sigma scale ( approx.  lobule
-    # radius), which can be offset by several pixels from the true CV centre.
-    # Re-localise each peak at a finer Gaussian scale (30 % of blob_sigma) so
-    # that the second-pass watershed seeds are placed as close as possible to
-    # the actual PV brightness maximum (i.e. the CV lumen edge).
-    if peak_coords:
-        _fine_sigma = max(4.0, blob_sigma * 0.3)
-        _smoothed_fine = _masked_smooth(pv_stain, fg, _fine_sigma)
-        _refined_coords: dict = {}
-        for _lid, (_py, _px) in peak_coords.items():
-            _ys, _xs = np.where(fg & (labels == _lid))
-            if len(_ys) == 0:
-                _refined_coords[_lid] = (_py, _px)
-                continue
-            _vals = _smoothed_fine[_ys, _xs]
-            _best = int(np.argmax(_vals))
-            _refined_coords[_lid] = (int(_ys[_best]), int(_xs[_best]))
-        peak_coords = _refined_coords
-
-    # -- Second-pass watershed from confirmed PV peaks -------------------------
-    # After the merge the seed set has changed. Re-seed from the refined PV
-    # brightness maxima (inside fg tissue) rather than from the original CV
-    # centroids. The same PV+PP edge-weight graph is reused, with no extra
-    # computation. Every fg pixel is freshly assigned to its nearest confirmed
-    # lobule centre through the strongest available boundary landscape.
-    if peak_coords:
-        _fresh = np.zeros((H, W), np.int32)
-        _r = max(5, peak_min_dist // 8)
-        for _lid, (_py, _px) in peak_coords.items():
-            cv2.circle(_fresh, (int(_px), int(_py)), _r, int(_lid), -1)
-        labels = hg.labelisation_seeded_watershed(graph, edge_weights, _fresh)
-        labels[~fg] = 0
-        labels = labels.astype(np.int32)
-    _tally("second_watershed")
-
     # -- CV-aware spurious-fragment removal -----------------------------------
-    # After the second-pass watershed, small regions that contain no CV pixel
+    # After the watershed, small regions that contain no CV pixel
     # are likely boundary artefacts or tissue-edge slivers. Absorb them into
     # the nearest surviving neighbour (Voronoi fill). Regions that do contain
     # a CV are kept unconditionally; removing them would discard a genuine
@@ -1420,5 +1392,14 @@ def segment_lobules(
             "peak_seed_xy": peak_seed_xy,
             "n_seeds": int(len(seed_cnts)),
             "stage_counts": _stage_counts,
+            # Boundary-evidence field the watershed cuts along, [0, 1], high =
+            # likely lobule wall (dark PV valley, or bright PP when blended in).
+            # Exposed so an interactive preview can show the evidence rather than
+            # a filled segmentation that will not survive to full resolution.
+            "edge_map": edge_map,
+            # The same field before anchor wells were stamped in; equal to edge_map
+            # when no anchors are present. Lets the preview stretch the display by
+            # the natural valleys so the wells do not wash them out.
+            "edge_map_base": edge_map_base,
         }
     return labels

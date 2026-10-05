@@ -1,6 +1,8 @@
 import numpy as np
+import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from rich.prompt import Confirm, Prompt
 import zarr
@@ -817,8 +819,14 @@ class StainSeparator(BaseOperator):
                 separated_levels[ch][level] = mm
                 mmaps.append(mm)
 
-            # Tile loop
-            for ys, xs in _iter_tiles_hw(H, W, tile_size=tile_size):
+            # Tile loop. Each tile reads its own region, optionally
+            # background-subtracts, and writes into disjoint memmap regions, so
+            # the tiles are independent and run on a thread pool. Reads and the
+            # vectorized numpy math both release the GIL, so threading overlaps
+            # them for a several-fold speedup; the disjoint writes keep the
+            # result byte-identical to a serial run regardless of tile order.
+            def _process_tile(bounds):
+                ys, xs = bounds
                 if cax == 0:
                     tile_cyx = np.asarray(src[:, ys, xs])  # (C,h,w)
                 elif cax == 2:
@@ -844,6 +852,15 @@ class StainSeparator(BaseOperator):
 
                 for ch in range(n_ch):
                     mmaps[ch][0, ys, xs] = tile_out[ch, :, :]
+
+            tiles = list(_iter_tiles_hw(H, W, tile_size=tile_size))
+            n_workers = min(len(tiles), (os.cpu_count() or 1), 8)
+            if n_workers > 1:
+                with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                    list(ex.map(_process_tile, tiles))
+            else:
+                for bounds in tiles:
+                    _process_tile(bounds)
 
             for mm in mmaps:
                 mm.flush()
