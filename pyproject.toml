@@ -35,7 +35,7 @@ dependencies = [
     "bounded-pool-executor==0.0.3",
     "build==1.3.0",
     "cachey==0.2.1",
-    "certifi==2025.8.3",
+    "certifi==2026.10.19",  # GHSA-6q48-6c7w-9gw2: emSign roots with compromised intermediates
     "cffi==1.17.1",
     "charset-normalizer==3.4.3",
     "cjdk==0.4.1",
