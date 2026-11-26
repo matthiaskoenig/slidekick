@@ -15,12 +15,41 @@ from slidekick.io.czi import czi2tiff
 
 # VALIS imports
 from valis import registration, slide_io
+from valis import feature_detectors, feature_matcher, non_rigid_registrars, warp_tools
+from skimage import transform as sktransform
 
-import matplotlib
-matplotlib.use("QtAgg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pyvips
+
+# ---------------------------------------------------------------------------
+# Backend choices exposed to the user. These select the actual VALIS algorithm
+# used for registration (as opposed to just the preview/stage shown).
+# ---------------------------------------------------------------------------
+RIGID_TRANSFORMS = {
+    "similarity": sktransform.SimilarityTransform,  # rotation + translation + uniform scale (default)
+    "euclidean": sktransform.EuclideanTransform,    # rigid body: rotation + translation only
+    "affine": sktransform.AffineTransform,          # + shear / anisotropic scale
+}
+
+# Non-rigid backends. "none" disables non-rigid refinement (rigid-only result).
+NON_RIGID_METHODS = {
+    "optical_flow": non_rigid_registrars.OpticalFlowWarper,  # default
+    "elastix": non_rigid_registrars.SimpleElastixWarper,     # B-spline (SimpleElastix)
+    "raft": non_rigid_registrars.RAFTWarper,                 # deep optical flow (RAFT)
+    "none": None,
+}
+
+# Feature detectors. "default" keeps VALIS' modern LightGlue + Disk deep-matching
+# pipeline. Any other choice switches to classic detect-and-match, and we pair the
+# detector with a matching classic Matcher so the two stay consistent.
+FEATURE_DETECTORS = {
+    "default": None,
+    "vgg": feature_detectors.VggFD,
+    "orb": feature_detectors.OrbFD,
+    "brisk": feature_detectors.BriskFD,
+    "akaze": feature_detectors.AkazeFD,
+    "sensitive": feature_detectors.SuperPointFD,
+}
 
 class ValisRegistrator(BaseOperator):
     """
@@ -44,6 +73,11 @@ class ValisRegistrator(BaseOperator):
         micro_registration: bool = False,
         crop: str = "reference",
         transform_czi: Optional[List[int]] = None,
+        rigid_transform: str = "similarity",
+        non_rigid_method: str = "optical_flow",
+        feature_detector: str = "default",
+        registration_stage: str = "auto",
+        preview_max_dim_px: int = 600,
     ):
 
         """
@@ -75,7 +109,34 @@ class ValisRegistrator(BaseOperator):
             Use micro registration
         crop
             Cropping style of VALIS
+        rigid_transform
+            Rigid transform model: "similarity" (default), "euclidean"
+            (rigid body, no scale), or "affine".
+        non_rigid_method
+            Non-rigid backend: "optical_flow" (default), "elastix", "raft",
+            or "none" to skip non-rigid refinement (rigid-only result).
+        feature_detector
+            Feature backend: "default" (VALIS' LightGlue + Disk deep matching),
+            or a classic detector "vgg" / "orb" / "brisk" / "akaze" /
+            "sensitive" (SuperPoint).
+        registration_stage
+            Which stage's transform to apply to the full-resolution slides:
+            "rigid", "non_rigid", "micro", or "auto" (best available). With an
+            interactive napari preview this is the pre-selected default; the
+            final choice is whatever stage is active when you click Apply.
+        preview_max_dim_px
+            Long-side resolution (px) at which warped stages are rendered in the
+            napari preview. The warp reads the smallest pyramid level >= this
+            size, so cost is bounded regardless of slide size. Higher = more
+            detail to judge micro alignment, but slower to build. Default 600;
+            the napari preview seeds its "preview px" field from this value.
         """
+        self._validate_backend(rigid_transform, non_rigid_method, feature_detector, registration_stage)
+        self.rigid_transform = str(rigid_transform)
+        self.non_rigid_method = str(non_rigid_method)
+        self.feature_detector = str(feature_detector)
+        self.registration_stage = str(registration_stage)
+        self.preview_max_dim_px = int(preview_max_dim_px)
         self.save_img = save_img
         channel_selection = None
         self.imgs_ordered = imgs_ordered
@@ -100,9 +161,70 @@ class ValisRegistrator(BaseOperator):
         # For inspection / downstream use
         self.error_df = None
         self.error_metric_px = None
+        self.applied_stage: Optional[str] = None
         self.results_root_dir: Optional[Path] = None
 
         super().__init__(metadata, channel_selection)
+
+    @staticmethod
+    def _validate_backend(rigid_transform, non_rigid_method, feature_detector, registration_stage):
+        """Fail fast on unknown backend / stage choices (before VALIS is invoked)."""
+        if rigid_transform not in RIGID_TRANSFORMS:
+            raise ValueError(
+                f"rigid_transform={rigid_transform!r} not in {sorted(RIGID_TRANSFORMS)}"
+            )
+        if non_rigid_method not in NON_RIGID_METHODS:
+            raise ValueError(
+                f"non_rigid_method={non_rigid_method!r} not in {sorted(NON_RIGID_METHODS)}"
+            )
+        if feature_detector not in FEATURE_DETECTORS:
+            raise ValueError(
+                f"feature_detector={feature_detector!r} not in {sorted(FEATURE_DETECTORS)}"
+            )
+        valid_stages = {"auto", "rigid", "non_rigid", "micro"}
+        if registration_stage not in valid_stages:
+            raise ValueError(
+                f"registration_stage={registration_stage!r} not in {sorted(valid_stages)}"
+            )
+
+    def _valis_backend_kwargs(self) -> dict:
+        """Translate the user's backend choices into registration.Valis kwargs."""
+        kwargs = {
+            "transformer_cls": RIGID_TRANSFORMS[self.rigid_transform],
+        }
+
+        nr_cls = NON_RIGID_METHODS[self.non_rigid_method]
+        if nr_cls is None:
+            # Rigid-only: disable non-rigid refinement entirely.
+            kwargs["non_rigid_registrar_cls"] = None
+        else:
+            kwargs["non_rigid_registrar_cls"] = nr_cls()
+
+        fd_cls = FEATURE_DETECTORS[self.feature_detector]
+        if fd_cls is not None:
+            # Classic detect-and-match: pair detector with a matching classic Matcher
+            # so the LightGlue default (which only works with its own descriptors)
+            # is not left mismatched against a hand-picked detector.
+            kwargs["feature_detector_cls"] = fd_cls
+            kwargs["matcher"] = feature_matcher.Matcher(feature_detector=fd_cls())
+
+        return kwargs
+
+    def _available_stages(self) -> list:
+        """Stages that actually exist for the current backend configuration."""
+        stages = ["rigid"]
+        if self.non_rigid_method != "none":
+            stages.append("non_rigid")
+            if self.micro_registration:
+                stages.append("micro")
+        return stages
+
+    def _resolve_stage(self, stage: str) -> str:
+        """Map 'auto' to the best available stage; clamp an explicit choice."""
+        available = self._available_stages()
+        if stage == "auto" or stage not in available:
+            return available[-1]
+        return stage
 
     @staticmethod
     def _compute_registration_error(error_df) -> float:
@@ -225,12 +347,15 @@ class ValisRegistrator(BaseOperator):
             max_non_rigid_registration_dim_px=max_nonrigid_dim,
             imgs_ordered=self.imgs_ordered,
             crop=self.crop,
+            **self._valis_backend_kwargs(),
         )
 
         try:
             rigid_registrar, non_rigid_registrar, error_df = registrar.register()
 
-            if self.micro_registration:
+            # Micro registration refines the non-rigid field, so it only applies
+            # when a non-rigid backend is active.
+            if self.micro_registration and self.non_rigid_method != "none":
                 registrar.register_micro(
                     max_non_rigid_registration_dim_px=max_micro_dim
                 )
@@ -334,6 +459,284 @@ class ValisRegistrator(BaseOperator):
                     meta.enrich_from_storage(overwrite=False)
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------ #
+    # Interactive napari preview
+    # ------------------------------------------------------------------ #
+    def _render_stage_images(self, registrar):
+        """
+        Build preview images per slide and per stage.
+
+        Warped stages (rigid / non_rigid / micro) are rendered from real pyramid
+        pixels at up to `preview_max_dim_px` on the long side (reading the
+        smallest pyramid level >= that size, so warp cost stays bounded). The
+        "original" reference and the pre-micro coarse non-rigid stay at thumbnail
+        resolution. The full-resolution warp still only happens after Apply.
+
+        Returns a list of dicts: {"name", "original"(RGB), "rigid"(gray),
+        "non_rigid"(gray|None), "micro"(gray|None)}.
+        """
+        MAX_SIDE = int(self.preview_max_dim_px)
+        warnings.filterwarnings(
+            "ignore",
+            message="scaling transformation for image with different shape",
+            category=UserWarning,
+        )
+
+        def _downsample(img):
+            if img is None:
+                return None
+            a = np.asarray(img)
+            H, W = a.shape[:2]
+            if max(H, W) <= MAX_SIDE:
+                return a
+            s = max(int(np.ceil(max(H, W) / float(MAX_SIDE))), 1)
+            return a[::s, ::s] if a.ndim == 2 else a[::s, ::s, :]
+
+        def _stretch99(x, invert=False):
+            x = np.asarray(x).astype(np.float32, copy=False)
+            if invert:  # brightfield: dark tissue on bright bg -> make tissue bright
+                x = float(np.nanmax(x)) - x
+            lo, hi = np.percentile(x, (1, 99))
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                lo = float(np.nanmin(x)) if np.isfinite(np.nanmin(x)) else 0.0
+                hi = float(np.nanmax(x)) if np.isfinite(np.nanmax(x)) else 1.0
+                if hi <= lo:
+                    hi = lo + 1.0
+            y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+            return (y * 255.0).astype(np.uint8)
+
+        def _to_gray(arr, is_bf):
+            """Collapse to a single channel: luminance for brightfield, max-proj for fluorescence."""
+            a = np.asarray(arr)
+            if a.ndim == 2:
+                return a
+            if a.shape[2] == 1:
+                return a[..., 0]
+            if is_bf:
+                return a[..., :3].astype(np.float32).mean(axis=2)  # luminance
+            return a.max(axis=2)  # fluorescence: brightest channel wins
+
+        def _original_gray(slide):
+            """Unregistered reference as tissue-bright intensity (thumbnail res)."""
+            is_bf = bool(getattr(slide, "is_rgb", False))
+            src = getattr(slide, "image", None)
+            if src is None:
+                src = slide.processed_img
+                is_bf = False  # processed_img is already fluorescence-like
+            return _downsample(_stretch99(_to_gray(src, is_bf), invert=is_bf))
+
+        def _coarse_non_rigid(slide):
+            """Pre-micro coarse non-rigid from VALIS' saved thumbnail (always fluorescence-like)."""
+            nr_path_str = getattr(slide, "nr_rigid_reg_img_f", None)
+            if not nr_path_str:
+                return None
+            nr_path = Path(nr_path_str)
+            if not nr_path.exists():
+                return None
+            try:
+                v = pyvips.Image.new_from_file(str(nr_path), access="sequential")
+                arr = warp_tools.vips2numpy(v)
+                return _downsample(_stretch99(_to_gray(arr, is_bf=False)))
+            except Exception:
+                return None
+
+        def _target_level(slide):
+            """Smallest pyramid level whose long side is still >= MAX_SIDE."""
+            dims = np.asarray(slide.slide_dimensions_wh)  # level 0 = full res
+            long_sides = dims.max(axis=1)
+            ok = np.where(long_sides >= MAX_SIDE)[0]
+            return int(ok[-1]) if ok.size else 0
+
+        def _warp_gray(slide, non_rigid):
+            """Warp a real pyramid level, resize to MAX_SIDE, return tissue-bright intensity."""
+            is_bf = bool(getattr(slide, "is_rgb", False))
+            try:
+                lvl = _target_level(slide)
+                v = slide.warp_slide(level=lvl, non_rigid=non_rigid, crop=True)  # pyvips.Image
+                long = max(v.width, v.height)
+                if long > MAX_SIDE:
+                    v = v.resize(MAX_SIDE / float(long))
+                arr = warp_tools.vips2numpy(v)
+                return _stretch99(_to_gray(arr, is_bf), invert=is_bf)
+            except Exception:
+                # Fallback to the low-res registration image if the level warp fails
+                try:
+                    return _downsample(_stretch99(
+                        slide.warp_img(img=slide.processed_img, non_rigid=non_rigid, crop=True)))
+                except Exception:
+                    return None
+
+        out = []
+        n = len(registrar.slide_dict)
+        for i, slide in enumerate(registrar.slide_dict.values(), start=1):
+            console.print(f"[preview] rendering {slide.name} ({i}/{n}) at <= {MAX_SIDE}px", style="info")
+            entry = {"name": slide.name, "original": _original_gray(slide),
+                     "rigid": None, "non_rigid": None, "micro": None}
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=UserWarning)
+                entry["rigid"] = _warp_gray(slide, non_rigid=False)
+
+                if self.non_rigid_method != "none":
+                    if self.micro_registration:
+                        # warp_slide(non_rigid=True) uses the micro-composed field.
+                        # The pre-micro coarse non-rigid is only available from VALIS'
+                        # saved thumbnail, so it stays at thumbnail resolution.
+                        entry["non_rigid"] = _coarse_non_rigid(slide)
+                        entry["micro"] = _warp_gray(slide, non_rigid=True)
+                    else:
+                        entry["non_rigid"] = _warp_gray(slide, non_rigid=True)
+            out.append(entry)
+        return out
+
+    def _napari_preview(self, registrar):
+        """
+        Open an interactive napari viewer. Each slide/stage is a layer you can
+        zoom, pan and toggle. A dock widget lets you switch the active stage and
+        then Apply (warp the full-res slides with that stage) or Abort.
+
+        Returns (do_apply: bool, stage: str).
+        """
+        import napari
+        from magicgui.widgets import ComboBox, PushButton, Container, Label, SpinBox
+
+        stages = self._available_stages()
+        default_stage = self._resolve_stage(self.registration_stage)
+
+        # Each slide gets its own color; additive blending makes co-registered
+        # structures blend (toward white) and misalignment show as colored fringes.
+        palette = ["green", "magenta", "cyan", "yellow", "red", "bop blue",
+                   "bop orange", "blue"]
+
+        viewer = napari.Viewer(title="VALIS registration preview")
+
+        # Mutable layer bookkeeping, rebuilt whenever the preview px changes.
+        state = {"stage_layers": {}, "view_layers": {}, "views": []}
+        active = {"view": default_stage}
+        result = {"apply": False, "stage": default_stage}
+
+        def _build_layers(entries):
+            """(Re)create one colored, additive layer per slide per view."""
+            stage_layers = {s: [] for s in stages}
+            original_layers = []
+            for si, entry in enumerate(entries):
+                name = entry["name"]
+                cmap = palette[si % len(palette)]
+                if entry["original"] is not None:
+                    original_layers.append(
+                        viewer.add_image(entry["original"], name=f"{name} · original",
+                                         colormap=cmap, blending="additive", visible=True)
+                    )
+                for s in stages:
+                    img = entry.get(s)
+                    if img is None:
+                        continue
+                    stage_layers[s].append(
+                        viewer.add_image(img, name=f"{name} · {s}", colormap=cmap,
+                                         blending="additive", visible=False)
+                    )
+            view_layers = {}
+            if original_layers:
+                view_layers["original"] = original_layers
+            for s in stages:
+                view_layers[s] = stage_layers[s]
+            state["stage_layers"] = stage_layers
+            state["view_layers"] = view_layers
+            state["views"] = list(view_layers.keys())
+
+        def _show_view(view):
+            if view not in state["view_layers"]:
+                view = state["views"][-1]
+            active["view"] = view
+            for v, layers in state["view_layers"].items():
+                for lyr in layers:
+                    lyr.visible = (v == view)
+
+        def _show_and_sync(view):
+            _show_view(view)
+            if active["view"] in stages and stage_combo.value != active["view"]:
+                # keep the apply-stage selector in step with what you're viewing
+                stage_combo.value = active["view"]
+
+        def _cycle(_=None):
+            views = state["views"]
+            nxt = views[(views.index(active["view"]) + 1) % len(views)]
+            _show_and_sync(nxt)
+
+        # Build the first set of layers.
+        entries = self._render_stage_images(registrar)
+        if not entries:
+            console.print("No slides for preview.", style="warning")
+            viewer.close()
+            return False, default_stage
+        _build_layers(entries)
+        _show_view(default_stage)
+        viewer.reset_view()
+
+        err = self.error_metric_px
+        err_txt = f"{err:.2f} px" if (err is not None and np.isfinite(err)) else "n/a"
+
+        info = Label(value=(f"median error: {err_txt}   |   backend: "
+                            f"{self.rigid_transform}/{self.non_rigid_method}/{self.feature_detector}"))
+        stage_combo = ComboBox(label="apply stage", choices=stages, value=default_stage)
+        px_box = SpinBox(label="preview px", value=int(self.preview_max_dim_px),
+                         min=32, max=16384, step=1)
+        recompute_btn = PushButton(text="Recompute at this px")
+        cycle_btn = PushButton(text=f"Cycle view  [{' › '.join(state['views'])}]   (C)")
+        apply_btn = PushButton(text="Apply at full resolution")
+        abort_btn = PushButton(text="Abort")
+
+        def _recompute(_=None):
+            new_px = int(px_box.value)
+            self.preview_max_dim_px = new_px
+            keep = active["view"]
+            console.print(f"[preview] recomputing warped stages at <= {new_px}px ...", style="info")
+            recompute_btn.enabled = False
+            recompute_btn.text = "Recomputing ..."
+            try:
+                new_entries = self._render_stage_images(registrar)
+                viewer.layers.clear()
+                _build_layers(new_entries)
+                _show_view(keep)
+                viewer.reset_view()
+            except Exception as e:
+                console.print(f"[preview] recompute failed: {e}", style="error")
+            finally:
+                recompute_btn.enabled = True
+                recompute_btn.text = "Recompute at this px"
+
+        @stage_combo.changed.connect
+        def _on_stage_change(value):
+            result["stage"] = value
+            _show_and_sync(value)
+
+        recompute_btn.changed.connect(_recompute)
+        cycle_btn.changed.connect(_cycle)
+
+        @apply_btn.changed.connect
+        def _on_apply(_=None):
+            result["apply"] = True
+            result["stage"] = stage_combo.value
+            viewer.close()
+
+        @abort_btn.changed.connect
+        def _on_abort(_=None):
+            result["apply"] = False
+            viewer.close()
+
+        # One-key cycling for speed; keeps zoom/pan intact between flips.
+        @viewer.bind_key("c", overwrite=True)
+        def _cycle_key(_viewer):
+            _cycle()
+
+        panel = Container(widgets=[info, stage_combo, px_box, recompute_btn,
+                                   cycle_btn, apply_btn, abort_btn])
+        viewer.window.add_dock_widget(panel, area="right", name="Registration")
+
+        napari.run()  # blocks until the viewer is closed
+
+        return result["apply"], result["stage"]
 
     def apply(self):
         """
@@ -478,279 +881,42 @@ class ValisRegistrator(BaseOperator):
             self.error_df = error_df
             self.error_metric_px = self._compute_registration_error(error_df)
 
-        # Preview: rows = [original, rigid, non-rigid, (optional micro)] x cols = slides
+        # ------------------------------------------------------------------ #
+        # Interactive preview + choice of which stage to apply
+        # ------------------------------------------------------------------ #
+        default_stage = self._resolve_stage(self.registration_stage)
+        chosen_stage = default_stage
+        do_apply = True
+
         if self.preview:
             try:
-                slides = list(registrar.slide_dict.values())
-                if not slides:
-                    console.print("No slides for preview.", style="error")
-                    return self.metadata
-
-                MAX_SIDE = 2048
-                warnings.filterwarnings(
-                    "ignore",
-                    message="scaling transformation for image with different shape",
-                    category=UserWarning,
-                )
-
-                def _downsample_stride(img: np.ndarray, max_side: int = MAX_SIDE) -> np.ndarray:
-                    if img is None:
-                        return None
-                    a = np.asarray(img)
-                    H, W = a.shape[:2]
-                    if max(H, W) <= max_side:
-                        return a
-                    s = max(int(np.ceil(max(H, W) / float(max_side))), 1)
-                    return a[::s, ::s] if a.ndim == 2 else a[::s, ::s, :]
-
-                def _stretch99(x: np.ndarray) -> np.ndarray:
-                    x = x.astype(np.float32, copy=False)
-                    lo, hi = np.percentile(x, (1, 99))
-                    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                        lo = np.nanmin(x) if np.isfinite(np.nanmin(x)) else 0.0
-                        hi = np.nanmax(x) if np.isfinite(np.nanmax(x)) else 1.0
-                        if hi <= lo:
-                            hi = lo + 1.0
-                    y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
-                    return (y * 255.0).astype(np.uint8)
-
-                def _guess_brightfield(arr: np.ndarray) -> bool:
-                    a = np.asarray(arr)
-                    return a.ndim == 3 and a.shape[2] >= 3 and a.dtype == np.uint8
-
-                def _rgb_native(a: np.ndarray) -> np.ndarray:
-                    """Preserve brightfield colors. Take first 3 channels. No per-channel stretch."""
-                    x = np.asarray(a)
-                    if x.ndim == 2:
-                        x = np.repeat(x[:, :, None], 3, axis=2)
-                    else:
-                        x = x[..., :3]
-                    if x.dtype == np.uint8:
-                        return x
-                    if x.dtype == np.uint16:
-                        return (x / 257.0).clip(0, 255).astype(np.uint8)
-                    x = x.astype(np.float32, copy=False)
-                    m = np.nanmax(x)
-                    m = 1.0 if (not np.isfinite(m) or m <= 0) else m
-                    return np.clip(x / m * 255.0, 0, 255).astype(np.uint8)
-
-                def _pick_rgb3(src: np.ndarray) -> list[np.ndarray]:
-                    """Choose 3 channels for fluorescence. Handles 2D, 3D, ND."""
-                    x = np.asarray(src)
-                    if x.ndim == 2:
-                        return [x, x, x]
-                    if x.ndim == 3:
-                        C = x.shape[2]
-                        if C >= 3:
-                            return [x[..., 0], x[..., 1], x[..., 2]]
-                        if C == 2:
-                            c0, c1 = x[..., 0], x[..., 1]
-                            return [c0, c1, np.maximum(c0, c1)]
-                        g = x[..., 0]
-                        return [g, g, g]
-                    # ND fallback: flatten non-spatial dims to channels, take first three
-                    order = np.argsort(x.shape)[::-1]
-                    y_dim, x_dim = order[:2]
-                    y = np.transpose(x, (y_dim, x_dim, *[d for d in range(x.ndim) if d not in (y_dim, x_dim)]))
-                    H, W = y.shape[:2]
-                    C = int(np.prod(y.shape[2:])) if y.ndim > 2 else 1
-                    y = y.reshape(H, W, C)
-                    if C >= 3:
-                        return [y[..., 0], y[..., 1], y[..., 2]]
-                    if C == 2:
-                        c0, c1 = y[..., 0], y[..., 1]
-                        return [c0, c1, np.maximum(c0, c1)]
-                    g = y[..., 0]
-                    return [g, g, g]
-
-                def _rgb_from_channels_stretched(chs: list[np.ndarray]) -> np.ndarray:
-                    """Fluorescence: per-channel percentile stretch to avoid black tiles."""
-                    return np.stack(
-                        [
-                            _stretch99(np.asarray(chs[0])),
-                            _stretch99(np.asarray(chs[1])),
-                            _stretch99(np.asarray(chs[2])),
-                        ],
-                        axis=-1,
-                    )
-
-                # Map VALIS short name -> original file path (for thumbnail fallback)
-                name_to_src = {v: k for k, v in registrar.name_dict.items()}
-
-                def _read_original_color(slide) -> np.ndarray:
-                    # Prefer VALIS-provided slide.image
-                    src = getattr(slide, "image", None)
-                    if src is not None:
-                        if _guess_brightfield(src):
-                            return _downsample_stride(_rgb_native(src))
-                        return _downsample_stride(_rgb_from_channels_stretched(_pick_rgb3(src)))
-                    # Fallback: thumbnail from original file via pyvips
-                    src_fp = name_to_src.get(slide.name, None)
-                    if src_fp and Path(src_fp).exists():
-                        try:
-                            v = pyvips.Image.thumbnail(str(src_fp), MAX_SIDE)
-                            arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(
-                                v.height, v.width, v.bands
-                            )
-                            if arr.shape[2] == 1:
-                                arr = np.repeat(arr, 3, axis=2)
-                            if arr.shape[2] > 3:
-                                arr = arr[..., :3]
-                            return arr
-                        except Exception:
-                            pass
-                    # Last resort: processed gray replicated
-                    g = _stretch99(slide.processed_img)
-                    return np.stack([g, g, g], axis=-1)
-
-                per_slide = []
-                for slide in slides:
-                    name = slide.name
-                    proc = slide.processed_img  # registration resolution (2D)
-
-                    # Row 1: original color (BF native, FL stretch), ≤ MAX_SIDE
-                    orig_rgb = _read_original_color(slide)
-
-                    # Rigid and micro previews from current displacement fields
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", category=UserWarning)
-                        try:
-                            rigid_gray = slide.warp_img(img=proc, non_rigid=False, crop=True)
-                        except Exception:
-                            rigid_gray = None
-
-                        if self.micro_registration:
-                            try:
-                                micro_nr_gray = slide.warp_img(img=proc, non_rigid=True, crop=True)
-                            except Exception:
-                                micro_nr_gray = None
-                        else:
-                            micro_nr_gray = None
-
-                    rigid_gray = _downsample_stride(_stretch99(rigid_gray)) if rigid_gray is not None else None
-                    micro_nr_gray = (
-                        _downsample_stride(_stretch99(micro_nr_gray)) if micro_nr_gray is not None else None
-                    )
-
-                    # Row 3: coarse non-rigid (pre-micro) from saved VALIS thumbnails if available
-                    coarse_nr_gray = None
-                    nr_path_str = getattr(slide, "nr_rigid_reg_img_f", None)
-                    if nr_path_str is not None:
-                        nr_path = Path(nr_path_str)
-                        if nr_path.exists():
-                            try:
-                                v = pyvips.Image.new_from_file(str(nr_path), access="sequential")
-                                arr = np.frombuffer(v.write_to_memory(), dtype=np.uint8).reshape(
-                                    v.height, v.width, v.bands
-                                )
-                                if arr.ndim == 2:
-                                    arr_gray = arr
-                                elif arr.ndim == 3:
-                                    if arr.shape[2] == 1:
-                                        arr_gray = arr[..., 0]
-                                    else:
-                                        arr_gray = np.mean(arr[..., :3], axis=2)
-                                else:
-                                    arr_gray = None
-                                if arr_gray is not None:
-                                    coarse_nr_gray = _downsample_stride(
-                                        _stretch99(arr_gray.astype(np.uint8, copy=False))
-                                    )
-                            except Exception:
-                                coarse_nr_gray = None
-
-                    per_slide.append((name, orig_rgb, rigid_gray, coarse_nr_gray, micro_nr_gray))
-
-                if not per_slide:
-                    console.print("Nothing to preview.", style="warning")
-                    return self.metadata
-
-                # Decide number of rows: 3 (no micro) or 4 (with micro)
-                n = len(per_slide)
-                n_rows = 4 if self.micro_registration else 3
-                fig_w = max(3.0 * n, 6.0)
-                fig_h = 9.0 if n_rows == 3 else 12.0
-                fig, axes = plt.subplots(n_rows, n, figsize=(fig_w, fig_h), constrained_layout=True)
-                if n == 1:
-                    axes = np.expand_dims(axes, 1)
-
-                row_titles = (
-                    ["original color", "rigid", "non-rigid", "micro"]
-                    if self.micro_registration
-                    else ["original color", "rigid", "non-rigid"]
-                )
-
-                for j, (name, orig_p, rigid_p, coarse_nr_p, micro_nr_p) in enumerate(per_slide):
-                    axes[0, j].set_title(name, fontsize=10)
-
-                    # row 1: color
-                    ax0 = axes[0, j]
-                    if orig_p is not None:
-                        ax0.imshow(orig_p)
-                    else:
-                        ax0.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
-                    ax0.set_ylabel(
-                        row_titles[0], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
-                    )
-                    ax0.set_xticks([])
-                    ax0.set_yticks([])
-                    for s in ax0.spines.values():
-                        s.set_visible(False)
-
-                    # row 2: rigid grayscale
-                    ax1 = axes[1, j]
-                    if rigid_p is not None:
-                        ax1.imshow(rigid_p, cmap="gray")
-                    else:
-                        ax1.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
-                    ax1.set_ylabel(
-                        row_titles[1], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
-                    )
-                    ax1.set_xticks([])
-                    ax1.set_yticks([])
-                    for s in ax1.spines.values():
-                        s.set_visible(False)
-
-                    # row 3: non-rigid (coarse, pre-micro)
-                    ax2 = axes[2, j]
-                    if coarse_nr_p is not None:
-                        ax2.imshow(coarse_nr_p, cmap="gray")
-                    else:
-                        ax2.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
-                    ax2.set_ylabel(
-                        row_titles[2], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
-                    )
-                    ax2.set_xticks([])
-                    ax2.set_yticks([])
-                    for s in ax2.spines.values():
-                        s.set_visible(False)
-
-                    # optional row 4: micro-registered non-rigid (final)
-                    if self.micro_registration:
-                        ax3 = axes[3, j]
-                        if micro_nr_p is not None:
-                            ax3.imshow(micro_nr_p, cmap="gray")
-                        else:
-                            ax3.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9)
-                        ax3.set_ylabel(
-                            row_titles[3], rotation=90, ha="right", va="center", fontsize=10, labelpad=18
-                        )
-                        ax3.set_xticks([])
-                        ax3.set_yticks([])
-                        for s in ax3.spines.values():
-                            s.set_visible(False)
-
-                plt.show()
-
+                do_apply, chosen_stage = self._napari_preview(registrar)
             except Exception as e:
-                console.print(f"Preview failed ({e}). Continuing without preview.", style="error")
+                console.print(
+                    f"napari preview failed ({e}). Falling back to a text prompt.",
+                    style="error",
+                )
+                if self.confirm:
+                    do_apply = Confirm.ask(
+                        f"Apply full-resolution transformation (stage={default_stage})?",
+                        default=False, console=console,
+                    )
+        elif self.confirm:
+            do_apply = Confirm.ask(
+                f"Apply full-resolution transformation (stage={default_stage})?",
+                default=False, console=console,
+            )
 
-        if self.confirm:
-            apply = Confirm.ask("Apply full-resolution transformation and save outputs?", default=False,
-                                console=console)
-            if not apply:
-                console.print("Aborted by user. No warping performed.")
-                return self.metadata
+        if not do_apply:
+            console.print("Aborted by user. No warping performed.")
+            return self.metadata
+
+        chosen_stage = self._resolve_stage(chosen_stage)
+        self.applied_stage = chosen_stage
+        # "rigid" -> rigid-only warp; "non_rigid"/"micro" -> full non-rigid field
+        # (the micro refinement, if computed, is already folded into that field).
+        apply_non_rigid = chosen_stage != "rigid"
+        console.print(f"[VALIS] applying stage '{chosen_stage}' at full resolution.", style="info")
 
         console.print(f"VALIS registration completed. Results directory: {results_dir}", style="info")
 
@@ -761,7 +927,8 @@ class ValisRegistrator(BaseOperator):
         # The VALIS API provides a method to warp & save the slides in native resolution.
         # We call that here so the full-resolution pyramid registered slides are available on disk.
         # NOTE: API method name in VALIS is `warp_and_save_slides` (per VALIS docs/examples).
-        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop=self.crop, pyramid=True, colormap="auto")
+        registrar.warp_and_save_slides(str(registered_slide_dst_dir), crop=self.crop, pyramid=True,
+                                       colormap="auto", non_rigid=apply_non_rigid)
 
         console.print(f"Full-resolution registered slides saved to: {registered_slide_dst_dir}", style="info")
 
